@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CliArgs } from "./cli.js";
+import { loadEnvFile } from "./env-file.js";
 import { PackageManagerId, UpdateStrategy } from "./types.js";
 import { exitWithError, log, warn } from "./util.js";
 
@@ -14,6 +15,8 @@ export interface ResolvedConfig {
   updateStrategy: UpdateStrategy;
   dryRun: boolean;
   skipUpdate: boolean;
+  discoverPackages: boolean; // auto-discover isolated sub-packages (own lockfile)
+  packages: string[]; // extra manifest dirs to always process (relative to root)
 }
 
 interface ConfigFile {
@@ -23,6 +26,8 @@ interface ConfigFile {
   updateStrategy?: UpdateStrategy;
   dryRun?: boolean;
   skipUpdate?: boolean;
+  discoverPackages?: boolean;
+  packages?: string[];
   token?: string; // not allowed — warned and ignored
 }
 
@@ -95,8 +100,13 @@ function resolveWorkspaceRoot(
  * Precedence (highest first): flags > env > config file > defaults.
  */
 export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedConfig {
-  // Determine a preliminary root (flag > env > cwd) to locate the config file.
+  // Determine a preliminary root (flag > env > cwd) to locate the .env / config.
   const preliminaryRoot = path.resolve(args.workspaceRoot ?? env.WORKSPACE_ROOT ?? process.cwd());
+
+  // Load <root>/.env into the environment first (without clobbering real env
+  // vars), so secrets like GITHUB_TOKEN are picked up from the repo-root .env.
+  loadEnvFile(preliminaryRoot, env);
+
   const { config, dir: configDir } = loadConfigFile(args.config, preliminaryRoot);
 
   if (config.token) {
@@ -119,6 +129,10 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   const dryRun = args.dryRun ?? envBool(env.DRY_RUN) ?? config.dryRun ?? false;
   const skipUpdate = args.skipUpdate ?? envBool(env.SKIP_UPDATE) ?? config.skipUpdate ?? false;
 
+  // Monorepo / isolated-package discovery (config-file only).
+  const discoverPackages = config.discoverPackages ?? true;
+  const packages = config.packages ?? [];
+
   // Validate required fields with friendly, actionable messages.
   if (!token) {
     exitWithError("GitHub token is required. Pass --token or set GITHUB_TOKEN.");
@@ -129,7 +143,19 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
 
   const [owner, name] = repo.split("/");
 
-  return { token, repo, owner, name, packageManager, workspaceRoot, updateStrategy, dryRun, skipUpdate };
+  return {
+    token,
+    repo,
+    owner,
+    name,
+    packageManager,
+    workspaceRoot,
+    updateStrategy,
+    dryRun,
+    skipUpdate,
+    discoverPackages,
+    packages,
+  };
 }
 
 function parsePmEnv(value: string | undefined): PackageManagerId | undefined {

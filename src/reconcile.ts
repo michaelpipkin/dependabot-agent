@@ -1,8 +1,14 @@
 import * as path from "node:path";
 import { ResolvedConfig } from "./config.js";
+import { discoverIsolatedManifestDirs } from "./discover.js";
 import { fetchDependabotAlerts } from "./github.js";
 import { OverrideSource, selectOverrideSource } from "./override-source.js";
-import { createPackageManager, detectPackageManager, PackageManager } from "./package-manager/index.js";
+import {
+  createPackageManager,
+  detectPackageManager,
+  PackageManager,
+  RunContext,
+} from "./package-manager/index.js";
 import { compareSemver, computeBoundedSpec, parseSemver, rangeCouldResolveVulnerable } from "./semver.js";
 import { findInstalledVersion } from "./tree.js";
 import {
@@ -10,6 +16,7 @@ import {
   DeploymentRecommendation,
   InstalledTree,
   OverrideChange,
+  PackageManagerId,
   VulnerablePackage,
 } from "./types.js";
 import { exitWithError, log } from "./util.js";
@@ -290,7 +297,11 @@ function logDeploymentRecommendation(recommendations: DeploymentRecommendation[]
  * manifest_path is relative to repo root, e.g. "package.json" or
  * "functions/package.json"; "." means the repo root.
  */
-function groupAlertsByManifestDir(alerts: DependabotAlert[], workspaceRoot: string): Map<string, DependabotAlert[]> {
+function groupAlertsByManifestDir(
+  alerts: DependabotAlert[],
+  workspaceRoot: string,
+  extraDirs: string[],
+): Map<string, DependabotAlert[]> {
   const alertsByDir = new Map<string, DependabotAlert[]>();
   for (const alert of alerts) {
     const rawDir = path.dirname(alert.dependency.manifest_path);
@@ -300,12 +311,30 @@ function groupAlertsByManifestDir(alerts: DependabotAlert[], workspaceRoot: stri
     alertsByDir.set(manifestDir, group);
   }
 
-  // Always include the root for a cleanup pass, even with no alerts.
-  if (!alertsByDir.has(workspaceRoot)) {
-    alertsByDir.set(workspaceRoot, []);
+  // Always include the root, plus any extra manifest dirs (discovered isolated
+  // packages and explicitly-configured ones), for a cleanup pass even with no
+  // alerts.
+  for (const dir of [workspaceRoot, ...extraDirs]) {
+    if (!alertsByDir.has(dir)) alertsByDir.set(dir, []);
   }
 
   return alertsByDir;
+}
+
+/**
+ * Resolve the package manager for a manifest directory. An explicit
+ * --package-manager setting wins everywhere; otherwise each isolated package is
+ * detected from its own lockfile, falling back to the root's package manager.
+ */
+function resolvePmForDir(
+  manifestDir: string,
+  isRoot: boolean,
+  rootPmId: PackageManagerId,
+  cfg: ResolvedConfig,
+): PackageManagerId {
+  if (cfg.packageManager) return cfg.packageManager;
+  if (isRoot) return rootPmId;
+  return detectPackageManager(manifestDir) ?? rootPmId;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,28 +346,38 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   log("================================");
   if (cfg.dryRun) log("⚠️  DRY RUN MODE — no files will be modified\n");
 
-  // Resolve the package manager (explicit override or lockfile auto-detection).
-  const pmId = cfg.packageManager ?? detectPackageManager(cfg.workspaceRoot);
-  if (!pmId) {
+  // Resolve the root package manager (explicit override or lockfile detection).
+  const rootPmId = cfg.packageManager ?? detectPackageManager(cfg.workspaceRoot);
+  if (!rootPmId) {
     exitWithError(
       `Could not detect a package manager in ${cfg.workspaceRoot} ` +
         `(no pnpm-lock.yaml or package-lock.json). Pass --package-manager pnpm|npm.`,
     );
   }
-  log(`📦 Package manager: ${pmId}${cfg.packageManager ? " (explicit)" : " (auto-detected)"}`);
+  log(`📦 Package manager: ${rootPmId}${cfg.packageManager ? " (explicit)" : " (auto-detected)"}`);
   log(`🔧 Update strategy: ${cfg.updateStrategy}`);
 
-  const pm = createPackageManager(pmId, {
+  const ctx: RunContext = {
     dryRun: cfg.dryRun,
     skipUpdate: cfg.skipUpdate,
     updateStrategy: cfg.updateStrategy,
-  });
+  };
+
+  // Additional manifest roots to reconcile beyond the workspace root: isolated
+  // sub-packages with their own lockfile (auto-discovered) plus any explicitly
+  // configured directories. Each is processed as its own group.
+  const explicitDirs = cfg.packages.map((p) => path.resolve(cfg.workspaceRoot, p));
+  const discoveredDirs = cfg.discoverPackages ? discoverIsolatedManifestDirs(cfg.workspaceRoot) : [];
+  const extraDirs = [...new Set([...explicitDirs, ...discoveredDirs])];
+  if (extraDirs.length > 0) {
+    log(`🧩 Isolated package(s): ${extraDirs.map((d) => path.relative(cfg.workspaceRoot, d)).join(", ")}`);
+  }
 
   // 1. Fetch all open npm alerts
   const alerts = await fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token });
 
-  // 2. Group alerts by manifest directory
-  const alertsByDir = groupAlertsByManifestDir(alerts, cfg.workspaceRoot);
+  // 2. Group alerts by manifest directory (plus root + extra dirs)
+  const alertsByDir = groupAlertsByManifestDir(alerts, cfg.workspaceRoot, extraDirs);
 
   // 3. Process each manifest group independently
   let totalAdded = 0;
@@ -354,9 +393,11 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   for (const [manifestDir, groupAlerts] of alertsByDir) {
     const isRoot = manifestDir === cfg.workspaceRoot;
     const label = isRoot ? "root" : path.relative(cfg.workspaceRoot, manifestDir);
+    const pmId = resolvePmForDir(manifestDir, isRoot, rootPmId, cfg);
+    const pm = createPackageManager(pmId, ctx);
 
     log(`\n${"─".repeat(48)}`);
-    log(`📂 Processing manifest: ${label} (${groupAlerts.length} alert(s))`);
+    log(`📂 Processing manifest: ${label} (${groupAlerts.length} alert(s)) [${pmId}]`);
 
     log("🗂️  Detecting override config location...");
     const source = selectOverrideSource(pmId, manifestDir, isRoot);

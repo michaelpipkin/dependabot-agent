@@ -59,6 +59,17 @@ dependabot-agent --repo owner/repo --update-strategy latest
 
 The GitHub token may also come from the `GITHUB_TOKEN` env var (recommended for CI — never commit it).
 
+### `.env` files
+
+On startup the agent automatically loads a `.env` file from the workspace root (the directory you run in, or `--workspace-root`). This is the convenient place for your token during local use:
+
+```bash
+# .env  (keep this gitignored)
+GITHUB_TOKEN=ghp_xxx
+```
+
+Real shell/CI environment variables always take precedence over `.env`, so the file never clobbers a value you set explicitly. Any variable the agent understands (`GITHUB_TOKEN`, `GITHUB_REPO`, `PACKAGE_MANAGER`, …) can live there, but **keep secrets out of the committed config file** — `.env` is the right home for the token.
+
 ## Options
 
 | Flag | Env fallback | Default | Description |
@@ -89,11 +100,22 @@ For shared/team setups, commit non-secret settings to a config file. The agent l
   "workspaceRoot": ".",          // resolved relative to the config file
   "updateStrategy": "compatible",
   "dryRun": false,
-  "skipUpdate": false
+  "skipUpdate": false,
+  "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
+  "packages": []                 // extra manifest dirs to always process
 }
 ```
 
 > **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `GITHUB_TOKEN` / CI secrets so they don't get committed.
+
+## Monorepos & isolated packages
+
+The agent always processes the workspace root, and additionally each **isolated sub-package** — a directory with both its own `package.json` **and** its own lockfile (`pnpm-lock.yaml` / `package-lock.json`), e.g. a Firebase `functions/` folder. These have a separate install and separate overrides, so each is reconciled as its own group (auto-detecting its package manager from its lockfile).
+
+Plain **workspace members** (listed under `pnpm-workspace.yaml`'s `packages:` or a `package.json` `workspaces` field) share the root install and the root override file, so they are intentionally **not** processed separately.
+
+- `discoverPackages` (default `true`) — set to `false` to process only the root.
+- `packages` — explicitly list extra manifest directories (relative to the workspace root) to process, e.g. for an isolated package that doesn't have its own lockfile.
 
 ## Update strategy
 
