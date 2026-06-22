@@ -1,0 +1,19 @@
+{
+  "name": "dependabot-agent",
+  "version": "1.0.0",
+  "description": "On-demand agent to reconcile pnpm overrides with Dependabot alerts",
+  "scripts": {
+    "start": "ts-node --esm dependabot-agent.ts",
+    "dry-run": "DRY_RUN=true ts-node --esm dependabot-agent.ts"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^26.0.0",
+    "js-yaml": "^5.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
