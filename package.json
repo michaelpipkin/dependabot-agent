@@ -1,19 +1,42 @@
 {
   "name": "dependabot-agent",
-  "version": "1.0.0",
-  "description": "On-demand agent to reconcile pnpm overrides with Dependabot alerts",
+  "version": "0.1.0",
+  "author": "Michael Pipkin <michael.a.pipkin@gmail.com>",
+  "description": "On-demand CLI agent that reconciles npm/pnpm dependency overrides with GitHub Dependabot alerts",
+  "type": "module",
+  "bin": {
+    "dependabot-agent": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "start": "ts-node --esm dependabot-agent.ts",
-    "dry-run": "DRY_RUN=true ts-node --esm dependabot-agent.ts"
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json && node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "dependabot",
+    "overrides",
+    "npm",
+    "pnpm",
+    "security",
+    "vulnerabilities",
+    "cli"
+  ],
+  "dependencies": {
+    "js-yaml": "^4.1.0"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^26.0.0",
-    "js-yaml": "^5.0.0",
-    "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

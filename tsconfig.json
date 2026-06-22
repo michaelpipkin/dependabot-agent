@@ -6,11 +6,11 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "rootDir": "src",
     "outDir": "dist",
+    "declaration": true,
+    "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["dependabot-agent.ts"],
-  "ts-node": {
-    "esm": false
-  }
+  "include": ["src/**/*.ts"]
 }
