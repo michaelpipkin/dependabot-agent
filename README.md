@@ -22,23 +22,43 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 - npm or pnpm
 - A GitHub Personal Access Token (classic or fine-grained) with **`security_events` read** permission, scoped to the repo.
 
-## Install
+## Install & invoke
 
-Run without installing:
+There are three ways to run the agent. Pick the one that fits how you use it.
+
+### 1. `npx` — no install
+
+Good for a one-off run or CI. Downloads and runs the published binary on demand:
 
 ```bash
 npx dependabot-agent --repo owner/repo --token ghp_xxx --dry-run
 ```
 
-Or install globally / as a dev dependency:
+### 2. Project dev dependency — recommended for a repo you maintain
+
+Install it into the project you want to reconcile:
+
+```bash
+npm install --save-dev dependabot-agent
+# or
+pnpm add -D dependabot-agent
+```
+
+> **A local install does _not_ put `dependabot-agent` on your shell `PATH`.** Typing `dependabot-agent …` in your terminal will fail with *"command not found"* / *"not recognized"*. A project-installed binary is only available through `npx dependabot-agent …`, or from an **npm/pnpm script** (where `node_modules/.bin` is on `PATH`). The script approach is the nicest — see [Config-driven workflow](#config-driven-workflow-recommended) below.
+
+### 3. Global install
+
+Puts `dependabot-agent` on your `PATH` so you can call it by name from any directory:
 
 ```bash
 npm install -g dependabot-agent
-# or
-npm install --save-dev dependabot-agent
+
+dependabot-agent --repo owner/repo --token ghp_xxx --dry-run
 ```
 
 ## Usage
+
+The agent takes **only flags** — there are no subcommands. `--dry-run` is a flag, not a command, so `dependabot-agent dry-run` is an error; use `dependabot-agent --dry-run`.
 
 ```bash
 # Dry run — see planned changes without writing anything
@@ -59,16 +79,67 @@ dependabot-agent --repo owner/repo --update-strategy latest
 
 The GitHub token may also come from the `GITHUB_TOKEN` env var (recommended for CI — never commit it).
 
-### `.env` files
+## Config-driven workflow (recommended)
 
-On startup the agent automatically loads a `.env` file from the workspace root (the directory you run in, or `--workspace-root`). This is the convenient place for your token during local use:
+For day-to-day use you don't want to retype flags. Put your **token in a `.env` file**, your **other options in `dependabot-agent.config.json`**, and wrap the two runs (dry-run and apply) in **package.json scripts**. Then everyday use is just:
 
 ```bash
-# .env  (keep this gitignored)
+pnpm deps:dry-run   # preview
+pnpm deps:fix       # apply
+```
+
+### Step 1 — token in `.env` (gitignored)
+
+On startup the agent automatically loads a `.env` file from the workspace root (the directory you run in, or `--workspace-root`):
+
+```bash
+# .env  (add to .gitignore — never commit this)
 GITHUB_TOKEN=ghp_xxx
 ```
 
-Real shell/CI environment variables always take precedence over `.env`, so the file never clobbers a value you set explicitly. Any variable the agent understands (`GITHUB_TOKEN`, `GITHUB_REPO`, `PACKAGE_MANAGER`, …) can live there, but **keep secrets out of the committed config file** — `.env` is the right home for the token.
+Real shell/CI environment variables always take precedence over `.env`, so the file never clobbers a value you set explicitly. Any variable the agent understands (`GITHUB_TOKEN`, `GITHUB_REPO`, `PACKAGE_MANAGER`, …) can live here — but the **token belongs in `.env`, never in the committed config file** (a `token` key in the config is ignored with a warning).
+
+### Step 2 — everything else in `dependabot-agent.config.json`
+
+Commit this file at the workspace root. It's auto-discovered — no `--config` flag needed:
+
+```jsonc
+{
+  "repo": "owner/repo",
+  "packageManager": "pnpm",      // omit to auto-detect from the lockfile
+  "workspaceRoot": ".",          // resolved relative to this file
+  "updateStrategy": "compatible",
+  "skipUpdate": false,
+  "discoverPackages": true,      // auto-discover isolated sub-packages
+  "packages": []                 // extra manifest dirs to always process
+}
+```
+
+Leave `dryRun` out of the config (or set `false`) so the same config serves both the preview and the apply script — the dry-run script adds `--dry-run` on the command line.
+
+### Step 3 — package.json scripts
+
+```jsonc
+{
+  "scripts": {
+    "deps:dry-run": "dependabot-agent --dry-run",
+    "deps:fix": "dependabot-agent"
+  }
+}
+```
+
+Now both invocations pull `repo`, `packageManager`, etc. from the config file and the token from `.env`:
+
+```bash
+pnpm deps:dry-run     # or: npm run deps:dry-run
+pnpm deps:fix         # then run `pnpm install` to regenerate the lockfile
+```
+
+There's no separate "fix" command in the tool — `deps:fix` is just the agent with no `--dry-run`, which writes the override changes. Any config value can still be overridden ad-hoc on the command line because **flags beat the config file**, e.g.:
+
+```bash
+pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
+```
 
 ## Options
 
@@ -85,28 +156,32 @@ Real shell/CI environment variables always take precedence over `.env`, so the f
 
 Precedence: **flags > environment variables > config file > defaults.**
 
-## Config file
+## Config file reference
 
-For shared/team setups, commit non-secret settings to a config file. The agent looks for (first found):
+The [Config-driven workflow](#config-driven-workflow-recommended) above shows the common setup. This section is the full reference.
 
-1. the path passed to `--config`,
+**Discovery order** (first found wins):
+
+1. the path passed to `--config <path>` (parsed as JSON),
 2. `dependabot-agent.config.json` in the workspace root,
 3. a `"dependabot-agent"` key in the workspace root `package.json`.
+
+The config file must be **JSON** (a `.js`/`.ts` config is not supported). All keys are optional:
 
 ```jsonc
 {
   "repo": "owner/repo",
-  "packageManager": "pnpm",      // omit to auto-detect
+  "packageManager": "pnpm",      // omit to auto-detect from the lockfile
   "workspaceRoot": ".",          // resolved relative to the config file
   "updateStrategy": "compatible",
-  "dryRun": false,
+  "dryRun": false,               // prefer leaving this out; pass --dry-run instead
   "skipUpdate": false,
   "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
   "packages": []                 // extra manifest dirs to always process
 }
 ```
 
-> **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `GITHUB_TOKEN` / CI secrets so they don't get committed.
+> **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `.env` / `GITHUB_TOKEN` / CI secrets so they don't get committed.
 
 ## Monorepos & isolated packages
 
