@@ -101,7 +101,7 @@ function computeOverrideChanges(
   resolvedAlertNames: Set<string>,
 ): OverrideChange[] {
   const changes: OverrideChange[] = [];
-  const neededOverrides = new Map(stillVulnerable.map((v) => [v.name, `>=${v.patchedVersion}`]));
+  const neededOverrides = new Map(stillVulnerable.map((v) => [v.name, v.patchedVersion]));
 
   // Add or update overrides for packages that still need them. We write a
   // major-bounded spec (>=patchedVersion <currentMajor+1) rather than an

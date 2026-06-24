@@ -74,13 +74,20 @@ export function rangeCouldResolveVulnerable(specifier: string, patchedVersion: s
  *   patchedVersion="7.29.6", installedVersion="7.29.0" → ">=7.29.6 <8"
  *   patchedVersion="5.2.0",  installedVersion="5.1.4"  → ">=5.2.0 <6"
  *   patchedVersion="11.1.1", installedVersion="11.1.1" → ">=11.1.1 <12"
+ *   patchedVersion="7.28.0", installedVersion="6.21.0" → ">=7.28.0 <8"
  *
- * If we can't determine the installed major (package not in tree), falls back
- * to the patched version's own major, which is still safe.
+ * The upper bound uses the higher of the installed and patched majors, plus one.
+ * Normally these majors are equal; when the only fix lives in a newer major than
+ * what is installed (a cross-major patch), the ceiling must clear the patched
+ * floor — otherwise we'd emit an impossible empty range like ">=7.28.0 <7".
+ *
+ * If we can't determine either major (package not in tree, unparseable patch),
+ * falls back to an unbounded ">=", which is still safe.
  */
 export function computeBoundedSpec(patchedVersion: string, installedVersion?: string): string {
-  const base = installedVersion ?? patchedVersion;
-  const parsed = parseSemver(base);
-  const nextMajor = parsed ? parsed[0] + 1 : null;
+  const patchedParsed = parseSemver(patchedVersion);
+  const installedParsed = installedVersion ? parseSemver(installedVersion) : null;
+  const baseMajor = Math.max(patchedParsed?.[0] ?? 0, installedParsed?.[0] ?? 0);
+  const nextMajor = patchedParsed || installedParsed ? baseMajor + 1 : null;
   return nextMajor === null ? `>=${patchedVersion}` : `>=${patchedVersion} <${nextMajor}`;
 }
