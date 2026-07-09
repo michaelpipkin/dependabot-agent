@@ -15,20 +15,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4 # uses the version from packageManager
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
 
-      # Trusted Publishing needs npm >= 11.5.1, newer than what the runner ships.
+      # The publish step below uses `npm publish` for OIDC Trusted Publishing,
+      # which needs npm >= 11.5.1 — newer than what the runner ships.
       - name: Upgrade npm
         run: npm install -g npm@latest
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       # Decide whether to publish. Skips if the commit says [no-deploy],
       # or if this exact version is already on npm (e.g. a docs-only push).
@@ -53,6 +57,8 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Publish with npm (not pnpm) so OIDC Trusted Publishing handles auth.
+      # npm publish only packs the `files` in package.json; it needs no lockfile.
       - name: Publish to npm
         if: steps.check.outputs.publish == 'true'
         run: npm publish --provenance --access public
