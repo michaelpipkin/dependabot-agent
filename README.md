@@ -21,6 +21,9 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 - Node 20+
 - npm or pnpm
 - A GitHub Personal Access Token (classic or fine-grained) with **`security_events` read** permission, scoped to the repo.
+  **In CI, this must be a real PAT stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
+  Actions injects cannot read the Dependabot alerts API under any circumstance. See
+  [CI integration](#ci-integration-github-actions) below.
 
 ## Install & invoke
 
@@ -209,7 +212,22 @@ If overrides were added or changed, run your package manager's install to regene
 pnpm install   # or: npm install
 ```
 
-## CI integration (GitHub Actions, manual trigger)
+## CI integration (GitHub Actions)
+
+> **The built-in `GITHUB_TOKEN` cannot read Dependabot alerts.** GitHub Actions' automatic,
+> ephemeral `GITHUB_TOKEN` cannot access the Dependabot alerts REST API **under any `permissions:`
+> grant** — including `security-events: read`, which only covers *code scanning* alerts, not
+> Dependabot alerts. Passing it to the agent fails with:
+> ```
+> ❌ Error: GitHub API error 403: {"message":"Resource not accessible by integration", ...}
+> ```
+> You need a real credential — a classic PAT with `security_events` scope (or a fine-grained PAT /
+> GitHub App token with the "Dependabot alerts: read" permission) — stored as a **repository secret**
+> and passed to the agent's own steps. Other steps (checkout, opening a PR) can keep using the
+> default `GITHUB_TOKEN` — least-privilege still applies everywhere except the one operation that
+> structurally requires a PAT.
+
+### Minimal example (manual trigger, commits directly)
 
 ```yaml
 # .github/workflows/dependabot-overrides.yml
@@ -222,7 +240,6 @@ jobs:
   reconcile:
     runs-on: ubuntu-latest
     permissions:
-      security-events: read
       contents: write
     steps:
       - uses: actions/checkout@v4
@@ -241,7 +258,7 @@ jobs:
       - name: Run Dependabot Override Agent
         run: npx dependabot-agent --repo ${{ github.repository }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DEPENDABOT_AGENT_TOKEN }} # PAT secret — see note above
 
       - name: Commit changes (if any)
         run: |
@@ -253,6 +270,100 @@ jobs:
             git push
           )
 ```
+
+### Recommended: scheduled, pinned dependency, opens a PR
+
+For unattended/org use, install the agent as a pinned `devDependency` (via the
+[config-driven workflow](#config-driven-workflow-recommended) above) instead of `npx`-ing an
+arbitrary version on every run, and open a PR for review/CI instead of committing straight to the
+branch:
+
+```yaml
+# .github/workflows/dependabot-agent.yml
+name: Reconcile Dependabot Overrides
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (print planned changes, write nothing, no PR)"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 6 * * 1" # weekly — GitHub has no native "new Dependabot alert" trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # pnpm projects only
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: pnpm install --frozen-lockfile # or: npm install
+
+      - name: Determine mode
+        id: mode
+        run: echo "apply=${{ (github.event_name != 'workflow_dispatch') || (!inputs.dry_run) }}" >> "$GITHUB_OUTPUT"
+
+      - name: Preview (dry run)
+        if: steps.mode.outputs.apply != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPENDABOT_AGENT_TOKEN }}
+        run: pnpm deps:dry-run
+
+      - name: Apply
+        if: steps.mode.outputs.apply == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPENDABOT_AGENT_TOKEN }}
+        run: pnpm deps:fix
+
+      - name: Sync lockfile(s) to new overrides
+        if: steps.mode.outputs.apply == 'true'
+        run: pnpm install --no-frozen-lockfile # repeat per isolated sub-package, e.g. functions/
+
+      - name: Open pull request
+        if: steps.mode.outputs.apply == 'true'
+        uses: peter-evans/create-pull-request@v8 # v7 targets a deprecated Node runtime — use v8+
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }} # default token is fine for opening the PR itself
+          branch: dependabot-agent/reconcile-overrides
+          commit-message: "chore: reconcile dependency overrides with Dependabot alerts"
+          title: "chore: reconcile dependency overrides"
+          body: "Automated override reconciliation. **Merge only after CI passes** — the agent does not build or test."
+          labels: dependencies
+```
+
+### Gotchas
+
+- **`workflow_dispatch` and `schedule` only activate once the workflow file exists on the repo's
+  *default* branch.** Pushing it to a feature branch alone won't make it dispatchable or let the
+  schedule fire — merge it to your default branch first (once merged, you can still dispatch it
+  against any *other* branch by picking that branch in the "Run workflow" dropdown, or via
+  `gh workflow run <name> --ref <branch>`).
+- **PRs opened with the default `GITHUB_TOKEN` don't trigger other `pull_request`-triggered
+  workflows** (GitHub's recursion guard). If your repo requires CI to pass before merge, that CI
+  won't auto-run on the agent's PR unless the PR-creation step uses a PAT or GitHub App token
+  instead — a human pushing an empty commit, or closing/reopening the PR, also kicks it.
+- **If your repo uses GitHub's CodeQL "Default setup" code scanning**, expect its JS/TS analyzer to
+  occasionally fail with `Only found JavaScript or TypeScript files that were empty or contained
+  syntax errors` on the agent's PRs — every reconciliation PR touches only manifests/lockfiles, never
+  real source, which is exactly the shape that trips this. In testing this was **non-deterministic**
+  (the identical diff against the identical cached overlay database produced both a pass and a fail
+  in back-to-back runs), so it's safe to just re-run the check. If your repo enforces branch
+  protection on code scanning, either allowlist this, or switch Code Scanning to "Advanced setup"
+  and add a `paths-ignore` for manifest/lockfile-only changes so the job doesn't run on these PRs at
+  all.
 
 ## Design notes
 
