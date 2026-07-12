@@ -204,6 +204,17 @@ The agent runs a dependency update before reconciling, so legitimately-fixed pac
 
 Either way, the **overrides themselves are always major-bounded**, so a fixed transitive dependency never silently jumps a major version. Transitive-only vulnerabilities are handled by overrides regardless of strategy.
 
+### Direct dependencies vs. overrides (npm's spec-match rule)
+
+npm forbids an `overrides` entry for a package you **also depend on directly** unless the override spec matches the direct dependency's declared range (or references it via the `"$name"` syntax); otherwise `npm install` fails with a *"conflicts with direct dependency"* error. The agent sidesteps this by fixing the two cases through different mechanisms:
+
+- **Direct dependencies** are fixed by the update pass above, which rewrites the declared range in `dependencies`/`devDependencies` in place. Once the package resolves to a patched version in-range, its alert closes and **no override is written** for it.
+- **Transitive dependencies** — whatever is still vulnerable after the update — are the only things that get overrides. Since they aren't direct deps, npm's spec-match rule doesn't apply.
+
+The agent does not rewrite an override to match a direct dep, and it does not use the `"$name"` self-reference form.
+
+**Edge case:** if a *direct* dependency is still vulnerable after the update — e.g. the only patched version is a major bump and you're on the default `compatible` strategy, so the update can't cross the major — the agent will write an override for a package that is also a direct dep, and `npm install` will then reject it with the conflict error. Fix it by re-running with `--update-strategy latest` (bumps the direct dep across the major and rewrites its declared range, so the alert closes without an override), or bump that dependency by hand.
+
 ## After running
 
 If overrides were added or changed, run your package manager's install to regenerate the lockfile:
@@ -377,6 +388,7 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 - When multiple alerts reference the same package, the **highest** `first_patched_version` wins.
 - Override specs are major-bounded (`>=X.Y.Z <nextMajor`) — compatible with both npm and pnpm.
 - The agent trusts the **alert state** (open ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides.
+- Overrides are only written for packages that remain vulnerable **after** the update pass — in practice transitive deps. Direct dependencies are fixed by bumping their declared range, so the agent doesn't collide with npm's rule that an override for a direct dep must match its spec. See [Direct dependencies vs. overrides](#direct-dependencies-vs-overrides-npms-spec-match-rule).
 
 ### Orphaned overrides
 
@@ -392,3 +404,7 @@ npm run build                                # compile to dist/
 npm start -- --repo owner/repo --dry-run     # run the compiled build
 npm run dev -- --repo owner/repo --dry-run   # build + run in one step
 ```
+
+## License
+
+[MIT](LICENSE) © Michael Pipkin
