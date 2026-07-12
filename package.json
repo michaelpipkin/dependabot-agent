@@ -4,6 +4,14 @@
   "author": "Michael Pipkin <michael.a.pipkin@gmail.com>",
   "description": "On-demand CLI agent that reconciles npm/pnpm dependency overrides with GitHub Dependabot alerts",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/michaelpipkin/dependabot-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/michaelpipkin/dependabot-agent/issues"
+  },
+  "homepage": "https://github.com/michaelpipkin/dependabot-agent#readme",
   "type": "module",
   "bin": {
     "dependabot-agent": "dist/index.js"
