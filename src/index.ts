@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "./cli.js";
 import { resolveConfig } from "./config.js";
 import { run } from "./reconcile.js";
+import { normalizeChildEnv } from "./util.js";
 
 function readVersion(): string {
   try {
@@ -17,6 +18,11 @@ function readVersion(): string {
 }
 
 const args = parseArgs(process.argv.slice(2), readVersion());
+
+// After parseArgs so --help/--version stay quiet, and before anything shells
+// out to a package manager. No-op off win32.
+normalizeChildEnv();
+
 const config = resolveConfig(args, process.env);
 
 try {
