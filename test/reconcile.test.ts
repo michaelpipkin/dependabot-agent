@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { computeOverrideChanges } from "../src/reconcile.js";
+import { computeOverrideChanges, findEscapingRanges, overrideFloor } from "../src/reconcile.js";
 import { VulnerablePackage } from "../src/types.js";
 
 function vuln(name: string, installedVersion: string, patchedVersion: string): VulnerablePackage {
@@ -91,7 +91,7 @@ describe("computeOverrideChanges", () => {
     });
   });
 
-  it("handles a mixed batch without cross-contaminating flags", () => {
+  it("flags escapes on both add and update paths without cross-contamination", () => {
     const changes = computeOverrideChanges(
       { tar: ">=6.2.1 <7" },
       [vuln("react", "18.2.0", "19.0.0"), vuln("lodash", "4.17.20", "4.17.21")],
@@ -102,5 +102,51 @@ describe("computeOverrideChanges", () => {
     assert.equal(byName.lodash.noInRangeFix, false);
     assert.equal(byName.tar.action, "remove");
     assert.equal(changes.filter((c) => c.noInRangeFix).length, 1);
+  });
+});
+
+describe("overrideFloor", () => {
+  it("reads the floor off bounded and unbounded specs alike", () => {
+    assert.equal(overrideFloor(">=7.29.6 <8"), "7.29.6");
+    assert.equal(overrideFloor(">=11.1.1"), "11.1.1");
+    assert.equal(overrideFloor(">=0.7.0 <0.8"), "0.7.0");
+    assert.equal(overrideFloor("1.2.3"), "1.2.3");
+  });
+});
+
+describe("findEscapingRanges", () => {
+  // Fixtures are the real overrides from a pip-cost-sharing dry run. Before the
+  // orphan path checked for escapes, all six reported identically as routine
+  // "still load-bearing" lines.
+  it("names the escaped range when an override forces dependents past a major", () => {
+    assert.deepEqual(findEscapingRanges(">=11.1.1", ["^7.0.3"]), ["^7.0.3"]);
+    assert.deepEqual(findEscapingRanges(">=11.1.1", ["^8.3.2"]), ["^8.3.2"]);
+    assert.deepEqual(findEscapingRanges(">=4.2.0", ["^3.13.1"]), ["^3.13.1"]);
+  });
+
+  it("stays quiet on overrides that sit inside what dependents ask for", () => {
+    // tar: floor 7.5.16 is inside ^7.5.3 / ^7.5.4 / ^7.4.3.
+    assert.deepEqual(findEscapingRanges(">=7.5.16", ["^7.5.3", "^7.5.4", "^7.4.3"]), []);
+    // @babel/core: floor 7.29.6 is inside ^8.0.0's predecessor ranges and below 8.
+    assert.deepEqual(findEscapingRanges(">=7.29.6 <8", ["7.29.0", "7.29.7", "^8.0.0"]), []);
+    // esbuild: floor 0.28.1 is inside the 0.28 line.
+    assert.deepEqual(findEscapingRanges(">=0.28.1", ["0.28.1"]), []);
+  });
+
+  it("skips ranges it cannot parse rather than guessing", () => {
+    // Compound ranges yield null from parseSemver; only provable escapes get named.
+    assert.deepEqual(findEscapingRanges(">=0.28.1", ["^0.27.0 || ^0.28.0"]), []);
+    assert.deepEqual(findEscapingRanges(">=11.1.1", ["*"]), []);
+  });
+
+  it("returns only the ranges that actually escape, not the whole set", () => {
+    const escaping = findEscapingRanges(">=11.1.1", ["^7.0.3", "^11.0.0", "^12.0.0"]);
+    assert.deepEqual(escaping, ["^7.0.3"]);
+  });
+
+  it("catches a 0.x escape in the orphan path too", () => {
+    // The 0.x boundary applies here identically: ^0.5.0 is >=0.5.0 <0.6.0.
+    assert.deepEqual(findEscapingRanges(">=0.7.0 <0.8", ["^0.5.0"]), ["^0.5.0"]);
+    assert.deepEqual(findEscapingRanges(">=0.5.2 <0.6", ["^0.5.0"]), []);
   });
 });

@@ -21,6 +21,7 @@ import {
   DependabotAlert,
   DeploymentRecommendation,
   InstalledTree,
+  OrphanEscape,
   OverrideChange,
   PackageManagerId,
   VulnerablePackage,
@@ -161,6 +162,26 @@ export function computeOverrideChanges(
   return changes;
 }
 
+/** The floor of an override spec: ">=11.1.1" and ">=7.29.6 <8" both yield the lower bound. */
+export function overrideFloor(spec: string): string {
+  return spec.replace(/^>=/, "").split(" ")[0].trim();
+}
+
+/**
+ * Of the ranges this override's dependents declare, which does its floor fall
+ * outside of?
+ *
+ * A non-empty result means the override is forcing those dependents past what
+ * they asked for — the same "no in-range fix" condition that computeOverrideChanges
+ * flags, but for an override already in place rather than one being written.
+ * Ranges it cannot parse (compound "^0.27.0 || ^0.28.0", wildcards) yield false
+ * from escapesCompatibleRange and are skipped: only provable escapes are named.
+ */
+export function findEscapingRanges(overrideSpec: string, dependentRanges: string[]): string[] {
+  const floor = overrideFloor(overrideSpec);
+  return dependentRanges.filter((range) => escapesCompatibleRange(floor, range));
+}
+
 /**
  * Surface the "no in-range fix exists" bucket separately from routine changes.
  *
@@ -171,19 +192,38 @@ export function computeOverrideChanges(
  * Nothing in that sequence is a signal, which is exactly why it gets its own
  * block here rather than a line in the list above.
  */
-function logNoInRangeFixWarning(escaped: OverrideChange[]): void {
-  if (escaped.length === 0) return;
+function logNoInRangeFixWarning(escaped: OverrideChange[], orphanEscapes: OrphanEscape[]): void {
+  const total = escaped.length + orphanEscapes.length;
+  if (total === 0) return;
 
-  log(`\n⚠️  NO IN-RANGE FIX — ${escaped.length} override(s) escape the installed compatible range:`);
-  for (const c of escaped) {
-    log(`      ${c.packageName}: installed ${c.installedVersion} → forced to "${c.newVersion}"`);
+  log(`\n⚠️  NO IN-RANGE FIX — ${total} override(s) escape the compatible range of their dependents:`);
+
+  if (escaped.length > 0) {
+    log("   From open alerts (being written now):");
+    for (const c of escaped) {
+      log(`      ${c.packageName}: installed ${c.installedVersion} → forced to "${c.newVersion}"`);
+    }
   }
+
+  if (orphanEscapes.length > 0) {
+    log("   Already in place (no open alert, kept because still load-bearing):");
+    for (const o of orphanEscapes) {
+      log(`      ${o.packageName}: "${o.spec}" forces dependents past ${o.dependentRanges.join(", ")}`);
+    }
+  }
+
   log("");
-  log("   These will install cleanly and close their alerts. That is not the same");
-  log("   as being safe: dependents that requested the old range will still call");
-  log("   the old API, and the break shows up at runtime, not at install.");
-  log("   Verify the dependents of each package above, or bump those dependents");
-  log("   to versions that request the patched range.");
+  log("   These install cleanly and their alerts read as fixed. That is not the same");
+  log("   as being safe: dependents that asked for the old range will still call the");
+  log("   old API, and the break shows up at runtime, not at install.");
+  log("   Verify the dependents of each package above, or bump those dependents to");
+  log("   versions that request the patched range.");
+  if (orphanEscapes.length > 0) {
+    log("");
+    log("   The 'already in place' entries are compared against the ranges the LATEST");
+    log("   published dependents declare, so this list can under-report: an older");
+    log("   installed dependent may ask for an even lower range than shown.");
+  }
 }
 
 export function applyOverrideChanges(
@@ -209,8 +249,6 @@ export function applyOverrideChanges(
     }
     log(`            (${change.reason})`);
   }
-
-  logNoInRangeFixWarning(changes.filter((c) => c.noInRangeFix));
 
   if (dryRun) {
     log("\n🚫 Dry run — no changes written.");
@@ -249,10 +287,10 @@ async function reconcileOrphanedOverride(
   manifestDir: string,
   pm: PackageManager,
   allAlertedNames: Set<string>,
-): Promise<void> {
+): Promise<OrphanEscape | null> {
   // Extract the patched version from the override spec, e.g. ">=11.1.1 <12" -> "11.1.1"
   const overrideSpec = source.overrides[name];
-  const patchedVersion = overrideSpec.replace(/^>=/, "").split(" ")[0].trim();
+  const patchedVersion = overrideFloor(overrideSpec);
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
   const registryRanges = await pm.collectDependentRanges(name, manifestDir);
@@ -264,22 +302,38 @@ async function reconcileOrphanedOverride(
         `Keeping conservatively — remove manually once upstream packages ` +
         `raise their own minimum requirements.`,
     );
-    return;
+    return null;
   }
 
   const stillNeeded = registryRanges.some((range) => rangeCouldResolveVulnerable(range, patchedVersion));
-  if (stillNeeded) {
-    log(
-      `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
-        `still load-bearing — latest upstream versions request: ${registryRanges.join(", ")}`,
-    );
-  } else {
+  if (!stillNeeded) {
     log(
       `   ✂️  Override for ${name} (${overrideSpec}) is no longer needed — ` +
         `latest upstream versions all request safe ranges: ${registryRanges.join(", ")}`,
     );
     allAlertedNames.add(name);
+    return null;
   }
+
+  // Load-bearing, but check *why*. If the floor sits outside what the dependents
+  // declare, keeping it isn't routine — it's forcing them past their range, the
+  // same condition an alert-driven override gets flagged for. Without this the
+  // two are indistinguishable in the output.
+  const escaping = findEscapingRanges(overrideSpec, registryRanges);
+  if (escaping.length > 0) {
+    log(
+      `   ⚠️  Override for ${name} (${overrideSpec}) has no open alert and is still ` +
+        `load-bearing, but no in-range fix exists for its dependents — ` +
+        `latest upstream versions request: ${registryRanges.join(", ")}`,
+    );
+    return { packageName: name, spec: overrideSpec, floor: patchedVersion, dependentRanges: escaping };
+  }
+
+  log(
+    `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
+      `still load-bearing — latest upstream versions request: ${registryRanges.join(", ")}`,
+  );
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +437,70 @@ function resolvePmForDir(
 // Main orchestration
 // ---------------------------------------------------------------------------
 
+/** What one manifest group contributed, for the run-wide summary. */
+interface GroupResult {
+  alerts: number;
+  added: number;
+  removed: number;
+  noInRangeFix: number;
+  recommendations: DeploymentRecommendation[];
+}
+
+/**
+ * Reconcile a single manifest directory: update, walk its tree, decide what
+ * overrides it needs, clean up orphans, and report.
+ */
+async function processManifestGroup(
+  manifestDir: string,
+  groupAlerts: DependabotAlert[],
+  cfg: ResolvedConfig,
+  ctx: RunContext,
+  rootPmId: PackageManagerId,
+  globalAlertedNames: Set<string>,
+): Promise<GroupResult> {
+  const isRoot = manifestDir === cfg.workspaceRoot;
+  const label = isRoot ? "root" : path.relative(cfg.workspaceRoot, manifestDir);
+  const pmId = resolvePmForDir(manifestDir, isRoot, rootPmId, cfg);
+  const pm = createPackageManager(pmId, ctx);
+
+  log(`\n${"─".repeat(48)}`);
+  log(`📂 Processing manifest: ${label} (${groupAlerts.length} alert(s)) [${pmId}]`);
+
+  log("🗂️  Detecting override config location...");
+  const source = selectOverrideSource(pmId, manifestDir, isRoot);
+
+  pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
+
+  const tree = pm.getInstalledTree(manifestDir);
+  const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
+
+  // Only remove overrides for packages whose alert in this group is resolved.
+  const allAlertedNames = new Set(groupAlerts.map((a) => a.security_vulnerability.package.name));
+
+  // For overrides with no active alert in ANY group, check whether any
+  // dependent still requests a vulnerable range.
+  const orphanedOverrides = Object.keys(source.overrides).filter((name) => !globalAlertedNames.has(name));
+  const orphanEscapes: OrphanEscape[] = [];
+  for (const name of orphanedOverrides) {
+    const escape = await reconcileOrphanedOverride(name, source, manifestDir, pm, allAlertedNames);
+    if (escape) orphanEscapes.push(escape);
+  }
+
+  const changes = computeOverrideChanges(source.overrides, stillVulnerable, allAlertedNames);
+  applyOverrideChanges(changes, source.overrides, source, cfg.dryRun);
+  const escapedChanges = changes.filter((c) => c.noInRangeFix);
+  logNoInRangeFixWarning(escapedChanges, orphanEscapes);
+
+  return {
+    alerts: groupAlerts.length,
+    added: changes.filter((c) => c.action !== "remove").length,
+    removed: changes.filter((c) => c.action === "remove").length,
+    noInRangeFix: escapedChanges.length + orphanEscapes.length,
+    recommendations:
+      groupAlerts.length > 0 ? stillVulnerable.map((v) => pm.analyseDeploymentImpact(v.name, manifestDir)) : [],
+  };
+}
+
 export async function run(cfg: ResolvedConfig): Promise<void> {
   log("🤖 Dependabot Override Agent");
   log("================================");
@@ -434,48 +552,13 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   const globalAlertedNames = new Set(alerts.map((a) => a.security_vulnerability.package.name));
 
   for (const [manifestDir, groupAlerts] of alertsByDir) {
-    const isRoot = manifestDir === cfg.workspaceRoot;
-    const label = isRoot ? "root" : path.relative(cfg.workspaceRoot, manifestDir);
-    const pmId = resolvePmForDir(manifestDir, isRoot, rootPmId, cfg);
-    const pm = createPackageManager(pmId, ctx);
+    const result = await processManifestGroup(manifestDir, groupAlerts, cfg, ctx, rootPmId, globalAlertedNames);
 
-    log(`\n${"─".repeat(48)}`);
-    log(`📂 Processing manifest: ${label} (${groupAlerts.length} alert(s)) [${pmId}]`);
-
-    log("🗂️  Detecting override config location...");
-    const source = selectOverrideSource(pmId, manifestDir, isRoot);
-
-    // Update packages in this directory
-    pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
-
-    // Walk its installed tree
-    const tree = pm.getInstalledTree(manifestDir);
-
-    // Determine which packages still need overrides
-    const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
-
-    // Only remove overrides for packages whose alert in this group is resolved.
-    const allAlertedNames = new Set(groupAlerts.map((a) => a.security_vulnerability.package.name));
-
-    // For overrides with no active alert in ANY group, check whether any
-    // dependent still requests a vulnerable range.
-    const orphanedOverrides = Object.keys(source.overrides).filter((name) => !globalAlertedNames.has(name));
-    for (const name of orphanedOverrides) {
-      await reconcileOrphanedOverride(name, source, manifestDir, pm, allAlertedNames);
-    }
-
-    const changes = computeOverrideChanges(source.overrides, stillVulnerable, allAlertedNames);
-    applyOverrideChanges(changes, source.overrides, source, cfg.dryRun);
-
-    if (groupAlerts.length > 0) {
-      const groupRecs = stillVulnerable.map((v) => pm.analyseDeploymentImpact(v.name, manifestDir));
-      allRecommendations.push(...groupRecs);
-    }
-
-    totalAlerts += groupAlerts.length;
-    totalAdded += changes.filter((c) => c.action !== "remove").length;
-    totalRemoved += changes.filter((c) => c.action === "remove").length;
-    totalNoInRangeFix += changes.filter((c) => c.noInRangeFix).length;
+    totalAlerts += result.alerts;
+    totalAdded += result.added;
+    totalRemoved += result.removed;
+    totalNoInRangeFix += result.noInRangeFix;
+    allRecommendations.push(...result.recommendations);
   }
 
   // Summary

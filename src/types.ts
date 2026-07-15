@@ -76,6 +76,20 @@ export interface OverrideChange {
   installedVersion?: string;
 }
 
+/**
+ * An override already in place, with no open alert, that forces its dependents
+ * past the range they declare. Same "no in-range fix" condition as the
+ * noInRangeFix flag on OverrideChange, reached the other way: there is no alert
+ * driving it, so it produces no OverrideChange and would otherwise be reported
+ * as a routine still-load-bearing override.
+ */
+export interface OrphanEscape {
+  packageName: string;
+  spec: string; // the full override spec, e.g. ">=11.1.1"
+  floor: string; // the spec's floor, e.g. "11.1.1"
+  dependentRanges: string[]; // the declared ranges it escapes, e.g. ["^7.0.3"]
+}
+
 // ---------------------------------------------------------------------------
 // Deployment-impact analysis
 // ---------------------------------------------------------------------------
