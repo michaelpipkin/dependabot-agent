@@ -19,7 +19,9 @@ import {
 import { findInstalledVersion } from "./tree.js";
 import {
   DependabotAlert,
+  DependentRange,
   DeploymentRecommendation,
+  EscapingDependent,
   InstalledTree,
   OrphanEscape,
   OverrideChange,
@@ -168,18 +170,39 @@ export function overrideFloor(spec: string): string {
 }
 
 /**
- * Of the ranges this override's dependents declare, which does its floor fall
- * outside of?
+ * Which of this override's dependents does its floor force past their declared
+ * range?
  *
- * A non-empty result means the override is forcing those dependents past what
- * they asked for — the same "no in-range fix" condition that computeOverrideChanges
- * flags, but for an override already in place rather than one being written.
+ * A non-empty result means the override is dragging those dependents beyond
+ * what they asked for — the same "no in-range fix" condition that
+ * computeOverrideChanges flags, but for an override already in place rather
+ * than one being written.
+ *
+ * Judged against each dependent's range at its INSTALLED version, which is the
+ * question that actually matters: what does the tree you have ask for? Falls
+ * back to the latest published version's range only when the installed one
+ * can't be resolved, and records which was used so the report can say so.
+ *
  * Ranges it cannot parse (compound "^0.27.0 || ^0.28.0", wildcards) yield false
  * from escapesCompatibleRange and are skipped: only provable escapes are named.
  */
-export function findEscapingRanges(overrideSpec: string, dependentRanges: string[]): string[] {
+export function findEscapingDependents(overrideSpec: string, dependents: DependentRange[]): EscapingDependent[] {
   const floor = overrideFloor(overrideSpec);
-  return dependentRanges.filter((range) => escapesCompatibleRange(floor, range));
+  const escaping: EscapingDependent[] = [];
+
+  for (const dep of dependents) {
+    const range = dep.installedRange ?? dep.latestRange;
+    if (!range) continue;
+    if (!escapesCompatibleRange(floor, range)) continue;
+    escaping.push({
+      name: dep.dependent,
+      version: dep.version,
+      range,
+      source: dep.installedRange ? "installed" : "latest",
+    });
+  }
+
+  return escaping;
 }
 
 /**
@@ -208,7 +231,10 @@ function logNoInRangeFixWarning(escaped: OverrideChange[], orphanEscapes: Orphan
   if (orphanEscapes.length > 0) {
     log("   Already in place (no open alert, kept because still load-bearing):");
     for (const o of orphanEscapes) {
-      log(`      ${o.packageName}: "${o.spec}" forces dependents past ${o.dependentRanges.join(", ")}`);
+      log(`      ${o.packageName}: "${o.spec}" forces past what its dependents declare:`);
+      for (const d of o.dependents) {
+        log(`         ${d.name}@${d.version} declares ${d.range}`);
+      }
     }
   }
 
@@ -216,13 +242,19 @@ function logNoInRangeFixWarning(escaped: OverrideChange[], orphanEscapes: Orphan
   log("   These install cleanly and their alerts read as fixed. That is not the same");
   log("   as being safe: dependents that asked for the old range will still call the");
   log("   old API, and the break shows up at runtime, not at install.");
-  log("   Verify the dependents of each package above, or bump those dependents to");
-  log("   versions that request the patched range.");
-  if (orphanEscapes.length > 0) {
+  log("   Verify the dependents listed above, or bump them to versions that request");
+  log("   the patched range.");
+
+  // Ranges are read at each dependent's installed version. Where that couldn't
+  // be resolved we fell back to the latest published version, which may declare
+  // a different range than the copy actually on disk — say so rather than let
+  // the entry read as authoritative.
+  const fellBack = orphanEscapes.flatMap((o) => o.dependents).filter((d) => d.source === "latest");
+  if (fellBack.length > 0) {
     log("");
-    log("   The 'already in place' entries are compared against the ranges the LATEST");
-    log("   published dependents declare, so this list can under-report: an older");
-    log("   installed dependent may ask for an even lower range than shown.");
+    log(`   ${fellBack.length} of the above could not be resolved at the installed version and`);
+    log("   were judged against the dependent's latest published range instead:");
+    for (const d of fellBack) log(`      ${d.name}@${d.version}`);
   }
 }
 
@@ -293,9 +325,10 @@ async function reconcileOrphanedOverride(
   const patchedVersion = overrideFloor(overrideSpec);
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
-  const registryRanges = await pm.collectDependentRanges(name, manifestDir);
+  const dependents = await pm.collectDependentRanges(name, manifestDir);
+  const latestRanges = [...new Set(dependents.map((d) => d.latestRange).filter((r): r is string => r !== null))];
 
-  if (registryRanges.length === 0) {
+  if (latestRanges.length === 0) {
     log(
       `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert. ` +
         `Could not determine upstream ranges from registry. ` +
@@ -305,11 +338,14 @@ async function reconcileOrphanedOverride(
     return null;
   }
 
-  const stillNeeded = registryRanges.some((range) => rangeCouldResolveVulnerable(range, patchedVersion));
+  // Removal asks a forward-looking question — "has upstream moved on?" — so it
+  // reads the LATEST published ranges: after an update you resolve to those
+  // dependents anyway.
+  const stillNeeded = latestRanges.some((range) => rangeCouldResolveVulnerable(range, patchedVersion));
   if (!stillNeeded) {
     log(
       `   ✂️  Override for ${name} (${overrideSpec}) is no longer needed — ` +
-        `latest upstream versions all request safe ranges: ${registryRanges.join(", ")}`,
+        `latest upstream versions all request safe ranges: ${latestRanges.join(", ")}`,
     );
     allAlertedNames.add(name);
     return null;
@@ -317,21 +353,23 @@ async function reconcileOrphanedOverride(
 
   // Load-bearing, but check *why*. If the floor sits outside what the dependents
   // declare, keeping it isn't routine — it's forcing them past their range, the
-  // same condition an alert-driven override gets flagged for. Without this the
-  // two are indistinguishable in the output.
-  const escaping = findEscapingRanges(overrideSpec, registryRanges);
+  // same condition an alert-driven override gets flagged for. This asks about
+  // the tree you have, so it reads the INSTALLED ranges.
+  const escaping = findEscapingDependents(overrideSpec, dependents);
   if (escaping.length > 0) {
     log(
       `   ⚠️  Override for ${name} (${overrideSpec}) has no open alert and is still ` +
-        `load-bearing, but no in-range fix exists for its dependents — ` +
-        `latest upstream versions request: ${registryRanges.join(", ")}`,
+        `load-bearing, but no in-range fix exists for its dependents:`,
     );
-    return { packageName: name, spec: overrideSpec, floor: patchedVersion, dependentRanges: escaping };
+    for (const d of escaping) {
+      log(`         ${d.name}@${d.version} declares ${d.range}${d.source === "latest" ? " (latest — installed version unresolved)" : ""}`);
+    }
+    return { packageName: name, spec: overrideSpec, floor: patchedVersion, dependents: escaping };
   }
 
   log(
     `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
-      `still load-bearing — latest upstream versions request: ${registryRanges.join(", ")}`,
+      `still load-bearing — latest upstream versions request: ${latestRanges.join(", ")}`,
   );
   return null;
 }

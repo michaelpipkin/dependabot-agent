@@ -1,4 +1,10 @@
-import { DeploymentRecommendation, InstalledTree, PackageManagerId, UpdateStrategy } from "../types.js";
+import {
+  DependentRange,
+  DeploymentRecommendation,
+  InstalledTree,
+  PackageManagerId,
+  UpdateStrategy,
+} from "../types.js";
 
 /**
  * Run-wide context shared with package managers. Replaces the module-level
@@ -30,11 +36,13 @@ export interface PackageManager {
   getInstalledTree(cwd: string): InstalledTree[];
 
   /**
-   * Collect the version ranges that the latest published versions of all
-   * dependents declare for `packageName`. Used to decide whether an override
-   * with no open alert is still load-bearing.
+   * Find every installed dependent of `packageName` and resolve the range each
+   * declares for it — both at the version installed here and at the dependent's
+   * latest published version. Used to decide whether an override with no open
+   * alert is still load-bearing (latest), and whether it forces a real dependent
+   * past its declared range (installed).
    */
-  collectDependentRanges(packageName: string, cwd: string): Promise<string[]>;
+  collectDependentRanges(packageName: string, cwd: string): Promise<DependentRange[]>;
 
   /** Analyse whether a package is reachable from production code. */
   analyseDeploymentImpact(packageName: string, cwd: string): DeploymentRecommendation;

@@ -6,15 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
-## [Unreleased]
+## [0.1.6]
 
 ### Fixed
 
-- **"No in-range fix" now covers overrides with no open alert.** 0.1.5 wired the check into the alert-driven path only. Overrides without an open alert take the orphan path, which asked only whether they were still load-bearing and reported every kept override identically — so a repo with zero open alerts, the steady state most of the time, never saw the check fire. An override kept as load-bearing can still be forcing its dependents past the range they declare; those are now reported as no-in-range-fix, using the dependent ranges already fetched for the removal decision.
+- **"No in-range fix" now covers overrides with no open alert.** 0.1.5 wired the check into the alert-driven path only. Overrides without an open alert take the orphan path, which asked only whether they were still load-bearing and reported every kept override identically — so a repo with zero open alerts, the steady state most of the time, never saw the check fire. An override kept as load-bearing can still be forcing its dependents past the range they declare; those are now reported as no-in-range-fix.
+- **Dependent ranges are resolved at the version installed, not the latest published.** `pnpm why` and `npm explain` both report each dependent's installed version; it was collected into a name-only set and discarded, and the range was then read from the dependent's `latest` manifest — which can declare something entirely different from the copy on disk. This under-reported escapes badly in practice: on a real tree, `tar >=7.5.16` read as routine because the latest dependents declare `^7.5.3`, while the *installed* `@capacitor/cli@5.7.8` declares `^6.1.11` and was being forced across a full major. Two of five escapes on that tree were invisible.
 
-### Known limitations
+  Both questions are now asked of the data that answers them: removal still reads the **latest** ranges (it asks "has upstream moved on?"), while the escape check reads the **installed** ranges (it asks "what does the tree I have ask for?"). Where a dependent's installed manifest can't be resolved, the report falls back to its latest range and says which entries it did that for.
 
-- The escape check for existing overrides compares against the ranges the **latest published** dependents declare, not the versions installed. An installed dependent is no newer than latest, so its declared range is generally no higher — meaning this **under-reports** rather than raising false alarms. Resolving each dependent's range at its installed version is the proper fix; the version is already known and currently discarded.
+### Changed
+
+- Escape reports now name the offending dependents and their versions (`gaxios@6.7.1 declares ^9.0.1`) rather than listing bare ranges.
+- `PackageManager.collectDependentRanges` returns `DependentRange[]` instead of `string[]`. Internal interface; no CLI or config surface changes.
 
 ## [0.1.5] - 2026-07-15
 

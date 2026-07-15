@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
-import { DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
+import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
-import { fetchRegistrySpecifier } from "../registry.js";
+import { fetchDependentRanges } from "../registry.js";
 import { PackageManager, RunContext } from "./types.js";
 
 // Raw shape pnpm emits from `pnpm list --json` (we normalize away from this).
@@ -86,24 +86,30 @@ export class PnpmPackageManager implements PackageManager {
     }));
   }
 
-  async collectDependentRanges(packageName: string, cwd: string): Promise<string[]> {
+  async collectDependentRanges(packageName: string, cwd: string): Promise<DependentRange[]> {
     try {
       const raw = shell(`pnpm why ${packageName} --json`, { cwd, maxBuffer: 16 * 1024 * 1024 });
       const entries = JSON.parse(raw) as PnpmWhyEntry[];
 
-      const dependentNames = new Set<string>();
+      // Key by name@version, not name: the same dependent can appear at more
+      // than one version in a tree, and they may declare different ranges.
+      const dependents = new Map<string, { name: string; version: string }>();
       function collectDependents(deps: PnpmWhyDependent[]): void {
         for (const dep of deps) {
-          if (!dep.deduped) dependentNames.add(dep.name);
+          if (!dep.deduped) dependents.set(`${dep.name}@${dep.version}`, { name: dep.name, version: dep.version });
           if (dep.dependents) collectDependents(dep.dependents);
         }
       }
       for (const entry of entries) collectDependents(entry.dependents);
 
-      const rangeResults = await Promise.all(
-        [...dependentNames].map((name) => fetchRegistrySpecifier(name, packageName)),
+      const results = await Promise.all(
+        [...dependents.values()].map(async ({ name, version }) => {
+          const ranges = await fetchDependentRanges(name, version, packageName);
+          return { dependent: name, version, ...ranges };
+        }),
       );
-      return [...new Set(rangeResults.filter((r): r is string => r !== null && r !== "*" && r !== ""))];
+      // Drop dependents that declare nothing usable at either version.
+      return results.filter((r) => r.installedRange !== null || r.latestRange !== null);
     } catch {
       return [];
     }

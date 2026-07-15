@@ -77,6 +77,38 @@ export interface OverrideChange {
 }
 
 /**
+ * One dependent of an overridden package, with the ranges it declares for that
+ * package at two points: the version installed in this tree, and the latest
+ * published version.
+ *
+ * The two answer different questions and are deliberately both kept:
+ *   - latestRange    — "has upstream moved on?" Decides whether an override
+ *                      with no open alert can be dropped, since after an update
+ *                      you resolve to the latest dependents anyway.
+ *   - installedRange — "what does the tree I actually have ask for?" Decides
+ *                      whether an override is forcing a real dependent past its
+ *                      declared range.
+ *
+ * Either may be null when the registry has no manifest for that version or the
+ * dependent declares no range on the target.
+ */
+export interface DependentRange {
+  dependent: string;
+  version: string; // the dependent's INSTALLED version
+  installedRange: string | null;
+  latestRange: string | null;
+}
+
+/** A dependent an override forces past the range it declares. */
+export interface EscapingDependent {
+  name: string;
+  version: string;
+  range: string;
+  /** Which range this was judged against — "latest" means installedRange was unavailable. */
+  source: "installed" | "latest";
+}
+
+/**
  * An override already in place, with no open alert, that forces its dependents
  * past the range they declare. Same "no in-range fix" condition as the
  * noInRangeFix flag on OverrideChange, reached the other way: there is no alert
@@ -87,7 +119,7 @@ export interface OrphanEscape {
   packageName: string;
   spec: string; // the full override spec, e.g. ">=11.1.1"
   floor: string; // the spec's floor, e.g. "11.1.1"
-  dependentRanges: string[]; // the declared ranges it escapes, e.g. ["^7.0.3"]
+  dependents: EscapingDependent[];
 }
 
 // ---------------------------------------------------------------------------

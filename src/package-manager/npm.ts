@@ -1,9 +1,9 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
+import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
-import { fetchRegistrySpecifier } from "../registry.js";
+import { fetchDependentRanges } from "../registry.js";
 import { PackageManager, RunContext } from "./types.js";
 
 // Raw shape npm emits from `npm ls --all --json`. All deps (prod + dev) appear
@@ -132,30 +132,36 @@ export class NpmPackageManager implements PackageManager {
     ];
   }
 
-  async collectDependentRanges(packageName: string, cwd: string): Promise<string[]> {
+  async collectDependentRanges(packageName: string, cwd: string): Promise<DependentRange[]> {
     try {
       const raw = npmJson(`npm explain ${packageName} --json`, cwd);
       const nodes = JSON.parse(raw) as NpmExplainNode[];
 
-      // Collect the names of every package that requires something along each
-      // chain (walking `from` up toward the root). Only direct dependents of
-      // the target actually declare a range on it; querying the rest returns
-      // null and is filtered out.
-      const dependentNames = new Set<string>();
+      // Collect every package that requires something along each chain (walking
+      // `from` up toward the root). Only direct dependents of the target
+      // actually declare a range on it; the rest resolve to null and drop out.
+      // Keyed by name@version — the same dependent can appear at more than one
+      // version, and they may declare different ranges.
+      const dependents = new Map<string, { name: string; version: string }>();
       function walk(edges: NpmExplainEdge[] | undefined): void {
         if (!edges) return;
         for (const edge of edges) {
           const from = edge.from;
-          if (from?.name && from.location !== "") dependentNames.add(from.name);
+          if (from?.name && from.version && from.location !== "") {
+            dependents.set(`${from.name}@${from.version}`, { name: from.name, version: from.version });
+          }
           if (from?.dependents) walk(from.dependents);
         }
       }
       for (const node of nodes) walk(node.dependents);
 
-      const rangeResults = await Promise.all(
-        [...dependentNames].map((name) => fetchRegistrySpecifier(name, packageName)),
+      const results = await Promise.all(
+        [...dependents.values()].map(async ({ name, version }) => {
+          const ranges = await fetchDependentRanges(name, version, packageName);
+          return { dependent: name, version, ...ranges };
+        }),
       );
-      return [...new Set(rangeResults.filter((r): r is string => r !== null && r !== "*" && r !== ""))];
+      return results.filter((r) => r.installedRange !== null || r.latestRange !== null);
     } catch {
       return [];
     }

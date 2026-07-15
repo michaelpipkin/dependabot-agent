@@ -418,7 +418,14 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 
 ### Orphaned overrides
 
-For an override with no matching open alert, the agent queries the npm registry for the ranges that the latest upstream dependents declare. Only if every upstream range now requests a safe version is the override removed — otherwise it's kept as still load-bearing. Registry data is used because it is unaffected by your local overrides.
+For an override with no matching open alert, the agent finds its installed dependents and asks the npm registry what range each declares for the overridden package. Registry data is used because your installed tree's *resolved* versions reflect whatever the overrides forced; reading the declared range off disk would mean knowing each package manager's `node_modules` layout, so the registry keeps this package-manager independent.
+
+Two different questions get asked here, of two different versions of each dependent:
+
+- **"Can this override be removed?"** reads the range each dependent's **latest published** version declares. It's forward-looking — after an update you resolve to those versions anyway — so the override is only removed if every latest upstream range now requests a safe version. Otherwise it's kept as still load-bearing.
+- **"Is this override forcing a dependent past its range?"** reads the range the **installed** version declares, because that's a question about the tree you actually have. A hit is reported as [no in-range fix](#no-in-range-fix), naming the dependent and version.
+
+The distinction matters. An override can look routine against latest and be forcing a major bump on the copy you have: if the newest release of a dependent asks for `^7.5.3` but the version installed asks for `^6.1.11`, an override at `>=7.5.16` is dragging your installed copy across a major, and only the installed range shows it. Where a dependent's installed manifest can't be resolved from the registry, the escape check falls back to its latest range and the report says so.
 
 > **Note on YAML comments:** `js-yaml` doesn't round-trip comments, so hand-written comments in `pnpm-workspace.yaml` are lost on the first write.
 
