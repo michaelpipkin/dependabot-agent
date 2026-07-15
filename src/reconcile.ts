@@ -9,7 +9,13 @@ import {
   PackageManager,
   RunContext,
 } from "./package-manager/index.js";
-import { compareSemver, computeBoundedSpec, parseSemver, rangeCouldResolveVulnerable } from "./semver.js";
+import {
+  compareSemver,
+  computeBoundedSpec,
+  escapesCompatibleRange,
+  parseSemver,
+  rangeCouldResolveVulnerable,
+} from "./semver.js";
 import { findInstalledVersion } from "./tree.js";
 import {
   DependabotAlert,
@@ -95,7 +101,7 @@ function findVulnerableInstalls(alerts: DependabotAlert[], tree: InstalledTree[]
 // Compute and apply override changes
 // ---------------------------------------------------------------------------
 
-function computeOverrideChanges(
+export function computeOverrideChanges(
   currentOverrides: Record<string, string>,
   stillVulnerable: VulnerablePackage[],
   resolvedAlertNames: Set<string>,
@@ -103,19 +109,25 @@ function computeOverrideChanges(
   const changes: OverrideChange[] = [];
   const neededOverrides = new Map(stillVulnerable.map((v) => [v.name, v.patchedVersion]));
 
-  // Add or update overrides for packages that still need them. We write a
-  // major-bounded spec (>=patchedVersion <currentMajor+1) rather than an
-  // unbounded >= to prevent jumping to a new major with breaking changes.
+  // Add or update overrides for packages that still need them. The spec is
+  // bounded at the first breaking version above the patch rather than left as
+  // an unbounded >=, so applying a fix can't drag the tree further than it has
+  // to. Where even that minimum lands outside what the installed version's
+  // dependents can accept, the change is marked noInRangeFix for the report.
   for (const [name, versionSpec] of neededOverrides) {
     const pkg = stillVulnerable.find((v) => v.name === name);
     const boundedSpec = computeBoundedSpec(versionSpec, pkg?.installedVersion);
+    const noInRangeFix = escapesCompatibleRange(versionSpec, pkg?.installedVersion);
+    const escapeReason = `No in-range fix exists — earliest patch ${versionSpec} is outside the compatible range of installed ${pkg?.installedVersion}`;
     const existing = currentOverrides[name];
     if (!existing) {
       changes.push({
         packageName: name,
         action: "add",
         newVersion: boundedSpec,
-        reason: `Still vulnerable per Dependabot (needs ${boundedSpec})`,
+        reason: noInRangeFix ? escapeReason : `Still vulnerable per Dependabot (needs ${boundedSpec})`,
+        noInRangeFix,
+        installedVersion: pkg?.installedVersion,
       });
     } else if (existing !== boundedSpec) {
       changes.push({
@@ -123,7 +135,9 @@ function computeOverrideChanges(
         action: "update",
         oldVersion: existing,
         newVersion: boundedSpec,
-        reason: `Updated version requirement to ${boundedSpec}`,
+        reason: noInRangeFix ? escapeReason : `Updated version requirement to ${boundedSpec}`,
+        noInRangeFix,
+        installedVersion: pkg?.installedVersion,
       });
     }
     // else: already correct — no change needed
@@ -147,7 +161,32 @@ function computeOverrideChanges(
   return changes;
 }
 
-function applyOverrideChanges(
+/**
+ * Surface the "no in-range fix exists" bucket separately from routine changes.
+ *
+ * These are the ones that need a human. The override itself will apply without
+ * complaint — the package manager forces the version at resolution time, so a
+ * dependent's declared range does not block it and the install exits 0.
+ * Dependabot then closes the alert because the resolved version is patched.
+ * Nothing in that sequence is a signal, which is exactly why it gets its own
+ * block here rather than a line in the list above.
+ */
+function logNoInRangeFixWarning(escaped: OverrideChange[]): void {
+  if (escaped.length === 0) return;
+
+  log(`\n⚠️  NO IN-RANGE FIX — ${escaped.length} override(s) escape the installed compatible range:`);
+  for (const c of escaped) {
+    log(`      ${c.packageName}: installed ${c.installedVersion} → forced to "${c.newVersion}"`);
+  }
+  log("");
+  log("   These will install cleanly and close their alerts. That is not the same");
+  log("   as being safe: dependents that requested the old range will still call");
+  log("   the old API, and the break shows up at runtime, not at install.");
+  log("   Verify the dependents of each package above, or bump those dependents");
+  log("   to versions that request the patched range.");
+}
+
+export function applyOverrideChanges(
   changes: OverrideChange[],
   currentOverrides: Record<string, string>,
   source: OverrideSource,
@@ -160,15 +199,18 @@ function applyOverrideChanges(
 
   log(`\n📝 Planned override changes (${source.label}):`);
   for (const change of changes) {
+    const mark = change.noInRangeFix ? "⚠" : " ";
     if (change.action === "add") {
-      log(`   + ADD    ${change.packageName}: "${change.newVersion}"`);
+      log(`  ${mark}+ ADD    ${change.packageName}: "${change.newVersion}"`);
     } else if (change.action === "update") {
-      log(`   ~ UPDATE ${change.packageName}: "${change.oldVersion}" → "${change.newVersion}"`);
+      log(`  ${mark}~ UPDATE ${change.packageName}: "${change.oldVersion}" → "${change.newVersion}"`);
     } else {
-      log(`   - REMOVE ${change.packageName}: "${change.oldVersion}"`);
+      log(`  ${mark}- REMOVE ${change.packageName}: "${change.oldVersion}"`);
     }
     log(`            (${change.reason})`);
   }
+
+  logNoInRangeFixWarning(changes.filter((c) => c.noInRangeFix));
 
   if (dryRun) {
     log("\n🚫 Dry run — no changes written.");
@@ -383,6 +425,7 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   let totalAdded = 0;
   let totalRemoved = 0;
   let totalAlerts = 0;
+  let totalNoInRangeFix = 0;
   const allRecommendations: DeploymentRecommendation[] = [];
 
   // Global set of all alerted package names across every group. Prevents a
@@ -432,6 +475,7 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
     totalAlerts += groupAlerts.length;
     totalAdded += changes.filter((c) => c.action !== "remove").length;
     totalRemoved += changes.filter((c) => c.action === "remove").length;
+    totalNoInRangeFix += changes.filter((c) => c.noInRangeFix).length;
   }
 
   // Summary
@@ -441,6 +485,9 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   log(`   Dependabot alerts checked : ${totalAlerts}`);
   log(`   Overrides added/updated   : ${totalAdded}`);
   log(`   Overrides removed         : ${totalRemoved}`);
+  if (totalNoInRangeFix > 0) {
+    log(`   ⚠️  No in-range fix        : ${totalNoInRangeFix}  (escapes compatible range — verify dependents)`);
+  }
 
   if (allRecommendations.length > 0) {
     log(`\n${"═".repeat(48)}`);

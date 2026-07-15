@@ -2,11 +2,26 @@
 // Semver helpers  (no external deps — keeps the agent self-contained)
 // ---------------------------------------------------------------------------
 
-/** Parse a semver string into [major, minor, patch] numeric tuple, ignoring pre-release. */
+/**
+ * Parse a semver string into a [major, minor, patch] tuple, ignoring
+ * pre-release. Returns null for anything that isn't a plain dotted version, so
+ * callers can fall back to their conservative branch.
+ *
+ * Segments are validated as digit strings rather than passed through Number():
+ * Number("") is 0, not NaN, so a bare "" or a "1..3" would otherwise parse as a
+ * real version instead of being rejected.
+ */
 export function parseSemver(version: string): [number, number, number] | null {
-  const clean = version.replace(/^[~^>=<\s]+/, "").split("-")[0]; // strip range prefix & pre-release
-  const parts = clean.split(".").map(Number);
-  if (parts.length < 1 || parts.some(Number.isNaN)) return null;
+  const clean = version
+    .replace(/^[~^>=<\s]+/, "")
+    .split("-")[0] // strip range prefix & pre-release
+    .trim();
+  if (clean === "") return null;
+
+  const segments = clean.split(".").map((s) => s.trim());
+  if (!segments.every((s) => /^\d+$/.test(s))) return null;
+
+  const parts = segments.map(Number);
   return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
 }
 
@@ -67,27 +82,93 @@ export function rangeCouldResolveVulnerable(specifier: string, patchedVersion: s
 }
 
 /**
- * Compute a major-bounded override spec from a patched version and the
- * currently installed version.
+ * The exclusive upper bound of the caret-compatible range around a version —
+ * i.e. the first version that is considered a breaking change from it.
+ *
+ * Follows npm's caret rules, where the significance of a position depends on
+ * the leading zeros:
+ *   ^1.2.3 := >=1.2.3 <2.0.0   → breaking at the major
+ *   ^0.2.3 := >=0.2.3 <0.3.0   → breaking at the MINOR
+ *   ^0.0.3 := >=0.0.3 <0.0.4   → breaking at the PATCH
+ *
+ * The 0.x rules are the whole reason this is a function rather than `major + 1`.
+ * A large share of real transitive alerts sit on 0.x packages, where treating
+ * the major as the boundary silently classifies a breaking bump as routine.
+ */
+export function compatibleCeiling(v: [number, number, number]): [number, number, number] {
+  const [major, minor, patch] = v;
+  if (major > 0) return [major + 1, 0, 0];
+  if (minor > 0) return [0, minor + 1, 0];
+  return [0, 0, patch + 1];
+}
+
+/** Render a ceiling tuple as the shortest valid range bound: 8, 0.8, or 0.0.4. */
+export function formatCeiling(v: [number, number, number]): string {
+  const [major, minor, patch] = v;
+  if (major > 0) return `${major}`;
+  if (minor > 0) return `0.${minor}`;
+  return `0.0.${patch}`;
+}
+
+/**
+ * True when no in-range fix exists — the earliest patched version falls outside
+ * the caret-compatible range of what is currently installed, so clearing the
+ * alert necessarily forces the tree across a breaking boundary.
+ *
+ * This is the bucket that needs flagging rather than silently applying. Such an
+ * override installs cleanly: the package manager applies it at the resolution
+ * layer, so a dependent's declared range does not veto it — not a caret range,
+ * not a peer range, not even an exact pin — and no ERESOLVE is raised. The
+ * alert closes because the resolved version is patched. The install is green
+ * and the dependent is left calling an API that changed shape underneath it.
+ * The failure surfaces at runtime.
+ *
+ * Note this is about the *breaking* boundary, not the major number: a 0.5.0 →
+ * 0.7.0 bump escapes ^0.5.0 and counts, even though the major never moves.
+ *
+ * Returns false when either version is unparseable — we only flag what we can
+ * actually prove escapes the range.
+ */
+export function escapesCompatibleRange(patchedVersion: string, installedVersion?: string): boolean {
+  const patched = parseSemver(patchedVersion);
+  const installed = installedVersion ? parseSemver(installedVersion) : null;
+  if (!patched || !installed) return false;
+  return compareSemver(patched, compatibleCeiling(installed)) >= 0;
+}
+
+/**
+ * Compute a bounded override spec from a patched version and the currently
+ * installed version: a floor at the patch, and a ceiling at the first breaking
+ * version above whichever of the two we expect to actually resolve to.
  *
  * Examples:
  *   patchedVersion="7.29.6", installedVersion="7.29.0" → ">=7.29.6 <8"
  *   patchedVersion="5.2.0",  installedVersion="5.1.4"  → ">=5.2.0 <6"
  *   patchedVersion="11.1.1", installedVersion="11.1.1" → ">=11.1.1 <12"
  *   patchedVersion="7.28.0", installedVersion="6.21.0" → ">=7.28.0 <8"
+ *   patchedVersion="0.7.0",  installedVersion="0.5.0"  → ">=0.7.0 <0.8"
  *
- * The upper bound uses the higher of the installed and patched majors, plus one.
- * Normally these majors are equal; when the only fix lives in a newer major than
- * what is installed (a cross-major patch), the ceiling must clear the patched
- * floor — otherwise we'd emit an impossible empty range like ">=7.28.0 <7".
+ * The ceiling anchors on the HIGHER of patched and installed, for two reasons:
+ * when the only fix lives above the installed version, the ceiling must clear
+ * the patched floor — otherwise we'd emit an impossible empty range like
+ * ">=7.28.0 <7". And when the installed version is already above the patch, the
+ * ceiling must clear the installed version so the spec doesn't force a
+ * pointless downgrade.
  *
- * If we can't determine either major (package not in tree, unparseable patch),
- * falls back to an unbounded ">=", which is still safe.
+ * The ceiling can never exclude the floor, because the floor is itself a
+ * published version and always sits inside its own compatible range — so this
+ * cannot produce an unsatisfiable spec (an ETARGET at install).
+ *
+ * If neither version is parseable, falls back to an unbounded ">=", which is
+ * still safe.
  */
 export function computeBoundedSpec(patchedVersion: string, installedVersion?: string): string {
-  const patchedParsed = parseSemver(patchedVersion);
-  const installedParsed = installedVersion ? parseSemver(installedVersion) : null;
-  const baseMajor = Math.max(patchedParsed?.[0] ?? 0, installedParsed?.[0] ?? 0);
-  const nextMajor = patchedParsed || installedParsed ? baseMajor + 1 : null;
-  return nextMajor === null ? `>=${patchedVersion}` : `>=${patchedVersion} <${nextMajor}`;
+  const patched = parseSemver(patchedVersion);
+  const installed = installedVersion ? parseSemver(installedVersion) : null;
+  if (!patched && !installed) return `>=${patchedVersion}`;
+
+  let anchor = patched ?? installed!;
+  if (patched && installed && compareSemver(installed, patched) > 0) anchor = installed;
+
+  return `>=${patchedVersion} <${formatCeiling(compatibleCeiling(anchor))}`;
 }

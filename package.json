@@ -1,6 +1,6 @@
 {
   "name": "dependabot-agent",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "author": "Michael Pipkin <michael.a.pipkin@gmail.com>",
   "description": "On-demand CLI agent that reconciles npm/pnpm dependency overrides with GitHub Dependabot alerts",
   "license": "MIT",
@@ -26,7 +26,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsc -p tsconfig.json && node dist/index.js",
-    "prepublishOnly": "npm run build"
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/test/**/*.test.js\"",
+    "prepublishOnly": "npm run test && npm run build"
   },
   "keywords": [
     "dependabot",
@@ -48,5 +49,5 @@
   "engines": {
     "node": ">=20"
   },
-  "packageManager": "pnpm@11.10.0"
+  "packageManager": "pnpm@11.13.0"
 }

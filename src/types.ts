@@ -64,6 +64,16 @@ export interface OverrideChange {
   oldVersion?: string;
   newVersion?: string;
   reason: string;
+  /**
+   * Set when no in-range fix exists — the patched version falls outside the
+   * caret-compatible range of what is installed, so this override forces the
+   * tree across a breaking boundary. The install will still succeed; the risk
+   * is a runtime break in the dependents that requested the old range. See
+   * escapesCompatibleRange() in semver.ts.
+   */
+  noInRangeFix?: boolean;
+  /** Installed version at the time the change was computed — context for the warning. */
+  installedVersion?: string;
 }
 
 // ---------------------------------------------------------------------------

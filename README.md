@@ -11,10 +11,11 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 3. **Fetches** all open npm Dependabot alerts for your repo via the GitHub API.
 4. **Updates** dependencies (range-bound by default — see [Update strategy](#update-strategy)).
 5. **Walks** the full installed dependency tree and confirms each alerted package is actually present.
-6. **Adds or updates** override entries for packages that remain vulnerable, writing a major-bounded spec (`>=patched <nextMajor`) so a fix never forces a breaking major bump.
-7. **Removes** overrides whose vulnerability has been resolved.
-8. **Leaves untouched** any overrides for packages that don't appear in any Dependabot alert (assumed intentional).
-9. **Reports** deployment impact — whether vulnerable packages are in your production graph (deploy recommended) or dev/test only (branch push sufficient).
+6. **Adds or updates** override entries for packages that remain vulnerable, writing a spec bounded at the first breaking version above the patch (`>=0.7.0 <0.8`, `>=4.17.21 <5`) so a fix never drags the tree further than it has to.
+7. **Flags** the cases where no in-range fix exists — the earliest patched version sits outside what's installed can accept — separately from routine changes. See [No in-range fix](#no-in-range-fix).
+8. **Removes** overrides whose vulnerability has been resolved.
+9. **Leaves untouched** any overrides for packages that don't appear in any Dependabot alert (assumed intentional).
+10. **Reports** deployment impact — whether vulnerable packages are in your production graph (deploy recommended) or dev/test only (branch push sufficient).
 
 ## Requirements
 
@@ -202,7 +203,31 @@ The agent runs a dependency update before reconciling, so legitimately-fixed pac
 - **`compatible`** (default) — stay within existing semver ranges; does not cross majors automatically. pnpm: `pnpm update`; npm: `npm update --save`.
 - **`latest`** — allow crossing majors. pnpm: `pnpm update --latest`; npm: `npm install <alerted-pkg>@latest` for the alerted direct dependencies.
 
-Either way, the **overrides themselves are always major-bounded**, so a fixed transitive dependency never silently jumps a major version. Transitive-only vulnerabilities are handled by overrides regardless of strategy.
+Either way, the **overrides themselves are always bounded** at the first breaking version above the patch, so a fixed transitive dependency never travels further than the fix requires. Transitive-only vulnerabilities are handled by overrides regardless of strategy.
+
+Bounded does **not** mean breaking-change-free. When the earliest patched version already sits outside the range the installed version's dependents accept, there is no in-range version that would close the alert, and the override necessarily crosses that boundary. The agent flags these rather than applying them quietly; see [No in-range fix](#no-in-range-fix) below.
+
+Note the boundary follows npm's caret rules, so it is not always the major. `^1.2.3` is `>=1.2.3 <2.0.0`, but `^0.5.0` is `>=0.5.0 <0.6.0` and `^0.0.3` is `>=0.0.3 <0.0.4` — under `0.x`, the minor (or patch) is the breaking position. A `0.5.0 → 0.7.0` bump is every bit as breaking as `1.x → 2.x`, and is treated as such.
+
+### No in-range fix
+
+Sometimes the only non-vulnerable version of a transitive dependency is outside the range its dependents ask for. The agent still writes the override — leaving a known vulnerability in place is not a better default — but reports it separately from routine changes:
+
+```
+⚠️  NO IN-RANGE FIX — 1 override(s) escape the installed compatible range:
+      cookie: installed 0.5.0 → forced to ">=0.7.0 <0.8"
+```
+
+**Treat these as needing review, because nothing else in the pipeline will tell you.** It's tempting to assume a bad override announces itself at install time. It doesn't:
+
+- Overrides are applied at the **resolution layer**, so a dependent's declared range does not veto them. Not a caret range, not a `peerDependencies` range, not even an exact pin. `express@4.18.2` pins `cookie` to exactly `"0.5.0"`; overriding `cookie` to `>=0.7.0 <0.8` installs cleanly and resolves `cookie@0.7.2`. Likewise `react-dom@18.2.0` declares `peerDependencies: { react: "^18.2.0" }`, and overriding `react` to `>=19.0.0 <20` resolves `react@19.2.7` with no `ERESOLVE` and no warning. Both exit 0.
+- Dependabot keys off the **resolved version**, so the alert closes.
+
+So the install is green and the alert is closed while a dependent calls an API that changed shape underneath it. The break lands at runtime. Verify the dependents of a flagged package before shipping it, or bump those dependents to versions that request the patched range.
+
+The `cookie` example above is the common shape of this, not a contrived one — `CVE-2024-47764` is a `0.x` transitive alert that a great many projects reach through `express`.
+
+(Two failure modes that *do* announce themselves, for contrast: an override with no matching published version fails with `ETARGET`, and an override on a package you also depend on directly fails with `EOVERRIDE` — see [Direct dependencies vs. overrides](#direct-dependencies-vs-overrides-npms-spec-match-rule).)
 
 ### Direct dependencies vs. overrides (npm's spec-match rule)
 
@@ -386,7 +411,8 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 
 - Overrides for packages **not mentioned in any Dependabot alert** are never removed automatically.
 - When multiple alerts reference the same package, the **highest** `first_patched_version` wins.
-- Override specs are major-bounded (`>=X.Y.Z <nextMajor`) — compatible with both npm and pnpm.
+- Override specs are bounded at the first breaking version above the patch, per npm's caret rules (`>=4.17.21 <5`, `>=0.7.0 <0.8`, `>=0.0.5 <0.0.6`) — compatible with both npm and pnpm. The bound can never exclude its own floor, so a bounded spec can't produce an `ETARGET` at install.
+- Specs that escape the installed version's compatible range are reported as [no in-range fix](#no-in-range-fix) rather than applied silently.
 - The agent trusts the **alert state** (open ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides.
 - Overrides are only written for packages that remain vulnerable **after** the update pass — in practice transitive deps. Direct dependencies are fixed by bumping their declared range, so the agent doesn't collide with npm's rule that an override for a direct dep must match its spec. See [Direct dependencies vs. overrides](#direct-dependencies-vs-overrides-npms-spec-match-rule).
 
@@ -396,14 +422,25 @@ For an override with no matching open alert, the agent queries the npm registry 
 
 > **Note on YAML comments:** `js-yaml` doesn't round-trip comments, so hand-written comments in `pnpm-workspace.yaml` are lost on the first write.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md), or the [Releases page](https://github.com/michaelpipkin/dependabot-agent/releases) for the same notes per version. Each release is published to GitHub Releases, so if you track this package with Dependabot or Renovate, the notes appear in the update PR itself.
+
 ## Development
 
 ```bash
 npm install
 npm run build                                # compile to dist/
+npm test                                     # typecheck + run the test suite
 npm start -- --repo owner/repo --dry-run     # run the compiled build
 npm run dev -- --repo owner/repo --dry-run   # build + run in one step
 ```
+
+### Tests
+
+Tests run on Node's built-in runner (`node --test`) — no test framework dependency. They compile via `tsconfig.test.json` to a gitignored `dist-test/`, so they're typechecked against `src` but never published in `dist/`. `prepublishOnly` runs them before every release.
+
+Coverage is deliberately concentrated on the decision logic rather than spread for its own sake: `semver.ts` (range parsing, compatibility boundaries, spec bounding) and `computeOverrideChanges` (what gets added, updated, removed, left alone, and flagged). These are the pure functions that decide what lands in your manifest, and they're where a wrong answer is both most likely and least visible — a bad override installs cleanly and closes its alert. The I/O edges (`github.ts`, `registry.ts`, the package-manager shell-outs) are thin wrappers left to integration testing.
 
 ## License
 

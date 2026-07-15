@@ -1,0 +1,13 @@
+// Tests compile to a separate, gitignored output so they are typechecked
+// against src but never land in dist/ (which is what package.json "files"
+// publishes). Run via `npm test`.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist-test",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

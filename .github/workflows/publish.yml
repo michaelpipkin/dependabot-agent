@@ -7,7 +7,7 @@ on:
 
 permissions:
   id-token: write # required for npm Trusted Publishing (OIDC) + provenance
-  contents: read
+  contents: write # required to create the git tag + GitHub Release
 
 jobs:
   publish:
@@ -30,6 +30,12 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # Runs on every push to main, not just publishing ones, so a red suite is
+      # visible even on a commit that doesn't ship. `prepublishOnly` runs these
+      # again at publish time — that guards local `npm publish` too.
+      - name: Test
+        run: pnpm test
 
       - name: Build
         run: pnpm run build
@@ -62,6 +68,37 @@ jobs:
       - name: Publish to npm
         if: steps.check.outputs.publish == 'true'
         run: npm publish --provenance --access public
+
+      # npm has no release-notes surface of its own — it renders README.md and
+      # nothing else. GitHub Releases is what Dependabot and Renovate read to
+      # fill in the body of the PRs they open for this package, so cutting one
+      # per version is what actually gets these notes in front of users.
+      # Runs only after a successful publish, so npm and GitHub can't disagree.
+      - name: Create GitHub Release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Extract this version's section: everything between its own heading
+          # and the next "## [" heading. Uses literal index() matching rather
+          # than a built regex — the version contains dots, and bracket/dot
+          # escaping through the shell into awk is fragile enough to silently
+          # match nothing and fall through to generated notes.
+          awk -v ver="$VERSION" '
+            BEGIN { heading = "## [" ver "]" }
+            index($0, heading) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ -s release-notes.md ]; then
+            gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md
+          else
+            echo "::warning::No CHANGELOG.md section found for $VERSION — using generated notes."
+            gh release create "v$VERSION" --title "v$VERSION" --generate-notes
+          fi
 
       - name: Skipped
         if: steps.check.outputs.publish != 'true'
