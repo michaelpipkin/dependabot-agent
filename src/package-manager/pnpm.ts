@@ -131,6 +131,13 @@ export class PnpmPackageManager implements PackageManager {
         }
       }
 
+      // Walk up each chain from the target toward the root project. The node
+      // carrying depField IS the root project — it says how the root reached
+      // this chain — so the useful label is the node one level below it: the
+      // root's own direct dependency. pathLabel latches the first level walked
+      // and carries it down, which is why it must start empty. Seeding it with
+      // entry.name (the package being queried) made `pathLabel ||` dead code
+      // and labelled every path with the target's own name: "tar — via: tar".
       function walkDependents(deps: PnpmWhyDependent[], pathLabel: string): void {
         for (const dep of deps) {
           if (dep.deduped) continue;
@@ -141,7 +148,7 @@ export class PnpmPackageManager implements PackageManager {
         }
       }
 
-      for (const entry of entries) walkDependents(entry.dependents, entry.name);
+      for (const entry of entries) walkDependents(entry.dependents, "");
 
       const devPath = devPaths.length > 0 ? "dev" : "unknown";
       const scope = productionPaths.length > 0 ? "production" : devPath;
