@@ -16,11 +16,12 @@ import {
   parseSemver,
   rangeCouldResolveVulnerable,
 } from "./semver.js";
-import { findInstalledVersion } from "./tree.js";
+import { findInstalledVersions } from "./tree.js";
 import {
   DependabotAlert,
   DependentRange,
   DeploymentRecommendation,
+  DepScope,
   EscapingDependent,
   InstalledTree,
   OrphanEscape,
@@ -34,30 +35,53 @@ import { exitWithError, log } from "./util.js";
 // Determine which alerts still need overrides
 // ---------------------------------------------------------------------------
 
+/** Dependabot's per-alert scope, normalized. Absent/unrecognized → unknown. */
+function alertScope(alert: DependabotAlert): DepScope {
+  if (alert.dependency.scope === "runtime") return "production";
+  if (alert.dependency.scope === "development") return "dev";
+  return "unknown";
+}
+
+/**
+ * Merge a package's scope across its alerts. Production wins: if any alert says
+ * the vulnerable copy is reachable at runtime, the package is a deploy concern
+ * regardless of what the other alerts say.
+ */
+function mergeScope(a: DepScope, b: DepScope): DepScope {
+  if (a === "production" || b === "production") return "production";
+  if (a === "dev" || b === "dev") return "dev";
+  return "unknown";
+}
+
 // Multiple alerts for the same package — keep the highest patched version.
 function mergeAlert(
   byName: Map<string, VulnerablePackage>,
   alert: DependabotAlert,
   pkgName: string,
   patchedVersion: string,
-  installedVersion: string,
+  installedVersions: string[],
 ): void {
   const existing = byName.get(pkgName);
   if (!existing) {
     byName.set(pkgName, {
       name: pkgName,
-      installedVersion,
+      installedVersions,
       patchedVersion,
       severity: alert.security_advisory.severity,
+      scope: alertScope(alert),
       foundInParents: [],
       alertNumber: alert.number,
     });
     return;
   }
+
+  const scope = mergeScope(existing.scope, alertScope(alert));
   const patch1 = parseSemver(existing.patchedVersion);
   const patch2 = parseSemver(patchedVersion);
   if (patch1 && patch2 && compareSemver(patch2, patch1) > 0) {
-    byName.set(pkgName, { ...existing, patchedVersion, alertNumber: alert.number });
+    byName.set(pkgName, { ...existing, patchedVersion, scope, alertNumber: alert.number });
+  } else {
+    byName.set(pkgName, { ...existing, scope });
   }
 }
 
@@ -86,13 +110,13 @@ function findVulnerableInstalls(alerts: DependabotAlert[], tree: InstalledTree[]
       continue;
     }
 
-    const installedVersion = findInstalledVersion(pkgName, tree);
-    if (!installedVersion) {
+    const installedVersions = findInstalledVersions(pkgName, tree);
+    if (installedVersions.length === 0) {
       log(`   ℹ️  Alert #${alert.number} (${pkgName}) — package not found in installed tree, skipping.`);
       continue;
     }
 
-    mergeAlert(byName, alert, pkgName, patchedVersion, installedVersion);
+    mergeAlert(byName, alert, pkgName, patchedVersion, installedVersions);
   }
 
   const results = [...byName.values()];
@@ -119,9 +143,18 @@ export function computeOverrideChanges(
   // dependents can accept, the change is marked noInRangeFix for the report.
   for (const [name, versionSpec] of neededOverrides) {
     const pkg = stillVulnerable.find((v) => v.name === name);
-    const boundedSpec = computeBoundedSpec(versionSpec, pkg?.installedVersion);
-    const noInRangeFix = escapesCompatibleRange(versionSpec, pkg?.installedVersion);
-    const escapeReason = `No in-range fix exists — earliest patch ${versionSpec} is outside the compatible range of installed ${pkg?.installedVersion}`;
+    const installedVersions = pkg?.installedVersions ?? [];
+
+    // Bound against the HIGHEST copy so the ceiling can't exclude one that is
+    // already safe; test escapes against EVERY copy, because the vulnerable one
+    // is frequently not the one a by-name lookup would land on.
+    const boundedSpec = computeBoundedSpec(versionSpec, installedVersions.at(-1));
+    const escapingVersions = installedVersions.filter((v) => escapesCompatibleRange(versionSpec, v));
+    const noInRangeFix = escapingVersions.length > 0;
+    const escapeReason =
+      `No in-range fix exists — earliest patch ${versionSpec} is outside the compatible range of ` +
+      `installed ${escapingVersions.join(", ")}`;
+
     const existing = currentOverrides[name];
     if (!existing) {
       changes.push({
@@ -130,7 +163,8 @@ export function computeOverrideChanges(
         newVersion: boundedSpec,
         reason: noInRangeFix ? escapeReason : `Still vulnerable per Dependabot (needs ${boundedSpec})`,
         noInRangeFix,
-        installedVersion: pkg?.installedVersion,
+        installedVersions,
+        escapingVersions,
       });
     } else if (existing !== boundedSpec) {
       changes.push({
@@ -140,7 +174,8 @@ export function computeOverrideChanges(
         newVersion: boundedSpec,
         reason: noInRangeFix ? escapeReason : `Updated version requirement to ${boundedSpec}`,
         noInRangeFix,
-        installedVersion: pkg?.installedVersion,
+        installedVersions,
+        escapingVersions,
       });
     }
     // else: already correct — no change needed
@@ -242,7 +277,12 @@ function logEscapeList(escaped: OverrideChange[], orphanEscapes: OrphanEscape[])
   if (escaped.length > 0) {
     log("   From open alerts (being written now):");
     for (const c of escaped) {
-      log(`      ${c.packageName}: installed ${c.installedVersion} → forced to "${c.newVersion}"`);
+      const escaping = (c.escapingVersions ?? []).join(", ");
+      // Name the other copies too: an escape on one of several is easy to
+      // misread as an escape on all of them.
+      const safe = (c.installedVersions ?? []).filter((v) => !(c.escapingVersions ?? []).includes(v));
+      const alsoInstalled = safe.length > 0 ? `  (also installed, already in range: ${safe.join(", ")})` : "";
+      log(`      ${c.packageName}: installed ${escaping} → forced to "${c.newVersion}"${alsoInstalled}`);
     }
   }
 
@@ -425,7 +465,12 @@ async function reconcileOrphanedOverride(
   // forcing them past their range, the same condition an alert-driven override
   // gets flagged for. This asks about the tree you have, so it reads the
   // resolved version and the INSTALLED ranges.
-  const resolvedVersion = findInstalledVersion(name, tree);
+  // An override normally collapses the tree to one copy, but not always (a
+  // nested override or a peer-suffixed instance can survive). Judge by the
+  // HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
+  // that's the copy pushing dependents furthest past their range.
+  const resolvedVersions = findInstalledVersions(name, tree);
+  const resolvedVersion = resolvedVersions.at(-1);
   const escaping = findEscapingDependents(resolvedVersion ?? patchedVersion, dependents);
   if (escaping.length > 0) {
     const resolvedSuffix = resolvedVersion ? ` → resolved ${resolvedVersion}` : "";
@@ -610,9 +655,25 @@ async function processManifestGroup(
     added: changes.filter((c) => c.action !== "remove").length,
     removed: changes.filter((c) => c.action === "remove").length,
     noInRangeFix: escapedChanges.length + orphanEscapes.length,
-    recommendations:
-      groupAlerts.length > 0 ? stillVulnerable.map((v) => pm.analyseDeploymentImpact(v.name, manifestDir)) : [],
+    recommendations: groupAlerts.length > 0 ? stillVulnerable.map((v) => resolveScope(v, pm, manifestDir)) : [],
   };
+}
+
+/**
+ * Decide whether a vulnerable package is a deploy concern.
+ *
+ * Prefers Dependabot's scope, which describes the *vulnerable copy* and is
+ * therefore version-accurate. Walking the local tree by name is not: with a
+ * vulnerable and a safe copy both installed, it finds the safe copy's
+ * production path and reports the package as production even when the copy
+ * under alert is dev-only. Falls back to the local walk only when GitHub
+ * doesn't say (older payloads).
+ */
+function resolveScope(v: VulnerablePackage, pm: PackageManager, manifestDir: string): DeploymentRecommendation {
+  if (v.scope === "unknown") return pm.analyseDeploymentImpact(v.name, manifestDir);
+
+  const local = pm.analyseDeploymentImpact(v.name, manifestDir);
+  return { ...local, scope: v.scope };
 }
 
 export async function run(cfg: ResolvedConfig): Promise<void> {

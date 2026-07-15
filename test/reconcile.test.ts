@@ -3,12 +3,13 @@ import { describe, it } from "node:test";
 import { computeOverrideChanges, findEscapingDependents, overrideFloor } from "../src/reconcile.js";
 import { DependentRange, VulnerablePackage } from "../src/types.js";
 
-function vuln(name: string, installedVersion: string, patchedVersion: string): VulnerablePackage {
+function vuln(name: string, installed: string | string[], patchedVersion: string): VulnerablePackage {
   return {
     name,
-    installedVersion,
+    installedVersions: Array.isArray(installed) ? installed : [installed],
     patchedVersion,
     severity: "high",
+    scope: "unknown",
     foundInParents: [],
     alertNumber: 1,
   };
@@ -61,7 +62,7 @@ describe("computeOverrideChanges", () => {
     it("flags a major escape and says so in the reason", () => {
       const changes = computeOverrideChanges({}, [vuln("react", "18.2.0", "19.0.0")], new Set(["react"]));
       assert.equal(changes[0].noInRangeFix, true);
-      assert.equal(changes[0].installedVersion, "18.2.0");
+      assert.deepEqual(changes[0].escapingVersions, ["18.2.0"]);
       assert.match(changes[0].reason, /No in-range fix exists/);
     });
 
@@ -88,6 +89,46 @@ describe("computeOverrideChanges", () => {
       );
       assert.equal(changes[0].action, "update");
       assert.equal(changes[0].noInRangeFix, true);
+    });
+  });
+
+  describe("trees holding several copies of a package", () => {
+    // Regression guards for the first real-alert run against pip-cost-sharing.
+    // Both tar and esbuild had a vulnerable copy AND a safe copy installed; the
+    // old code looked up one version by name, landed on the safe copy, and
+    // silently reported no escape.
+    it("flags when only the LOWER of two copies escapes — the tar case", () => {
+      // tar 6.2.1 (via @capacitor/assets) + tar 7.5.20 (via @capacitor/cli),
+      // patched 7.5.16. Looking at 7.5.20 alone says "in range". 6.2.1 escapes.
+      const changes = computeOverrideChanges({}, [vuln("tar", ["6.2.1", "7.5.20"], "7.5.16")], new Set(["tar"]));
+      assert.equal(changes[0].noInRangeFix, true);
+      assert.deepEqual(changes[0].escapingVersions, ["6.2.1"]);
+    });
+
+    it("flags a 0.x escape hidden behind a safe copy — the esbuild case", () => {
+      // esbuild 0.27.7 (via vite@7.3.5, which declares ^0.27.0) + 0.28.1.
+      const changes = computeOverrideChanges({}, [vuln("esbuild", ["0.27.7", "0.28.1"], "0.28.1")], new Set(["esbuild"]));
+      assert.equal(changes[0].noInRangeFix, true);
+      assert.deepEqual(changes[0].escapingVersions, ["0.27.7"]);
+    });
+
+    it("bounds against the HIGHEST copy so the ceiling can't exclude a safe one", () => {
+      // Anchoring on 6.2.1 would emit "<7" and exclude the installed 7.5.20.
+      const changes = computeOverrideChanges({}, [vuln("tar", ["6.2.1", "7.5.20"], "7.5.16")], new Set(["tar"]));
+      assert.equal(changes[0].newVersion, ">=7.5.16 <8");
+    });
+
+    it("does not flag when every copy is in range", () => {
+      const changes = computeOverrideChanges({}, [vuln("@babel/core", ["7.29.0", "7.29.7"], "7.29.6")], new Set(["@babel/core"]));
+      assert.equal(changes[0].noInRangeFix, false);
+      assert.deepEqual(changes[0].escapingVersions, []);
+    });
+
+    it("reports every escaping copy when they all escape", () => {
+      // uuid 7.0.3 + 9.0.1, patched 11.1.1 — both escape.
+      const changes = computeOverrideChanges({}, [vuln("uuid", ["7.0.3", "9.0.1"], "11.1.1")], new Set(["uuid"]));
+      assert.deepEqual(changes[0].escapingVersions, ["7.0.3", "9.0.1"]);
+      assert.equal(changes[0].newVersion, ">=11.1.1 <12");
     });
   });
 

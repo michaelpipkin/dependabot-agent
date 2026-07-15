@@ -1,3 +1,4 @@
+import { compareSemver, parseSemver } from "./semver.js";
 import { InstalledTree, TreeNode } from "./types.js";
 
 /**
@@ -39,16 +40,35 @@ export function isPackageInTree(targetName: string, tree: InstalledTree[]): bool
 }
 
 /**
- * Only add an override if the package actually exists somewhere in the tree.
- * If it's not installed at all, an override does nothing.
- * We take the first hit — all instances should be the same version after
- * the package manager resolves with any existing overrides applied.
+ * Every distinct version of a package installed anywhere in the tree, sorted
+ * ascending. Empty when the package isn't installed at all — in which case an
+ * override for it would do nothing.
+ *
+ * There is deliberately no "the installed version" accessor. A tree routinely
+ * carries several copies of the same package at different versions, and that is
+ * *especially* true in the situation this agent exists to fix: before an
+ * override is applied, a vulnerable copy and a safe copy commonly coexist (a
+ * stale dependent pins the old one while something else resolves the new one).
+ * Picking one copy meant picking the safe one about as often as the vulnerable
+ * one, which silently suppressed escape warnings for the alert's actual subject.
+ * Callers must decide which copy answers their question:
+ *
+ *   - bounding a spec    → the HIGHEST copy, so the ceiling can't exclude a
+ *                          copy that is already safe and force a downgrade
+ *   - detecting escapes  → the LOWEST copy, since escapesCompatibleRange() is
+ *                          monotonic in the installed version: if any copy
+ *                          escapes, the lowest one does
  */
-export function findInstalledVersion(pkgName: string, tree: InstalledTree[]): string {
+export function findInstalledVersions(pkgName: string, tree: InstalledTree[]): string[] {
+  const versions = new Set<string>();
   for (const workspace of tree) {
     const allDeps = { ...workspace.dependencies, ...workspace.devDependencies };
-    const hits = findPackageInTree(pkgName, allDeps);
-    if (hits.length > 0) return hits[0].version;
+    for (const hit of findPackageInTree(pkgName, allDeps)) versions.add(hit.version);
   }
-  return "";
+  return [...versions].sort((a, b) => {
+    const pa = parseSemver(a);
+    const pb = parseSemver(b);
+    if (!pa || !pb) return a.localeCompare(b);
+    return compareSemver(pa, pb);
+  });
 }

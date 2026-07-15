@@ -8,6 +8,14 @@ export interface DependabotAlert {
   dependency: {
     package: { ecosystem: string; name: string };
     manifest_path: string;
+    /**
+     * GitHub's own execution scope for the *vulnerable copy* this alert is
+     * about. Authoritative in a way local tree-walking is not: when a tree holds
+     * both a vulnerable and a safe copy of a package, walking by name can find
+     * the safe copy's production path and call the whole package production,
+     * while the vulnerable copy is dev-only. Absent on older payloads.
+     */
+    scope?: "development" | "runtime" | null;
   };
   security_advisory: {
     summary: string;
@@ -51,9 +59,12 @@ export interface InstalledTree {
 
 export interface VulnerablePackage {
   name: string;
-  installedVersion: string;
+  /** Every distinct copy installed, ascending. See findInstalledVersions(). */
+  installedVersions: string[];
   patchedVersion: string; // minimum safe version
   severity: string;
+  /** Scope reported by Dependabot, merged across this package's alerts (runtime wins). */
+  scope: DepScope;
   foundInParents: string[]; // dependency chain that brought this in
   alertNumber: number;
 }
@@ -66,14 +77,16 @@ export interface OverrideChange {
   reason: string;
   /**
    * Set when no in-range fix exists — the patched version falls outside the
-   * caret-compatible range of what is installed, so this override forces the
-   * tree across a breaking boundary. The install will still succeed; the risk
-   * is a runtime break in the dependents that requested the old range. See
-   * escapesCompatibleRange() in semver.ts.
+   * caret-compatible range of at least one installed copy, so this override
+   * forces that copy across a breaking boundary. The install will still
+   * succeed; the risk is a runtime break in the dependents that requested the
+   * old range. See escapesCompatibleRange() in semver.ts.
    */
   noInRangeFix?: boolean;
-  /** Installed version at the time the change was computed — context for the warning. */
-  installedVersion?: string;
+  /** Every copy installed when the change was computed — context for the warning. */
+  installedVersions?: string[];
+  /** The subset of installedVersions this change forces past its compatible range. */
+  escapingVersions?: string[];
 }
 
 /**

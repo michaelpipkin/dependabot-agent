@@ -17,6 +17,13 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 - **Escapes are split into the ones you can update away and the ones you can't.** Each escaping dependent is checked against its own latest release: if that release accepts the forced version, or dropped the dependency entirely, the escape clears by moving off the installed version and no override change is needed. Only the rest — dependents already at their newest release that still can't take the forced version — need a judgement call. On a real tree this separated 6 escaping dependents into 5 stale and 1 genuinely stuck.
 - **Dry runs say so.** Escapes are computed from the installed tree, and a dry run skips the update pass — so escapes caused purely by an out-of-date dependent appear there but wouldn't survive a real run. The report now notes this rather than letting the list read as final.
 
+## [Unreleased]
+
+### Fixed
+
+- **Escape detection now considers every installed copy of a package, not one picked by name.** `findInstalledVersion` returned the first match in a tree walk, on the stated assumption that "all instances should be the same version after the package manager resolves with any existing overrides applied." That assumption is inverted: it holds *after* an override is applied, but the agent runs *before*, which is exactly when a vulnerable copy and a safe copy coexist. On a real tree it landed on the safe copy and suppressed the warning for the alert's actual subject — `tar` 6.2.1 alongside 7.5.20, and `esbuild` 0.27.7 alongside 0.28.1, both silently reported as having no escape. Specs are now bounded against the highest copy (so the ceiling can't exclude one already in range) and escapes tested against every copy, with the offending versions named. The function is gone; `findInstalledVersions` returns all of them.
+- **Deployment impact now uses Dependabot's `scope`.** The local `pnpm why` / `npm explain` walk is version-agnostic: with two copies installed it finds the *safe* copy's production path and calls the package production even when the copy under alert is dev-only. Real example — `tar` reported as PRODUCTION (reached via `@capacitor/cli`, a runtime dependency, at the safe 7.5.20) while every one of its alerts is `development`, because the vulnerable 6.2.1 arrives through `@capacitor/assets`. GitHub reports scope per alert, tied to the vulnerable copy. That's now the source of truth, with the local walk kept as a fallback when the payload omits it.
+
 ## [0.1.6]
 
 ### Fixed
