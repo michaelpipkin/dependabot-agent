@@ -410,7 +410,7 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 ### Override safety
 
 - Overrides for packages **not mentioned in any Dependabot alert** are never removed automatically.
-- When multiple alerts reference the same package, the **highest** `first_patched_version` wins.
+- When multiple alerts reference the same package, the **highest** `first_patched_version` wins. Note an advisory can carry one vulnerable range per release line, each with its own patch — so a package vulnerable on two lines at once can be forced onto the newer one even where a lower patch clears both. A single flat override hands one version to every consumer, so some choice has to be made here; see [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2) for why this one isn't yet settled.
 - Override specs are bounded at the first breaking version above the patch, per npm's caret rules (`>=4.17.21 <5`, `>=0.7.0 <0.8`, `>=0.0.5 <0.0.6`) — compatible with both npm and pnpm. The bound can never exclude its own floor, so a bounded spec can't produce an `ETARGET` at install.
 - Specs that escape the installed version's compatible range are reported as [no in-range fix](#no-in-range-fix) rather than applied silently.
 - The agent trusts the **alert state** (open ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides.

@@ -54,6 +54,13 @@ function mergeScope(a: DepScope, b: DepScope): DepScope {
 }
 
 // Multiple alerts for the same package — keep the highest patched version.
+//
+// An advisory can carry one vulnerable range per release line, each with its own
+// first_patched_version, so "the patched version" isn't a single number. Taking
+// the max can force a package vulnerable on two lines onto the newer one even
+// where a lower patch clears both. A flat override gives every consumer the same
+// version, so some choice is unavoidable — this one just hasn't been examined.
+// See https://github.com/michaelpipkin/dependabot-agent/issues/2.
 function mergeAlert(
   byName: Map<string, VulnerablePackage>,
   alert: DependabotAlert,
