@@ -308,12 +308,15 @@ function logEscapeGuidance(orphanEscapes: OrphanEscape[]): void {
   const stuck = allDeps.filter((d) => !d.fixedByUpdate);
 
   if (fixable.length > 0) {
-    const subject = fixable.length === 1 ? "is a stale dependent" : "are stale dependents";
+    const subject = fixable.length === 1 ? "has" : "have";
     log("");
-    log(`   ${fixable.length} ${subject} — the latest release either accepts the forced`);
-    log("   version or dropped the dependency, so moving off the installed version");
-    log("   clears the escape without touching the override:");
+    log(`   ${fixable.length} ${subject} an upstream fix — the dependent's own latest release either`);
+    log("   accepts the forced version or dropped the dependency altogether:");
     for (const d of fixable) log(`      ${d}`);
+    log("");
+    log("   Whether you can reach that fix is a separate question. A parent pinning the");
+    log("   dependent — an exact pin or a capped range — holds it where it is, and no");
+    log("   amount of updating will move it.");
   }
 
   if (stuck.length > 0) {
@@ -355,14 +358,17 @@ function logNoInRangeFixWarning(
 
   logEscapeGuidance(orphanEscapes);
 
-  // Escapes are computed from the installed tree. When the update pass didn't
-  // run, that tree is whatever was already on disk — so escapes caused purely
-  // by an out-of-date dependent show up here but would not survive a real run.
+  // Escapes are computed from the installed tree, and without the update pass
+  // that tree is whatever was already on disk. Say so — but don't imply a real
+  // run would shorten the list. Measured against a live tree it didn't move it
+  // at all: every stale dependent was pinned by a parent already at its own
+  // latest version, so `update --latest` had nowhere to go.
   if (treeIsPreUpdate && orphanEscapes.length > 0) {
     log("");
     log("   NOTE: the update pass was skipped, so this reflects your current tree.");
-    log("   A real run updates dependents first — escapes caused only by an");
-    log("   out-of-date dependent may not appear there.");
+    log("   A real run updates first, which clears an escape only when the dependent");
+    log("   is free to move. One held by a parent's pin stays put, and so does its");
+    log("   escape — expect this list to survive the update more often than not.");
   }
 }
 
