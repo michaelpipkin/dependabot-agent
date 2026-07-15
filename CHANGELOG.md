@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **"No in-range fix" now covers overrides with no open alert.** 0.1.5 wired the check into the alert-driven path only. Overrides without an open alert take the orphan path, which asked only whether they were still load-bearing and reported every kept override identically — so a repo with zero open alerts, the steady state most of the time, never saw the check fire. An override kept as load-bearing can still be forcing its dependents past the range they declare; those are now reported as no-in-range-fix, using the dependent ranges already fetched for the removal decision.
+
+### Known limitations
+
+- The escape check for existing overrides compares against the ranges the **latest published** dependents declare, not the versions installed. An installed dependent is no newer than latest, so its declared range is generally no higher — meaning this **under-reports** rather than raising false alarms. Resolving each dependent's range at its installed version is the proper fix; the version is already known and currently discarded.
+
 ## [0.1.5] - 2026-07-15
 
 ### Added
