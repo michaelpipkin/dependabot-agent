@@ -160,6 +160,36 @@ describe("computeBoundedSpec", () => {
   });
 });
 
+describe("why mergeAlert keeps the HIGHEST patch — issue #2", () => {
+  // Issue #2 proposed replacing max with the LOWEST patch that clears every
+  // vulnerable range in the advisory. On GHSA-mh29-5h37-fv8m (js-yaml) with
+  // 3.13.0 and 4.0.5 installed, that picks 3.14.2, which does clear "< 3.14.2"
+  // and ">= 4.0.0, < 4.1.1" both. These two assertions are why it can't ship:
+  // together they show the lower patch failing *silently*. If either flips, the
+  // argument for max needs rechecking — that's what these guard.
+
+  it("a patch below the highest copy emits a spec that still admits it", () => {
+    // The ceiling anchors on the higher of patch and installed (4.0.5 here), so
+    // the emitted range spans right over the vulnerable copy. The override
+    // applies, the resolver keeps 4.0.5, and the CVE stays live.
+    assert.equal(computeBoundedSpec("3.14.2", "4.0.5"), ">=3.14.2 <5");
+    assert.ok(compareSemver(parseSemver("4.0.5")!, parseSemver("3.14.2")!) > 0, "4.0.5 satisfies >=3.14.2");
+    assert.ok(compareSemver(parseSemver("4.0.5")!, parseSemver("5")!) < 0, "4.0.5 satisfies <5");
+  });
+
+  it("and nothing flags it, because escapes are only ever detected upward", () => {
+    // escapesCompatibleRange asks whether the patch sits ABOVE the installed
+    // copy's compatible ceiling. A patch below an installed copy is never an
+    // escape, so noInRangeFix stays false and the run reports success.
+    assert.equal(escapesCompatibleRange("3.14.2", "4.0.5"), false);
+    assert.equal(escapesCompatibleRange("3.14.2", "3.13.0"), false);
+
+    // The max, by contrast, is loud: it names the consumer it drags across a major.
+    assert.equal(computeBoundedSpec("4.1.1", "4.0.5"), ">=4.1.1 <5");
+    assert.equal(escapesCompatibleRange("4.1.1", "3.13.0"), true);
+  });
+});
+
 describe("rangeCouldResolveVulnerable", () => {
   it("keeps the override when the range's minimum is below the patch", () => {
     assert.equal(rangeCouldResolveVulnerable("^7.5.3", "7.5.16"), true);

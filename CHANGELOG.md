@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [0.1.8]
+
+### Changed
+
+- **Keeping the highest `first_patched_version` is now a considered choice, with the reasoning and a fixture behind it.** An advisory carries one vulnerable range per release line, each with its own patch, so "the patched version" isn't a single number — `GHSA-mh29-5h37-fv8m` patches js-yaml's `< 3.14.2` at 3.14.2 and its `>= 4.0.0, < 4.1.1` at 4.1.1, and 3.14.2 clears both. Taking the max therefore drags a 3.x consumer across a major no advisory demands, and [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2) proposed switching to the lowest patch that clears every range. Tracing that through the code disproves it: with 3.13.0 and 4.0.5 both installed, the lower patch emits `>=3.14.2 <5` — the ceiling anchors on the highest installed copy — which still admits the vulnerable 4.0.5, and escapes are only detected upward, so nothing flags it and the CVE stays live in silence. Anchoring the ceiling on the patch instead only trades that for an equally silent major downgrade. The max emits `>=4.1.1 <5` and reports 3.13.0 as a no-in-range fix: the bump is surfaced, not assumed. Behaviour is unchanged; the merge path is now driven from real alert payloads in the tests, and the mechanism the argument rests on is pinned so a future change to it can't quietly invalidate the rationale. Handing each release line its own patch still needs scoped overrides, which #2 now tracks.
+
 ## [0.1.7]
 
 ### Added

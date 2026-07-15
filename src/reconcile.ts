@@ -55,12 +55,28 @@ function mergeScope(a: DepScope, b: DepScope): DepScope {
 
 // Multiple alerts for the same package — keep the highest patched version.
 //
-// An advisory can carry one vulnerable range per release line, each with its own
-// first_patched_version, so "the patched version" isn't a single number. Taking
-// the max can force a package vulnerable on two lines onto the newer one even
-// where a lower patch clears both. A flat override gives every consumer the same
-// version, so some choice is unavoidable — this one just hasn't been examined.
-// See https://github.com/michaelpipkin/dependabot-agent/issues/2.
+// An advisory carries one vulnerable range per release line, each with its own
+// first_patched_version, so "the patched version" isn't a single number.
+// GHSA-mh29-5h37-fv8m (js-yaml) patches "< 3.14.2" at 3.14.2 and
+// ">= 4.0.0, < 4.1.1" at 4.1.1, and 3.14.2 clears *both* ranges. So with 3.13.0
+// and 4.0.5 both installed, taking the max drags the 3.x consumer across a
+// major that no advisory demands. That cost is real, and the max is still right:
+// an override is flat, one version reaches every consumer, and when consumers
+// span two majors someone breaks either way. The only question is which way.
+//
+// The max is chosen because it is the only side that fails loudly. The spec's
+// ceiling anchors on the highest installed copy (see computeBoundedSpec), so any
+// patch below that copy yields a range that still admits it: the lower patch
+// here emits ">=3.14.2 <5", which keeps the vulnerable 4.0.5 resolvable, and
+// escapesCompatibleRange only detects *upward* escapes — so nothing would flag
+// it and the CVE would stay live in silence. The max emits ">=4.1.1 <5" and
+// flags 3.13.0 as noInRangeFix, so the major bump gets reported rather than
+// assumed. Pinned by the findVulnerableInstalls tests in test/reconcile.test.ts;
+// the mechanism the argument rests on is pinned in test/semver.test.ts.
+//
+// Handing each line its own patch needs scoped overrides ("parent>child"), the
+// only mechanism that can give different consumers different versions — see
+// https://github.com/michaelpipkin/dependabot-agent/issues/2.
 function mergeAlert(
   byName: Map<string, VulnerablePackage>,
   alert: DependabotAlert,
@@ -102,7 +118,7 @@ function mergeAlert(
  * We still confirm the package is present in the tree (no point overriding
  * something absent) and use its version to bound the override spec.
  */
-function findVulnerableInstalls(alerts: DependabotAlert[], tree: InstalledTree[]): VulnerablePackage[] {
+export function findVulnerableInstalls(alerts: DependabotAlert[], tree: InstalledTree[]): VulnerablePackage[] {
   log("🔎 Determining required overrides from open Dependabot alerts...");
 
   const byName = new Map<string, VulnerablePackage>();

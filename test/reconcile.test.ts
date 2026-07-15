@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { computeOverrideChanges, findEscapingDependents, overrideFloor } from "../src/reconcile.js";
-import { DependentRange, VulnerablePackage } from "../src/types.js";
+import {
+  computeOverrideChanges,
+  findEscapingDependents,
+  findVulnerableInstalls,
+  overrideFloor,
+} from "../src/reconcile.js";
+import { DependabotAlert, DependentRange, InstalledTree, VulnerablePackage } from "../src/types.js";
 
 function vuln(name: string, installed: string | string[], patchedVersion: string): VulnerablePackage {
   return {
@@ -143,6 +148,93 @@ describe("computeOverrideChanges", () => {
     assert.equal(byName.lodash.noInRangeFix, false);
     assert.equal(byName.tar.action, "remove");
     assert.equal(changes.filter((c) => c.noInRangeFix).length, 1);
+  });
+});
+
+describe("findVulnerableInstalls", () => {
+  // The multi-line advisory case from issue #2. GHSA-mh29-5h37-fv8m is ONE
+  // js-yaml advisory carrying one vulnerable range per release line, each with
+  // its own patch — so "the patched version" is not a single number. GitHub
+  // repeats the whole vulnerabilities[] on every alert it raises from the
+  // advisory and sets security_vulnerability to the one range that matched.
+  const jsYamlVulns = [
+    {
+      package: { ecosystem: "npm", name: "js-yaml" },
+      vulnerable_version_range: "< 3.14.2",
+      first_patched_version: { identifier: "3.14.2" },
+    },
+    {
+      package: { ecosystem: "npm", name: "js-yaml" },
+      vulnerable_version_range: ">= 4.0.0, < 4.1.1",
+      first_patched_version: { identifier: "4.1.1" },
+    },
+  ];
+
+  /** An alert raised off the 3.x line (matched 0) or the 4.x line (matched 1). */
+  const jsYamlAlert = (number: number, matched: 0 | 1): DependabotAlert => ({
+    number,
+    state: "open",
+    dependency: {
+      package: { ecosystem: "npm", name: "js-yaml" },
+      manifest_path: "package.json",
+      scope: "runtime",
+    },
+    security_advisory: {
+      summary: "js-yaml prototype pollution",
+      severity: "high",
+      vulnerabilities: jsYamlVulns,
+    },
+    security_vulnerability: jsYamlVulns[matched],
+  });
+
+  // Vulnerable on both lines at once: 3.13.0 is inside "< 3.14.2", and 4.0.5 is
+  // inside ">= 4.0.0, < 4.1.1". 3.14.2 clears both.
+  const jsYamlTree: InstalledTree[] = [
+    {
+      name: "root",
+      version: "1.0.0",
+      path: ".",
+      dependencies: {
+        "old-consumer": {
+          name: "old-consumer",
+          version: "1.0.0",
+          dependencies: { "js-yaml": { name: "js-yaml", version: "3.13.0" } },
+        },
+        "new-consumer": {
+          name: "new-consumer",
+          version: "2.0.0",
+          dependencies: { "js-yaml": { name: "js-yaml", version: "4.0.5" } },
+        },
+      },
+    },
+  ];
+
+  it("takes the highest patch when alerts span two release lines", () => {
+    // 3.14.2 would clear both ranges, so the max drags the 3.x consumer across
+    // a major no advisory demands. That cost is accepted deliberately: see the
+    // mergeAlert comment, and the mechanism pinned in semver.test.ts. The max is
+    // the only choice that can't leave a vulnerable copy installed in silence.
+    const pkgs = findVulnerableInstalls([jsYamlAlert(1, 0), jsYamlAlert(2, 1)], jsYamlTree);
+    assert.equal(pkgs.length, 1);
+    assert.equal(pkgs[0].patchedVersion, "4.1.1");
+    assert.deepEqual(pkgs[0].installedVersions, ["3.13.0", "4.0.5"]);
+  });
+
+  it("takes the highest patch regardless of the order alerts arrive in", () => {
+    // mergeAlert only replaces on a strictly-greater patch, so the incumbent
+    // wins ties — which makes it worth proving the result isn't order-dependent.
+    const pkgs = findVulnerableInstalls([jsYamlAlert(2, 1), jsYamlAlert(1, 0)], jsYamlTree);
+    assert.equal(pkgs[0].patchedVersion, "4.1.1");
+  });
+
+  it("reports the major bump the two-line case forces rather than applying it silently", () => {
+    // The end of the path that matters: the 3.x consumer really is dragged to
+    // 4.x, and it is named as a no-in-range fix instead of slipping through.
+    const pkgs = findVulnerableInstalls([jsYamlAlert(1, 0), jsYamlAlert(2, 1)], jsYamlTree);
+    const changes = computeOverrideChanges({}, pkgs, new Set(["js-yaml"]));
+    assert.equal(changes[0].newVersion, ">=4.1.1 <5");
+    assert.equal(changes[0].noInRangeFix, true);
+    assert.deepEqual(changes[0].escapingVersions, ["3.13.0"]);
   });
 });
 
