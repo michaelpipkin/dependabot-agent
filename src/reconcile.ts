@@ -170,35 +170,58 @@ export function overrideFloor(spec: string): string {
 }
 
 /**
- * Which of this override's dependents does its floor force past their declared
- * range?
+ * Would moving this dependent to its own latest release clear the escape?
+ *
+ * Two ways it can: the latest release widened its range to accept the forced
+ * version, or it dropped the dependency altogether — in which case it stops
+ * being a dependent at all. Both need the latest manifest to have actually been
+ * read; without it we know nothing and claim nothing.
+ *
+ * Note this says the *upstream fix exists*, not that the update is necessarily
+ * reachable — whether the dependent can move depends on what constrains it.
+ */
+function isFixedByUpdate(dep: DependentRange, forcedVersion: string): boolean {
+  if (!dep.latestKnown) return false;
+  if (dep.latestRange === null) return true; // upstream dropped the dependency
+  return !escapesCompatibleRange(forcedVersion, dep.latestRange);
+}
+
+/**
+ * Which of this override's dependents does `forcedVersion` push past their
+ * declared range?
  *
  * A non-empty result means the override is dragging those dependents beyond
  * what they asked for — the same "no in-range fix" condition that
  * computeOverrideChanges flags, but for an override already in place rather
  * than one being written.
  *
- * Judged against each dependent's range at its INSTALLED version, which is the
- * question that actually matters: what does the tree you have ask for? Falls
- * back to the latest published version's range only when the installed one
- * can't be resolved, and records which was used so the report can say so.
+ * Pass the version actually resolved in the tree, not the spec's floor. An
+ * unbounded spec can sit well above its own floor (">=4.2.0" resolving to
+ * 5.0.0), and judging by the floor doesn't merely understate the severity — it
+ * misses escapes outright: floor 0.28.1 sits inside a dependent's ^0.28.0, so
+ * a drift to 0.29.5 reads as no escape at all.
+ *
+ * Each dependent is judged against the range its INSTALLED version declares,
+ * which is the question that matters: what does the tree you have ask for?
+ * Falls back to the latest published version's range only when the installed
+ * one can't be resolved, and records which was used so the report can say so.
  *
  * Ranges it cannot parse (compound "^0.27.0 || ^0.28.0", wildcards) yield false
  * from escapesCompatibleRange and are skipped: only provable escapes are named.
  */
-export function findEscapingDependents(overrideSpec: string, dependents: DependentRange[]): EscapingDependent[] {
-  const floor = overrideFloor(overrideSpec);
+export function findEscapingDependents(forcedVersion: string, dependents: DependentRange[]): EscapingDependent[] {
   const escaping: EscapingDependent[] = [];
 
   for (const dep of dependents) {
     const range = dep.installedRange ?? dep.latestRange;
     if (!range) continue;
-    if (!escapesCompatibleRange(floor, range)) continue;
+    if (!escapesCompatibleRange(forcedVersion, range)) continue;
     escaping.push({
       name: dep.dependent,
       version: dep.version,
       range,
       source: dep.installedRange ? "installed" : "latest",
+      fixedByUpdate: isFixedByUpdate(dep, forcedVersion),
     });
   }
 
@@ -215,12 +238,7 @@ export function findEscapingDependents(overrideSpec: string, dependents: Depende
  * Nothing in that sequence is a signal, which is exactly why it gets its own
  * block here rather than a line in the list above.
  */
-function logNoInRangeFixWarning(escaped: OverrideChange[], orphanEscapes: OrphanEscape[]): void {
-  const total = escaped.length + orphanEscapes.length;
-  if (total === 0) return;
-
-  log(`\n⚠️  NO IN-RANGE FIX — ${total} override(s) escape the compatible range of their dependents:`);
-
+function logEscapeList(escaped: OverrideChange[], orphanEscapes: OrphanEscape[]): void {
   if (escaped.length > 0) {
     log("   From open alerts (being written now):");
     for (const c of escaped) {
@@ -228,33 +246,83 @@ function logNoInRangeFixWarning(escaped: OverrideChange[], orphanEscapes: Orphan
     }
   }
 
-  if (orphanEscapes.length > 0) {
-    log("   Already in place (no open alert, kept because still load-bearing):");
-    for (const o of orphanEscapes) {
-      log(`      ${o.packageName}: "${o.spec}" forces past what its dependents declare:`);
-      for (const d of o.dependents) {
-        log(`         ${d.name}@${d.version} declares ${d.range}`);
-      }
+  if (orphanEscapes.length === 0) return;
+  log("   Already in place (no open alert, kept because still load-bearing):");
+  for (const o of orphanEscapes) {
+    const resolvedSuffix = o.resolvedVersion ? ` → resolved ${o.resolvedVersion}` : "";
+    log(`      ${o.packageName}: "${o.spec}"${resolvedSuffix} forces past what its dependents declare:`);
+    for (const d of o.dependents) {
+      log(`         ${d.name}@${d.version} declares ${d.range}`);
     }
   }
+}
 
-  log("");
-  log("   These install cleanly and their alerts read as fixed. That is not the same");
-  log("   as being safe: dependents that asked for the old range will still call the");
-  log("   old API, and the break shows up at runtime, not at install.");
-  log("   Verify the dependents listed above, or bump them to versions that request");
-  log("   the patched range.");
+/**
+ * Split the escaping dependents into the ones a user can just update away and
+ * the ones that need a real judgement call — the distinction that decides what
+ * they do next.
+ */
+function logEscapeGuidance(orphanEscapes: OrphanEscape[]): void {
+  const allDeps = orphanEscapes.flatMap((o) => o.dependents);
+  const fixable = [...new Set(allDeps.filter((d) => d.fixedByUpdate).map((d) => `${d.name}@${d.version}`))];
+  const stuck = allDeps.filter((d) => !d.fixedByUpdate);
+
+  if (fixable.length > 0) {
+    const subject = fixable.length === 1 ? "is a stale dependent" : "are stale dependents";
+    log("");
+    log(`   ${fixable.length} ${subject} — the latest release either accepts the forced`);
+    log("   version or dropped the dependency, so moving off the installed version");
+    log("   clears the escape without touching the override:");
+    for (const d of fixable) log(`      ${d}`);
+  }
+
+  if (stuck.length > 0) {
+    const subject = stuck.length === 1 ? "has" : "have";
+    log("");
+    log(`   ${stuck.length} ${subject} no upstream fix available — verify these, or bound the`);
+    log("   override lower if the dependent genuinely can't take the forced version:");
+    for (const d of stuck) log(`      ${d.name}@${d.version} (wants ${d.range})`);
+  }
 
   // Ranges are read at each dependent's installed version. Where that couldn't
   // be resolved we fell back to the latest published version, which may declare
   // a different range than the copy actually on disk — say so rather than let
   // the entry read as authoritative.
-  const fellBack = orphanEscapes.flatMap((o) => o.dependents).filter((d) => d.source === "latest");
+  const fellBack = allDeps.filter((d) => d.source === "latest");
   if (fellBack.length > 0) {
     log("");
-    log(`   ${fellBack.length} of the above could not be resolved at the installed version and`);
-    log("   were judged against the dependent's latest published range instead:");
+    log(`   ${fellBack.length} could not be resolved at the installed version and were judged`);
+    log("   against the dependent's latest published range instead:");
     for (const d of fellBack) log(`      ${d.name}@${d.version}`);
+  }
+}
+
+function logNoInRangeFixWarning(
+  escaped: OverrideChange[],
+  orphanEscapes: OrphanEscape[],
+  treeIsPreUpdate: boolean,
+): void {
+  const total = escaped.length + orphanEscapes.length;
+  if (total === 0) return;
+
+  log(`\n⚠️  NO IN-RANGE FIX — ${total} override(s) escape the compatible range of their dependents:`);
+  logEscapeList(escaped, orphanEscapes);
+
+  log("");
+  log("   These install cleanly and their alerts read as fixed. That is not the same");
+  log("   as being safe: dependents that asked for the old range will still call the");
+  log("   old API, and the break shows up at runtime, not at install.");
+
+  logEscapeGuidance(orphanEscapes);
+
+  // Escapes are computed from the installed tree. When the update pass didn't
+  // run, that tree is whatever was already on disk — so escapes caused purely
+  // by an out-of-date dependent show up here but would not survive a real run.
+  if (treeIsPreUpdate && orphanEscapes.length > 0) {
+    log("");
+    log("   NOTE: the update pass was skipped, so this reflects your current tree.");
+    log("   A real run updates dependents first — escapes caused only by an");
+    log("   out-of-date dependent may not appear there.");
   }
 }
 
@@ -319,6 +387,7 @@ async function reconcileOrphanedOverride(
   manifestDir: string,
   pm: PackageManager,
   allAlertedNames: Set<string>,
+  tree: InstalledTree[],
 ): Promise<OrphanEscape | null> {
   // Extract the patched version from the override spec, e.g. ">=11.1.1 <12" -> "11.1.1"
   const overrideSpec = source.overrides[name];
@@ -351,20 +420,25 @@ async function reconcileOrphanedOverride(
     return null;
   }
 
-  // Load-bearing, but check *why*. If the floor sits outside what the dependents
-  // declare, keeping it isn't routine — it's forcing them past their range, the
-  // same condition an alert-driven override gets flagged for. This asks about
-  // the tree you have, so it reads the INSTALLED ranges.
-  const escaping = findEscapingDependents(overrideSpec, dependents);
+  // Load-bearing, but check *why*. If what this override actually resolves to
+  // sits outside what the dependents declare, keeping it isn't routine — it's
+  // forcing them past their range, the same condition an alert-driven override
+  // gets flagged for. This asks about the tree you have, so it reads the
+  // resolved version and the INSTALLED ranges.
+  const resolvedVersion = findInstalledVersion(name, tree);
+  const escaping = findEscapingDependents(resolvedVersion ?? patchedVersion, dependents);
   if (escaping.length > 0) {
+    const resolvedSuffix = resolvedVersion ? ` → resolved ${resolvedVersion}` : "";
     log(
-      `   ⚠️  Override for ${name} (${overrideSpec}) has no open alert and is still ` +
-        `load-bearing, but no in-range fix exists for its dependents:`,
+      `   ⚠️  Override for ${name} (${overrideSpec}${resolvedSuffix}) has ` +
+        `no open alert and is still load-bearing, but no in-range fix exists for its dependents:`,
     );
     for (const d of escaping) {
-      log(`         ${d.name}@${d.version} declares ${d.range}${d.source === "latest" ? " (latest — installed version unresolved)" : ""}`);
+      const via = d.source === "latest" ? " (latest — installed version unresolved)" : "";
+      const hint = d.fixedByUpdate ? ` — updating ${d.name} resolves this` : "";
+      log(`         ${d.name}@${d.version} declares ${d.range}${via}${hint}`);
     }
-    return { packageName: name, spec: overrideSpec, floor: patchedVersion, dependents: escaping };
+    return { packageName: name, spec: overrideSpec, floor: patchedVersion, resolvedVersion, dependents: escaping };
   }
 
   log(
@@ -520,14 +594,16 @@ async function processManifestGroup(
   const orphanedOverrides = Object.keys(source.overrides).filter((name) => !globalAlertedNames.has(name));
   const orphanEscapes: OrphanEscape[] = [];
   for (const name of orphanedOverrides) {
-    const escape = await reconcileOrphanedOverride(name, source, manifestDir, pm, allAlertedNames);
+    const escape = await reconcileOrphanedOverride(name, source, manifestDir, pm, allAlertedNames, tree);
     if (escape) orphanEscapes.push(escape);
   }
 
   const changes = computeOverrideChanges(source.overrides, stillVulnerable, allAlertedNames);
   applyOverrideChanges(changes, source.overrides, source, cfg.dryRun);
   const escapedChanges = changes.filter((c) => c.noInRangeFix);
-  logNoInRangeFixWarning(escapedChanges, orphanEscapes);
+  // The tree was read without an update pass, so it is whatever was already on
+  // disk — escapes computed from it may not survive a real run.
+  logNoInRangeFixWarning(escapedChanges, orphanEscapes, ctx.dryRun || ctx.skipUpdate);
 
   return {
     alerts: groupAlerts.length,

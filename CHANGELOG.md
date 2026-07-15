@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **Escapes are judged against the version actually resolved, not the override's floor.** An unbounded spec can sit far above its own floor — a real `uuid` override reading `>=11.1.1` had resolved to `14.0.1`, and a `js-yaml` `>=4.2.0` to `5.0.0`. Judging by the floor didn't just understate severity in the report; it **missed escapes outright**: floor `0.28.1` sits inside a dependent's `^0.28.0`, so a drift to `0.29.5` read as no escape at all. Reports now show `">=11.1.1" → resolved 14.0.1`.
+
+### Added
+
+- **Escapes are split into the ones you can update away and the ones you can't.** Each escaping dependent is checked against its own latest release: if that release accepts the forced version, or dropped the dependency entirely, the escape clears by moving off the installed version and no override change is needed. Only the rest — dependents already at their newest release that still can't take the forced version — need a judgement call. On a real tree this separated 6 escaping dependents into 5 stale and 1 genuinely stuck.
+- **Dry runs say so.** Escapes are computed from the installed tree, and a dry run skips the update pass — so escapes caused purely by an out-of-date dependent appear there but wouldn't survive a real run. The report now notes this rather than letting the list read as final.
+
 ## [0.1.6]
 
 ### Fixed

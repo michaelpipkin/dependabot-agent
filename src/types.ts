@@ -97,6 +97,13 @@ export interface DependentRange {
   version: string; // the dependent's INSTALLED version
   installedRange: string | null;
   latestRange: string | null;
+  /**
+   * Whether the latest manifest was actually read. Distinguishes a latestRange
+   * of null meaning "upstream dropped this dependency" (latestKnown true — so
+   * moving off this version removes the problem entirely) from "we couldn't
+   * find out" (latestKnown false).
+   */
+  latestKnown: boolean;
 }
 
 /** A dependent an override forces past the range it declares. */
@@ -106,6 +113,13 @@ export interface EscapingDependent {
   range: string;
   /** Which range this was judged against — "latest" means installedRange was unavailable. */
   source: "installed" | "latest";
+  /**
+   * True when this dependent's own latest release accepts the forced version —
+   * so updating the dependent resolves the escape without touching the override.
+   * Only set when provable: a dependent whose latest range can't be read (or
+   * that dropped the dependency entirely) stays false rather than guessing.
+   */
+  fixedByUpdate: boolean;
 }
 
 /**
@@ -119,6 +133,13 @@ export interface OrphanEscape {
   packageName: string;
   spec: string; // the full override spec, e.g. ">=11.1.1"
   floor: string; // the spec's floor, e.g. "11.1.1"
+  /**
+   * The version actually resolved in the tree. An unbounded spec can sit far
+   * above its own floor — ">=4.2.0" resolving to 5.0.0 — so this, not the
+   * floor, is what the dependents are really being handed. Undefined only if
+   * the package isn't in the installed tree.
+   */
+  resolvedVersion?: string;
   dependents: EscapingDependent[];
 }
 
