@@ -8,7 +8,7 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 2. **Detects** where overrides live:
    - **npm** → top-level `overrides` in `package.json`.
    - **pnpm** → `pnpm-workspace.yaml` (workspace projects) if present, otherwise `pnpm.overrides` in `package.json`.
-3. **Fetches** all open npm Dependabot alerts for your repo via the GitHub API.
+3. **Fetches** your repo's npm Dependabot alerts (all states) via the GitHub API; open alerts drive the override decisions, while every package that was *ever* alerted is remembered so a resolved override can be aged out without touching a never-alerted hand-pin.
 4. **Updates** dependencies (range-bound by default — see [Update strategy](#update-strategy)).
 5. **Walks** the full installed dependency tree and confirms each alerted package is actually present.
 6. **Adds or updates** override entries for packages that remain vulnerable, writing a spec bounded at the first breaking version above the patch (`>=0.7.0 <0.8`, `>=4.17.21 <5`) so a fix never drags the tree further than it has to. When one advisory spans **disjoint release lines** — a package vulnerable on, say, both 3.x and 4.x at once — it writes one bounded override *per line* (`js-yaml@3`, `js-yaml@4`) so each consumer stays on its own major instead of being forced up. See [Multi-line advisory](#multi-line-advisory).
@@ -185,6 +185,7 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "updateStrategy": "compatible",
   "dryRun": false,               // prefer leaving this out; pass --dry-run instead
   "skipUpdate": false,
+  "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
   "packages": []                 // extra manifest dirs to always process
 }
@@ -219,7 +220,8 @@ Note the boundary follows npm's caret rules, so it is not always the major. `^1.
 Sometimes the only non-vulnerable version of a transitive dependency is outside the range its dependents ask for. The agent still writes the override — leaving a known vulnerability in place is not a better default — but reports it separately from routine changes:
 
 ```
-⚠️  NO IN-RANGE FIX — 1 override(s) escape the installed compatible range:
+⚠️  NO IN-RANGE FIX — 1 override(s) escape the compatible range of their dependents:
+   From open alerts (being written now):
       cookie: installed 0.5.0 → forced to ">=0.7.0 <0.8"
 ```
 

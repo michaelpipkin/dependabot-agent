@@ -22,6 +22,7 @@ First stable release. The command-line interface — its flags, environment vari
 
 ### Fixed
 
+- **A hand-written override pin is never auto-removed, on any removal path.** The "only remove a bounded `>=…` the agent could have written" guard was applied when cleaning up a superseded key, but not when aging out an orphaned override — so a hand-written pin (an exact `2.3.1`, a caret, or a scoped `name@major`) for a package whose alert had since been *fixed* could be dropped by the orphan pass, against the documented guarantee. The shape guard now applies to both paths.
 - **An empty `--repo=` no longer masks `GITHUB_REPO` or the config file.** Repo resolution used `??`, so an empty inline value won over the environment and config; it now uses `||` (matching `--token`) and falls through.
 
 ## [0.1.16]
