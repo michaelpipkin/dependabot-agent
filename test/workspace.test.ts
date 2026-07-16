@@ -125,7 +125,7 @@ describe("orphan removal uses workspace members' local ranges — issue #14", ()
       "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
       "packages/old/package.json": pkg({ name: "old", version: "1.0.0", dependencies: { ms: "^2.1.3" } }),
     });
-    assert.equal(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", "2.1.3").action, "remove");
+    assert.equal(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", "2.1.3", "latest").action, "remove");
   });
 
   it("keeps the override while a workspace dependent still declares a vulnerable range", () => {
@@ -133,7 +133,7 @@ describe("orphan removal uses workspace members' local ranges — issue #14", ()
       "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
       "packages/stale/package.json": pkg({ name: "stale", version: "1.0.0", dependencies: { ms: "^1.0.0" } }),
     });
-    assert.notEqual(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", "2.1.3").action, "remove");
+    assert.notEqual(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", "2.1.3", "latest").action, "remove");
   });
 
   it("keeps conservatively when no workspace member declares the target", () => {
@@ -141,6 +141,6 @@ describe("orphan removal uses workspace members' local ranges — issue #14", ()
       "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
       "packages/unrelated/package.json": pkg({ name: "unrelated", version: "1.0.0", dependencies: { debug: "^4" } }),
     });
-    assert.equal(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", undefined).action, "keep-no-data");
+    assert.equal(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", undefined, "latest").action, "keep-no-data");
   });
 });

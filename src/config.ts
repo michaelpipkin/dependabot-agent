@@ -113,8 +113,9 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     warn(`Ignoring "token" in config file — the GitHub token is read only from --token or GITHUB_TOKEN.`);
   }
 
-  // Token: flags > env only (never config).
-  const token = args.token ?? env.GITHUB_TOKEN ?? "";
+  // Token: flags > env only (never config). `||` not `??` so an empty
+  // `--token=` (or empty env) falls through instead of masking a real token.
+  const token = args.token || env.GITHUB_TOKEN || "";
 
   // Repo: flags > env > config.
   const repo = args.repo ?? env.GITHUB_REPO ?? config.repo ?? "";

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [0.1.13]
+
+### Fixed
+
+- **Override removal is safe again across scoped keys, update strategies, and hand-added pins.** An independent audit turned up four ways the removal path could remove an override that was still load-bearing — reintroducing the CVE it was holding back. All are fixed:
+  - **Scoped keys were judged against the lowest floor.** When a package was held by per-line overrides (`js-yaml@3` → `>=3.14.2`, `js-yaml@4` → `>=4.1.1`) and became an orphan, the removal check collapsed them to the *lowest* floor — the least conservative choice, which dropped the whole set while a higher line was still needed (a `^4.0.0` dependent silently back on `4.0.x < 4.1.1`). It now judges against the **highest** floor, keeping the set until every line is clear. **Live since 0.1.10.**
+  - **Removal ignored installed dependents.** It decided purely from each dependent's *latest* published range, on the assumption an update reaches it — which fails under the default `compatible` strategy (no major crossing) or a parent-pinned dependent. Under `compatible` it now also checks the **installed** range and keeps the override if either could still resolve vulnerable; `latest` is unchanged.
+  - **It could remove a never-alerted override.** The agent fetched only open alerts, so it couldn't tell a resolved alert from a hand-added pin the agent never authored, and could remove the latter — contradicting the "never removes what was never alerted" guarantee. It now fetches all alert states and only reconciles a package that was alerted at some point. (Consequence: an override for a package with no alert history is now correctly left alone — including the synthetic one in the removal fixture repo.)
+  - **Scoped selectors could miss a sub-major copy.** An open-ended-below line (`< 3.14.2`) covers 2.x too, but a `js-yaml@3` selector doesn't — leaving such a copy unpatched and unflagged. When a vulnerable copy sits below the lowest scoped major, the agent now falls back to the flat override (which covers every copy and reports the escape).
+- **An empty `--token=` no longer masks a valid `GITHUB_TOKEN`.** It coalesced with `??`, so an empty inline value won over the environment; it now falls through.
+
 ## [0.1.12]
 
 ### Changed

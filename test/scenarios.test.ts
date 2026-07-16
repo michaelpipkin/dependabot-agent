@@ -73,7 +73,8 @@ describe("scenario: REMOVE an override once upstream has moved on", () => {
   const dependents = loadJson<DependentRange[]>("dependents-debug-ms.json");
 
   it("removes when every latest upstream range is safe", () => {
-    const verdict = judgeOrphanedOverride(dependents, "2.0.0", "2.1.3");
+    // debug is a published dependent, so `latest` reflects its real registry range.
+    const verdict = judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "latest");
     assert.equal(verdict.action, "remove");
   });
 
@@ -83,7 +84,7 @@ describe("scenario: REMOVE an override once upstream has moved on", () => {
     // surfaces as an escape: debug@2.0.0 declares ms 0.6.2, and the resolved 2.1.3
     // is past that range. The point for this scenario is the negative — never
     // "remove".
-    const verdict = judgeOrphanedOverride(dependents, "3.0.0", "2.1.3");
+    const verdict = judgeOrphanedOverride(dependents, "3.0.0", "2.1.3", "latest");
     assert.notEqual(verdict.action, "remove");
     assert.equal(verdict.action, "escape");
   });

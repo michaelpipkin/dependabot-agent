@@ -8,16 +8,24 @@ export interface GitHubRepoConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch open npm Dependabot alerts for a repository
+// Fetch npm Dependabot alerts for a repository
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetches npm Dependabot alerts across ALL states, not just open. The caller
+ * filters to open for the override decisions, but also needs the set of packages
+ * that were EVER alerted: an override for a package that has never been alerted
+ * is a hand-written pin the agent must not touch (README guarantee), and with a
+ * state=open fetch that distinction is invisible — a resolved alert and a
+ * never-existent one look identical (no open alert).
+ */
 export async function fetchDependabotAlerts(repo: GitHubRepoConfig): Promise<DependabotAlert[]> {
   log("📡 Fetching Dependabot alerts from GitHub...");
 
   const alerts: DependabotAlert[] = [];
   // Cursor-based pagination: GitHub returns a Link header with the next URL
   let nextUrl: string | null =
-    `https://api.github.com/repos/${repo.owner}/${repo.name}/dependabot/alerts?state=open&ecosystem=npm&per_page=100`;
+    `https://api.github.com/repos/${repo.owner}/${repo.name}/dependabot/alerts?ecosystem=npm&per_page=100`;
 
   while (nextUrl) {
     const response: Response = await fetch(nextUrl, {
@@ -47,6 +55,7 @@ export async function fetchDependabotAlerts(repo: GitHubRepoConfig): Promise<Dep
     nextUrl = nextMatch ? nextMatch[1] : null;
   }
 
-  log(`   Found ${alerts.length} open npm Dependabot alert(s).`);
+  const openCount = alerts.filter((a) => a.state === "open").length;
+  log(`   Found ${openCount} open npm Dependabot alert(s) (${alerts.length} across all states).`);
   return alerts;
 }
