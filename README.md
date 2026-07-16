@@ -461,6 +461,14 @@ The distinction between installed and latest matters. An override can look routi
 
 > **Note on YAML comments:** `js-yaml` doesn't round-trip comments, so hand-written comments in `pnpm-workspace.yaml` are lost on the first write.
 
+## Versioning & stability
+
+This package follows [Semantic Versioning](https://semver.org/). From **1.0.0** onward, the contract the version numbers describe is the **command-line interface** — its flags, environment variables, the [config-file schema](#config-file-reference), exit codes, and **which overrides the agent writes or removes for a given repository state**. Two things are deliberately *not* part of the contract: the console output, which is human-facing and may change at any time (parse exit codes, not text); and the internal modules — the package exposes no importable API, and importing anything under `dist/` is unsupported.
+
+- **Major** — removing or renaming a flag, environment variable, or config key; changing a default; changing the config schema; or raising the minimum Node version.
+- **Minor** — a new flag, environment variable, or config key with a safe default, **or** a change to *which overrides the agent produces* for inputs it already handled — even a corrective one. Because those alter behaviour for consumers who auto-update, they always get at least a minor bump and a `CHANGELOG` entry, never a silent patch.
+- **Patch** — bug fixes for cases the agent previously mishandled or declined to act on, and any change to console output, wording, or diagnostics.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md), or the [Releases page](https://github.com/michaelpipkin/dependabot-agent/releases) for the same notes per version. Each release is published to GitHub Releases, so if you track this package with Dependabot or Renovate, the notes appear in the update PR itself.

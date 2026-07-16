@@ -117,8 +117,9 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   // `--token=` (or empty env) falls through instead of masking a real token.
   const token = args.token || env.GITHUB_TOKEN || "";
 
-  // Repo: flags > env > config.
-  const repo = args.repo ?? env.GITHUB_REPO ?? config.repo ?? "";
+  // Repo: flags > env > config. `||` not `??` (matching token) so an empty
+  // `--repo=` falls through to env/config instead of masking them.
+  const repo = args.repo || env.GITHUB_REPO || config.repo || "";
 
   const workspaceRoot = resolveWorkspaceRoot(args, env, config, configDir);
 
