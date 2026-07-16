@@ -12,7 +12,7 @@ export function addUnique<T>(arr: T[], value: T): void {
   if (!arr.includes(value)) arr.push(value);
 }
 
-export function sortObjectKeys(obj: Record<string, string>): Record<string, string> {
+export function sortObjectKeys<T>(obj: Record<string, T>): Record<string, T> {
   return Object.fromEntries(Object.entries(obj).sort(([a], [b]) => a.localeCompare(b)));
 }
 

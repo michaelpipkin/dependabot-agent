@@ -43,3 +43,26 @@ describe("OverrideSource round-trips version-selector (scoped) keys", () => {
     assert.deepEqual(selectOverrideSource("pnpm", dir, true).overrides, SCOPED);
   });
 });
+
+describe("npm nested (object-valued) overrides are preserved, not clobbered — finding #3", () => {
+  it("hides object-valued overrides from the reconciler and merges them back on write", () => {
+    const dir = scratchDir({
+      "package.json": JSON.stringify({
+        name: "root",
+        private: true,
+        overrides: { webpack: { "loader-utils": "^2.0.4" }, lodash: ">=4.17.19 <5" },
+      }),
+    });
+
+    // Read path: only the string-valued override is exposed for reconciliation;
+    // the nested object is not surfaced (it can't be modeled as a string spec).
+    const source = selectOverrideSource("npm", dir, true);
+    assert.deepEqual(source.overrides, { lodash: ">=4.17.19 <5" });
+
+    // Write path: the agent rewrites lodash but the nested webpack override
+    // survives verbatim — never flattened to a string or dropped.
+    source.write({ lodash: ">=4.17.21 <5" });
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf-8"));
+    assert.deepEqual(raw.overrides, { lodash: ">=4.17.21 <5", webpack: { "loader-utils": "^2.0.4" } });
+  });
+});

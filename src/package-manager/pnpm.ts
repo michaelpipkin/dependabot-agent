@@ -113,6 +113,12 @@ export class PnpmPackageManager implements PackageManager {
       const dependents = new Map<string, { name: string; version: string }>();
       function collectDependents(deps: PnpmWhyDependent[]): void {
         for (const dep of deps) {
+          // Skip `deduped` nodes: their canonical (non-deduped) occurrence appears
+          // elsewhere in the same output at the same name@version and supplies the
+          // range. Known edge (not yet reproduced live): a dependent that appears
+          // ONLY deduped would contribute no range, biasing the orphan check toward
+          // remove — bounded by the fixed-alert gate. Verify against real `pnpm why`
+          // output before changing (a deduped node's `version` field may be absent).
           if (!dep.deduped) dependents.set(`${dep.name}@${dep.version}`, { name: dep.name, version: dep.version });
           if (dep.dependents) collectDependents(dep.dependents);
         }
