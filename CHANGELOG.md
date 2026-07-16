@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **A failed alert fetch now exits cleanly instead of crashing.** When the Dependabot alert fetch failed for any reason — bad token (401), alerts disabled (403), network error, any non-2xx — the agent printed the correct error and then aborted with a libuv assertion (`UV_HANDLE_CLOSING`) and a non-standard exit code (127 instead of 1). The cause: `exitWithError` called `process.exit()` synchronously from inside the async fetch path, tearing the process down while undici's handles were still open (Windows/Node 24). It now throws a typed `AgentError` that the top-level handler prints and turns into `process.exitCode = 1`, letting the event loop drain — no assertion, correct exit code, same message. ([#12](https://github.com/michaelpipkin/dependabot-agent/issues/12))
+
 ## [0.1.10]
 
 ### Added

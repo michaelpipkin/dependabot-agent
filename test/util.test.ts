@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { normalizeChildEnv, posixToWindowsPath } from "../src/util.js";
+import { AgentError, exitWithError, normalizeChildEnv, posixToWindowsPath } from "../src/util.js";
+
+describe("exitWithError", () => {
+  it("throws an AgentError instead of calling process.exit", () => {
+    // Regression guard for the libuv crash (issue #12): exiting synchronously
+    // from inside async I/O aborts abnormally. It must throw so the top-level
+    // handler can drain and set exitCode cleanly.
+    assert.throws(() => exitWithError("boom"), (e: unknown) => e instanceof AgentError && e.message === "boom");
+  });
+});
 
 describe("posixToWindowsPath", () => {
   it("converts an MSYS drive path", () => {
