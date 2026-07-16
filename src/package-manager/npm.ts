@@ -48,6 +48,26 @@ function normalizeNodes(deps: Record<string, NpmLsNode> | undefined): Record<str
 }
 
 /**
+ * Parse the JSON from `npm ls --all --json` into the agent's InstalledTree[].
+ * Pure and separate from the shell call so captured real output can be replayed
+ * in tests — a change to npm's output shape surfaces here. npm returns a single
+ * root object (all deps under `dependencies`, no dev split); it is wrapped into
+ * the one-element array shape the rest of the agent expects.
+ */
+export function parseNpmLsOutput(raw: string, cwd: string): InstalledTree[] {
+  const root: NpmLsRoot = JSON.parse(raw);
+  return [
+    {
+      name: root.name,
+      version: root.version ?? "",
+      path: cwd,
+      dependencies: normalizeNodes(root.dependencies),
+      devDependencies: undefined,
+    },
+  ];
+}
+
+/**
  * Run an npm command that prints JSON but may exit non-zero (e.g. `npm ls`
  * exits 1 on extraneous/peer/missing problems while still emitting valid JSON
  * on stdout). Returns stdout regardless of exit code; throws only if there is
@@ -117,19 +137,7 @@ export class NpmPackageManager implements PackageManager {
   getInstalledTree(cwd: string): InstalledTree[] {
     log(`🔍 Reading installed dependency tree (npm) in ${cwd}...`);
     const raw = npmJson("npm ls --all --json", cwd);
-    const root: NpmLsRoot = JSON.parse(raw);
-    // npm returns a single root object; wrap it into the array shape the rest
-    // of the agent expects. All deps live under `dependencies` (no dev split),
-    // which the `{...dependencies, ...devDependencies}` merge handles fine.
-    return [
-      {
-        name: root.name,
-        version: root.version ?? "",
-        path: cwd,
-        dependencies: normalizeNodes(root.dependencies),
-        devDependencies: undefined,
-      },
-    ];
+    return parseNpmLsOutput(raw, cwd);
   }
 
   async collectDependentRanges(packageName: string, cwd: string): Promise<DependentRange[]> {

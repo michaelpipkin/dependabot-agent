@@ -1,0 +1,66 @@
+[
+  {
+    "name": "cap-pnpm",
+    "version": "0.0.0",
+    "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm",
+    "private": true
+  },
+  {
+    "name": "consumer-new",
+    "version": "0.0.0",
+    "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\packages\\consumer-new",
+    "private": true,
+    "dependencies": {
+      "js-yaml": {
+        "from": "js-yaml",
+        "version": "4.1.0",
+        "resolved": "https://registry.npmjs.org/js-yaml/-/js-yaml-4.1.0.tgz",
+        "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\js-yaml@4.1.0\\node_modules\\js-yaml",
+        "dependencies": {
+          "argparse": {
+            "from": "argparse",
+            "version": "2.0.1",
+            "resolved": "https://registry.npmjs.org/argparse/-/argparse-2.0.1.tgz",
+            "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\argparse@2.0.1\\node_modules\\argparse"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "consumer-old",
+    "version": "0.0.0",
+    "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\packages\\consumer-old",
+    "private": true,
+    "dependencies": {
+      "js-yaml": {
+        "from": "js-yaml",
+        "version": "3.14.1",
+        "resolved": "https://registry.npmjs.org/js-yaml/-/js-yaml-3.14.1.tgz",
+        "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\js-yaml@3.14.1\\node_modules\\js-yaml",
+        "dependencies": {
+          "esprima": {
+            "from": "esprima",
+            "version": "4.0.1",
+            "resolved": "https://registry.npmjs.org/esprima/-/esprima-4.0.1.tgz",
+            "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\esprima@4.0.1\\node_modules\\esprima"
+          },
+          "argparse": {
+            "from": "argparse",
+            "version": "1.0.10",
+            "resolved": "https://registry.npmjs.org/argparse/-/argparse-1.0.10.tgz",
+            "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\argparse@1.0.10\\node_modules\\argparse",
+            "dependencies": {
+              "sprintf-js": {
+                "from": "sprintf-js",
+                "version": "1.0.3",
+                "resolved": "https://registry.npmjs.org/sprintf-js/-/sprintf-js-1.0.3.tgz",
+                "path": "C:\\Users\\mpipk\\AppData\\Local\\Temp\\claude\\c--Users-mpipk-source-repos-michaelpipkin-dependabot-agent\\fbbcd307-e034-42b9-ba5a-584fdbc2bb3d\\scratchpad\\cap-pnpm\\node_modules\\.pnpm\\sprintf-js@1.0.3\\node_modules\\sprintf-js"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+]

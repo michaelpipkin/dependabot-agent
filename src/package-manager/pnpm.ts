@@ -44,6 +44,23 @@ function normalizeEntries(deps: Record<string, PnpmListEntry> | undefined): Reco
   return out;
 }
 
+/**
+ * Parse the JSON from `pnpm list -r --json` into the agent's InstalledTree[].
+ * Pure and separate from the shell call so captured real output can be replayed
+ * in tests — a change to pnpm's output shape surfaces here. Each array element is
+ * one workspace project; findInstalledVersions() walks them all.
+ */
+export function parsePnpmListOutput(raw: string): InstalledTree[] {
+  const parsed: PnpmListOutput[] = JSON.parse(raw);
+  return parsed.map((ws) => ({
+    name: ws.name,
+    version: ws.version,
+    path: ws.path,
+    dependencies: normalizeEntries(ws.dependencies),
+    devDependencies: normalizeEntries(ws.devDependencies),
+  }));
+}
+
 export class PnpmPackageManager implements PackageManager {
   readonly id = "pnpm" as const;
 
@@ -83,14 +100,7 @@ export class PnpmPackageManager implements PackageManager {
       "pnpm list -r --json --depth=Infinity",
       { cwd, maxBuffer: 64 * 1024 * 1024 }, // 64MB — large monorepos can exceed the 1MB default
     );
-    const parsed: PnpmListOutput[] = JSON.parse(raw);
-    return parsed.map((ws) => ({
-      name: ws.name,
-      version: ws.version,
-      path: ws.path,
-      dependencies: normalizeEntries(ws.dependencies),
-      devDependencies: normalizeEntries(ws.devDependencies),
-    }));
+    return parsePnpmListOutput(raw);
   }
 
   async collectDependentRanges(packageName: string, cwd: string): Promise<DependentRange[]> {
