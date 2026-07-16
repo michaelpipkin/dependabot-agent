@@ -16,7 +16,6 @@ import {
   lowestPatchClearingAll,
   parseSemver,
   rangeCouldResolveVulnerable,
-  satisfiesVulnerableRange,
 } from "./semver.js";
 import { findInstalledVersions } from "./tree.js";
 import {
@@ -181,8 +180,18 @@ interface ScopedSpec {
   selector: string;
   /** Bounded spec for that line, e.g. ">=3.15.0 <4". */
   spec: string;
-  /** Installed copies on this line that the spec still forces past their range. */
-  escapingVersions: string[];
+}
+
+/** The major of a range's lower bound (`>=`/`>`), or null if it has none. */
+function rangeLowerMajor(range: string): number | null {
+  for (const part of range.split(",")) {
+    const m = /^\s*(>=|>)(.+)$/.exec(part);
+    if (m) {
+      const v = parseSemver(m[2]);
+      if (v) return v[0];
+    }
+  }
+  return null;
 }
 
 /**
@@ -207,11 +216,20 @@ export function baseNameOfOverrideKey(key: string): string {
  * version installed rather than by which parent pulled it — so no parent
  * attribution is needed. Proven end-to-end against the fixture repo for issue #2.
  *
+ * Derived from the advisory ranges, not the installed versions — the agent
+ * trusts the alert state, and once an override is applied the installed copies
+ * are already patched, so keying off them would make the fix un-write itself on
+ * the next run (see findVulnerableInstalls). Each line's selector major and patch
+ * come from the alert; the copies matched are whatever pnpm resolves at the
+ * selector.
+ *
  * Returns null (→ caller writes the flat override) when scoping doesn't apply:
  *   - the advisory isn't multi-line (a single patch clears every range),
- *   - the vulnerable copies don't span two majors, or
- *   - the package is 0.x, where `name@0` is too broad (0.x "lines" are minors) —
- *     handled flat, with the multi-line report still warning. See issue #2.
+ *   - the lines don't span two majors (a same-major bump is safe flat), or
+ *   - a line is 0.x (`name@0` is too broad — 0.x lines are minors), or its patch
+ *     crosses out of its own major (no in-range fix on that line, so a version
+ *     selector can't match the vulnerable copy). Those fall back to the flat max,
+ *     with the multi-line report still warning. See issue #2.
  */
 function computeScopedSpecs(pkg: VulnerablePackage): ScopedSpec[] | null {
   // Same gate as the report: only when the lines are genuinely disjoint.
@@ -224,37 +242,36 @@ function computeScopedSpecs(pkg: VulnerablePackage): ScopedSpec[] | null {
   const chosen = parseSemver(pkg.patchedVersion);
   if (!lowest || !chosen || compareSemver(lowest, chosen) >= 0) return null;
 
-  // Group vulnerable copies by major — the selector must match the copy it fixes.
-  const byMajor = new Map<number, string[]>();
-  for (const v of pkg.installedVersions) {
-    const parsed = parseSemver(v);
-    if (!parsed) return null; // can't scope safely — fall back to flat
-    if (parsed[0] === 0) return null; // 0.x: name@0 too broad
-    if (!byMajor.has(parsed[0])) byMajor.set(parsed[0], []);
-    byMajor.get(parsed[0])!.push(v);
+  // Group the advisory's lines by the major of their patch. The patch shares a
+  // major with the vulnerable copies it fixes (3.14.2 patches the 3.x line), so
+  // that major is the version-selector.
+  const patchesByMajor = new Map<number, string[]>();
+  for (const ar of pkg.alertRanges) {
+    const pv = parseSemver(ar.patch);
+    if (!pv) return null; // unparseable patch — can't scope safely
+    if (pv[0] === 0) return null; // 0.x: name@0 too broad
+    // A patch whose major is above its own vulnerable range is a cross-major fix
+    // (no in-range fix on that line); a name@major selector wouldn't match the
+    // vulnerable copy, so scoping can't help — fall back to flat.
+    const lowerMajor = rangeLowerMajor(ar.range);
+    if (lowerMajor !== null && lowerMajor !== pv[0]) return null;
+    if (!patchesByMajor.has(pv[0])) patchesByMajor.set(pv[0], []);
+    patchesByMajor.get(pv[0])!.push(ar.patch);
   }
-  if (byMajor.size < 2) return null; // all copies one major → flat handles it
+  if (patchesByMajor.size < 2) return null; // one major → flat handles it
 
   const higher = (a: string, b: string): string =>
     compareSemver(parseSemver(a)!, parseSemver(b)!) >= 0 ? a : b;
 
   const specs: ScopedSpec[] = [];
-  for (const [major, copies] of byMajor) {
-    // The patch these copies need: the highest first_patched_version across the
-    // lines they actually fall in (two advisories on one major collapse here).
-    const patches = pkg.alertRanges
-      .filter((ar) => copies.some((v) => satisfiesVulnerableRange(v, ar.range) === true))
-      .map((ar) => ar.patch);
-    if (patches.length === 0) continue; // copies not actually vulnerable on this line
+  for (const [major, patches] of patchesByMajor) {
+    // Highest patch on this line (two advisories on one major collapse here).
+    // The bound anchors on the patch itself: the selector already scopes to the
+    // major, so the ceiling is that major's first breaking version.
     const maxPatch = patches.reduce(higher);
-    const anchor = copies.reduce(higher);
-    specs.push({
-      selector: `${pkg.name}@${major}`,
-      spec: computeBoundedSpec(maxPatch, anchor),
-      escapingVersions: copies.filter((v) => escapesCompatibleRange(maxPatch, v)),
-    });
+    specs.push({ selector: `${pkg.name}@${major}`, spec: computeBoundedSpec(maxPatch) });
   }
-  return specs.length >= 2 ? specs : null;
+  return specs;
 }
 
 /**
@@ -322,22 +339,12 @@ export function computeOverrideChanges(
       // each installed copy stays on its own major, instead of the flat max.
       for (const s of scoped) {
         handledKeys.add(s.selector);
-        const noInRangeFix = s.escapingVersions.length > 0;
-        const reason = noInRangeFix
-          ? `No in-range fix exists — patch for ${s.selector} is outside the compatible range of ` +
-            `installed ${s.escapingVersions.join(", ")}`
-          : `Vulnerable on multiple release lines — scoped to ${s.spec} (issue #2)`;
+        // A scoped spec keeps its line inside its own major by construction, so
+        // it never forces a copy across a breaking boundary — no escape to flag.
+        const reason = `Vulnerable on multiple release lines — scoped to ${s.spec} (issue #2)`;
         const existing = currentOverrides[s.selector];
         if (existing === undefined) {
-          changes.push({
-            packageName: s.selector,
-            action: "add",
-            newVersion: s.spec,
-            reason,
-            noInRangeFix,
-            installedVersions: pkg.installedVersions,
-            escapingVersions: s.escapingVersions,
-          });
+          changes.push({ packageName: s.selector, action: "add", newVersion: s.spec, reason, noInRangeFix: false });
         } else if (existing !== s.spec) {
           changes.push({
             packageName: s.selector,
@@ -345,9 +352,7 @@ export function computeOverrideChanges(
             oldVersion: existing,
             newVersion: s.spec,
             reason,
-            noInRangeFix,
-            installedVersions: pkg.installedVersions,
-            escapingVersions: s.escapingVersions,
+            noInRangeFix: false,
           });
         }
       }
@@ -696,9 +701,19 @@ async function reconcileOrphanedOverride(
   allAlertedNames: Set<string>,
   tree: InstalledTree[],
 ): Promise<OrphanEscape | null> {
-  // Extract the patched version from the override spec, e.g. ">=11.1.1 <12" -> "11.1.1"
-  const overrideSpec = source.overrides[name];
-  const patchedVersion = overrideFloor(overrideSpec);
+  // `name` is a base package name; it may be held by a flat key or by one or
+  // more scoped selectors (js-yaml@3, js-yaml@4). Describe it by its keys, and
+  // judge "still needed" against the LOWEST floor — the most conservative
+  // threshold, so any line a dependent might still resolve below keeps the set.
+  const keys = Object.keys(source.overrides).filter((k) => baseNameOfOverrideKey(k) === name);
+  const overrideSpec = keys.map((k) => source.overrides[k]).join(", ");
+  const floors = keys.map((k) => overrideFloor(source.overrides[k]));
+  const patchedVersion = floors.reduce((lo, f) => {
+    const a = parseSemver(lo);
+    const b = parseSemver(f);
+    if (!a || !b) return lo;
+    return compareSemver(b, a) < 0 ? f : lo;
+  }, floors[0]);
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
   const dependents = await pm.collectDependentRanges(name, manifestDir);
@@ -913,11 +928,15 @@ async function processManifestGroup(
   const allAlertedNames = new Set(groupAlerts.map((a) => a.security_vulnerability.package.name));
 
   // For overrides with no active alert in ANY group, check whether any
-  // dependent still requests a vulnerable range.
-  const orphanedOverrides = Object.keys(source.overrides).filter((name) => !globalAlertedNames.has(name));
+  // dependent still requests a vulnerable range. Work in base package names: a
+  // scoped key like "js-yaml@3" belongs to "js-yaml", which is what the alert
+  // set and the registry are keyed by.
+  const orphanedBaseNames = [...new Set(Object.keys(source.overrides).map(baseNameOfOverrideKey))].filter(
+    (base) => !globalAlertedNames.has(base),
+  );
   const orphanEscapes: OrphanEscape[] = [];
-  for (const name of orphanedOverrides) {
-    const escape = await reconcileOrphanedOverride(name, source, manifestDir, pm, allAlertedNames, tree);
+  for (const base of orphanedBaseNames) {
+    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, allAlertedNames, tree);
     if (escape) orphanEscapes.push(escape);
   }
 
