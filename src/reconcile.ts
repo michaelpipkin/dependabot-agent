@@ -13,17 +13,20 @@ import {
   compareSemver,
   computeBoundedSpec,
   escapesCompatibleRange,
+  lowestPatchClearingAll,
   parseSemver,
   rangeCouldResolveVulnerable,
 } from "./semver.js";
 import { findInstalledVersions } from "./tree.js";
 import {
+  AlertRange,
   DependabotAlert,
   DependentRange,
   DeploymentRecommendation,
   DepScope,
   EscapingDependent,
   InstalledTree,
+  MultiLineAdvisory,
   OrphanEscape,
   OverrideChange,
   PackageManagerId,
@@ -82,8 +85,11 @@ function mergeAlert(
   alert: DependabotAlert,
   pkgName: string,
   patchedVersion: string,
+  vulnerableRange: string,
   installedVersions: string[],
 ): void {
+  const line: AlertRange = { range: vulnerableRange, patch: patchedVersion };
+
   const existing = byName.get(pkgName);
   if (!existing) {
     byName.set(pkgName, {
@@ -94,18 +100,78 @@ function mergeAlert(
       scope: alertScope(alert),
       foundInParents: [],
       alertNumber: alert.number,
+      alertRanges: [line],
     });
     return;
   }
 
+  // Every range is kept, including this one, whichever patch ends up winning —
+  // the set of ranges is what findMultiLineAdvisories needs, not just the max's.
+  const alertRanges = [...existing.alertRanges, line];
   const scope = mergeScope(existing.scope, alertScope(alert));
   const patch1 = parseSemver(existing.patchedVersion);
   const patch2 = parseSemver(patchedVersion);
   if (patch1 && patch2 && compareSemver(patch2, patch1) > 0) {
-    byName.set(pkgName, { ...existing, patchedVersion, scope, alertNumber: alert.number });
+    byName.set(pkgName, { ...existing, patchedVersion, scope, alertNumber: alert.number, alertRanges });
   } else {
-    byName.set(pkgName, { ...existing, scope });
+    byName.set(pkgName, { ...existing, scope, alertRanges });
   }
+}
+
+/**
+ * Packages whose alerts span disjoint release lines — where a version lower than
+ * the one being written would have cleared every advisory.
+ *
+ * Detection only. mergeAlert still takes the max, deliberately: an override is
+ * flat, so one version reaches every consumer, and the max is the only choice
+ * that can't leave a vulnerable copy resolvable with nothing to flag it. What
+ * this adds is that the cost stops being invisible. On pip-cost-sharing the
+ * condition fired five times across ten months and reported nothing — once
+ * forcing a minimatch consumer from 3.x to 10.2.3 where 3.1.4 cleared all three
+ * ranges.
+ *
+ * The comparison is the fix issue #2 proposed and #3 disproved: computing the
+ * lowest patch clearing every range is unsafe to *write*, but it is exactly the
+ * right number to measure the max against.
+ *
+ * Silent when it can't prove divergence — an unparseable range yields null from
+ * lowestPatchClearingAll rather than a guess.
+ */
+export function findMultiLineAdvisories(pkgs: VulnerablePackage[]): MultiLineAdvisory[] {
+  const found: MultiLineAdvisory[] = [];
+
+  for (const pkg of pkgs) {
+    const lowestClearing = lowestPatchClearingAll(
+      pkg.alertRanges.map((a) => a.patch),
+      pkg.alertRanges.map((a) => a.range),
+    );
+    if (!lowestClearing) continue;
+
+    const lowest = parseSemver(lowestClearing);
+    const chosen = parseSemver(pkg.patchedVersion);
+    if (!lowest || !chosen || compareSemver(lowest, chosen) >= 0) continue;
+
+    // Distinct lines, ascending — the same range can arrive on several alerts
+    // (one per vulnerable copy), and repeating it in the report says nothing.
+    const seen = new Set<string>();
+    const lines = pkg.alertRanges
+      .filter((a) => !seen.has(a.range) && seen.add(a.range))
+      .sort((a, b) => {
+        const pa = parseSemver(a.patch);
+        const pb = parseSemver(b.patch);
+        if (!pa || !pb) return a.patch.localeCompare(b.patch);
+        return compareSemver(pa, pb);
+      });
+
+    found.push({
+      packageName: pkg.name,
+      lines,
+      chosenPatch: pkg.patchedVersion,
+      lowestClearing,
+    });
+  }
+
+  return found;
 }
 
 /**
@@ -139,7 +205,7 @@ export function findVulnerableInstalls(alerts: DependabotAlert[], tree: Installe
       continue;
     }
 
-    mergeAlert(byName, alert, pkgName, patchedVersion, installedVersions);
+    mergeAlert(byName, alert, pkgName, patchedVersion, vuln.vulnerable_version_range, installedVersions);
   }
 
   const results = [...byName.values()];
@@ -395,6 +461,30 @@ function logNoInRangeFixWarning(
   }
 }
 
+/**
+ * Report packages vulnerable on more than one release line at once.
+ *
+ * Informational, not a warning: nothing here is wrong, and there is nothing to
+ * act on until scoped overrides exist (issue #2). It says the max forced someone
+ * further than any advisory demanded, and by how much. In every occurrence
+ * measured so far the lines sat on different majors, so noInRangeFix has already
+ * fired above — this explains why the only available fix was out of range.
+ */
+function logMultiLineAdvisories(advisories: MultiLineAdvisory[]): void {
+  if (advisories.length === 0) return;
+
+  log(`\nℹ️  MULTI-LINE ADVISORY — ${advisories.length} package(s) vulnerable on disjoint release lines:`);
+  for (const a of advisories) {
+    const [first, ...rest] = a.lines;
+    log(`      ${a.packageName}: ${a.lines.length} lines — "${first.range}" → ${first.patch}`);
+    // Align continuation lines under the first range, so the set reads as a column.
+    const indent = " ".repeat(`      ${a.packageName}: ${a.lines.length} lines — `.length);
+    for (const line of rest) log(`${indent}"${line.range}" → ${line.patch}`);
+    log(`         Forcing ${a.chosenPatch}. ${a.lowestClearing} clears every range, but a flat`);
+    log(`         override hands one version to every consumer. See issue #2.`);
+  }
+}
+
 export function applyOverrideChanges(
   changes: OverrideChange[],
   currentOverrides: Record<string, string>,
@@ -629,6 +719,7 @@ interface GroupResult {
   added: number;
   removed: number;
   noInRangeFix: number;
+  multiLine: number;
   recommendations: DeploymentRecommendation[];
 }
 
@@ -679,11 +770,18 @@ async function processManifestGroup(
   // disk — escapes computed from it may not survive a real run.
   logNoInRangeFixWarning(escapedChanges, orphanEscapes, ctx.dryRun || ctx.skipUpdate);
 
+  // After the escape block: these lines are usually the reason an escape had no
+  // in-range fix to offer, so they read as the explanation rather than a new
+  // finding.
+  const multiLine = findMultiLineAdvisories(stillVulnerable);
+  logMultiLineAdvisories(multiLine);
+
   return {
     alerts: groupAlerts.length,
     added: changes.filter((c) => c.action !== "remove").length,
     removed: changes.filter((c) => c.action === "remove").length,
     noInRangeFix: escapedChanges.length + orphanEscapes.length,
+    multiLine: multiLine.length,
     recommendations: groupAlerts.length > 0 ? stillVulnerable.map((v) => resolveScope(v, pm, manifestDir)) : [],
   };
 }
@@ -748,6 +846,7 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   let totalRemoved = 0;
   let totalAlerts = 0;
   let totalNoInRangeFix = 0;
+  let totalMultiLine = 0;
   const allRecommendations: DeploymentRecommendation[] = [];
 
   // Global set of all alerted package names across every group. Prevents a
@@ -762,6 +861,7 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
     totalAdded += result.added;
     totalRemoved += result.removed;
     totalNoInRangeFix += result.noInRangeFix;
+    totalMultiLine += result.multiLine;
     allRecommendations.push(...result.recommendations);
   }
 
@@ -772,6 +872,9 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   log(`   Dependabot alerts checked : ${totalAlerts}`);
   log(`   Overrides added/updated   : ${totalAdded}`);
   log(`   Overrides removed         : ${totalRemoved}`);
+  if (totalMultiLine > 0) {
+    log(`   ℹ️  Multi-line advisory    : ${totalMultiLine}  (forced above the minimum — see issue #2)`);
+  }
   if (totalNoInRangeFix > 0) {
     log(`   ⚠️  No in-range fix        : ${totalNoInRangeFix}  (escapes compatible range — verify dependents)`);
   }

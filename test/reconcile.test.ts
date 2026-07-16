@@ -3,12 +3,24 @@ import { describe, it } from "node:test";
 import {
   computeOverrideChanges,
   findEscapingDependents,
+  findMultiLineAdvisories,
   findVulnerableInstalls,
   overrideFloor,
 } from "../src/reconcile.js";
-import { DependabotAlert, DependentRange, InstalledTree, VulnerablePackage } from "../src/types.js";
+import {
+  AlertRange,
+  DependabotAlert,
+  DependentRange,
+  InstalledTree,
+  VulnerablePackage,
+} from "../src/types.js";
 
-function vuln(name: string, installed: string | string[], patchedVersion: string): VulnerablePackage {
+function vuln(
+  name: string,
+  installed: string | string[],
+  patchedVersion: string,
+  alertRanges: AlertRange[] = [],
+): VulnerablePackage {
   return {
     name,
     installedVersions: Array.isArray(installed) ? installed : [installed],
@@ -17,6 +29,7 @@ function vuln(name: string, installed: string | string[], patchedVersion: string
     scope: "unknown",
     foundInParents: [],
     alertNumber: 1,
+    alertRanges,
   };
 }
 
@@ -227,6 +240,29 @@ describe("findVulnerableInstalls", () => {
     assert.equal(pkgs[0].patchedVersion, "4.1.1");
   });
 
+  it("records every alert's range, so the multi-line case is detectable downstream", () => {
+    // Closes the loop from raw payload to finding: mergeAlert used to discard
+    // vulnerable_version_range, which is why the condition was undetectable.
+    const pkgs = findVulnerableInstalls([jsYamlAlert(1, 0), jsYamlAlert(2, 1)], jsYamlTree);
+    assert.deepEqual(pkgs[0].alertRanges, [
+      { range: "< 3.14.2", patch: "3.14.2" },
+      { range: ">= 4.0.0, < 4.1.1", patch: "4.1.1" },
+    ]);
+
+    const found = findMultiLineAdvisories(pkgs);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].chosenPatch, "4.1.1");
+    assert.equal(found[0].lowestClearing, "3.14.2");
+  });
+
+  it("keeps every range even when the losing alert arrives second", () => {
+    // The 4.1.1 alert wins the max; the 3.14.2 range must survive the merge
+    // regardless of order, or the detector sees only one line.
+    const pkgs = findVulnerableInstalls([jsYamlAlert(2, 1), jsYamlAlert(1, 0)], jsYamlTree);
+    assert.equal(pkgs[0].alertRanges.length, 2);
+    assert.equal(findMultiLineAdvisories(pkgs)[0].lowestClearing, "3.14.2");
+  });
+
   it("reports the major bump the two-line case forces rather than applying it silently", () => {
     // The end of the path that matters: the 3.x consumer really is dragged to
     // 4.x, and it is named as a no-in-range fix instead of slipping through.
@@ -235,6 +271,115 @@ describe("findVulnerableInstalls", () => {
     assert.equal(changes[0].newVersion, ">=4.1.1 <5");
     assert.equal(changes[0].noInRangeFix, true);
     assert.deepEqual(changes[0].escapingVersions, ["3.13.0"]);
+  });
+});
+
+describe("findMultiLineAdvisories", () => {
+  // Every fixture below is a REAL alert group from michaelpipkin/pip-cost-sharing,
+  // retrieved with `gh api .../dependabot/alerts` with `state` unfiltered. The
+  // agent fetches ?state=open, which is the only reason this condition looked
+  // hypothetical: it fired five times across ten months and reported nothing.
+  const line = (range: string, patch: string): AlertRange => ({ range, patch });
+
+  it("catches the two-line js-yaml case — GHSA-mh29-5h37-fv8m, 2025-11-18", () => {
+    // functions/pnpm-lock.yaml, alerts #10 and #14. One advisory, one range per
+    // release line. 3.14.2 clears both; the agent wrote 4.1.1.
+    const found = findMultiLineAdvisories([
+      vuln("js-yaml", ["3.13.0", "4.0.5"], "4.1.1", [
+        line("< 3.14.2", "3.14.2"),
+        line(">= 4.0.0, < 4.1.1", "4.1.1"),
+      ]),
+    ]);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].packageName, "js-yaml");
+    assert.equal(found[0].chosenPatch, "4.1.1");
+    assert.equal(found[0].lowestClearing, "3.14.2");
+    assert.deepEqual(
+      found[0].lines.map((l) => l.patch),
+      ["3.14.2", "4.1.1"],
+    );
+  });
+
+  it("catches the '= V' shape — the real jws case, 2025-12-04", () => {
+    const found = findMultiLineAdvisories([
+      vuln("jws", ["3.2.2", "4.0.0"], "4.0.1", [line("< 3.2.3", "3.2.3"), line("= 4.0.0", "4.0.1")]),
+    ]);
+    assert.equal(found[0].lowestClearing, "3.2.3");
+    assert.equal(found[0].chosenPatch, "4.0.1");
+  });
+
+  it("catches a pre-release lower bound — the real ajv case, 2026-02-20", () => {
+    const found = findMultiLineAdvisories([
+      vuln("ajv", ["6.12.0", "8.0.0"], "8.18.0", [
+        line("< 6.14.0", "6.14.0"),
+        line(">= 7.0.0-alpha.0, < 8.18.0", "8.18.0"),
+      ]),
+    ]);
+    assert.equal(found[0].lowestClearing, "6.14.0");
+  });
+
+  it("catches the worst real case — minimatch spanning seven majors, 2026-02-27", () => {
+    // functions/pnpm-lock.yaml. 3.1.4 clears all three ranges; the agent forced
+    // the 3.x consumer to 10.2.3.
+    const found = findMultiLineAdvisories([
+      vuln("minimatch", ["3.0.4", "9.0.5", "10.0.1"], "10.2.3", [
+        line("< 3.1.4", "3.1.4"),
+        line(">= 9.0.0, < 9.0.7", "9.0.7"),
+        line(">= 10.0.0, < 10.2.3", "10.2.3"),
+      ]),
+    ]);
+    assert.equal(found[0].lowestClearing, "3.1.4");
+    assert.equal(found[0].chosenPatch, "10.2.3");
+    assert.equal(found[0].lines.length, 3);
+  });
+
+  it("stays silent when every range sits on one line — the real tar case", () => {
+    // Seven nested advisories on 7.x, the shape that makes up most of the noise
+    // in real data. Only 7.5.16 clears them all, so max IS the minimum and there
+    // is nothing to say. This is the false-positive guard.
+    const found = findMultiLineAdvisories([
+      vuln("tar", ["6.2.1", "7.5.20"], "7.5.16", [
+        line("<= 7.5.2", "7.5.3"),
+        line("<= 7.5.3", "7.5.4"),
+        line("< 7.5.7", "7.5.7"),
+        line("< 7.5.8", "7.5.8"),
+        line("<= 7.5.9", "7.5.10"),
+        line("<= 7.5.10", "7.5.11"),
+        line("<= 7.5.15", "7.5.16"),
+      ]),
+    ]);
+    assert.deepEqual(found, []);
+  });
+
+  it("stays silent for a single alert — the real @babel/core case", () => {
+    const found = findMultiLineAdvisories([
+      vuln("@babel/core", ["7.29.0"], "7.29.6", [line("<= 7.29.0", "7.29.6")]),
+    ]);
+    assert.deepEqual(found, []);
+  });
+
+  it("collapses duplicate ranges — one alert per vulnerable copy, one line", () => {
+    // The real minimatch group carried 7 alerts over 4 distinct ranges; repeating
+    // a range in the report would say nothing.
+    const found = findMultiLineAdvisories([
+      vuln("js-yaml", ["3.13.0", "4.0.5"], "4.1.1", [
+        line("< 3.14.2", "3.14.2"),
+        line(">= 4.0.0, < 4.1.1", "4.1.1"),
+        line(">= 4.0.0, < 4.1.1", "4.1.1"),
+      ]),
+    ]);
+    assert.equal(found[0].lines.length, 2);
+  });
+
+  it("stays silent rather than guessing when a range is unparseable", () => {
+    const found = findMultiLineAdvisories([
+      vuln("mystery", ["1.0.0"], "2.0.0", [line("< 1.5.0", "1.5.0"), line("^2.0.0", "2.0.0")]),
+    ]);
+    assert.deepEqual(found, []);
+  });
+
+  it("reports nothing for a package with no alert ranges recorded", () => {
+    assert.deepEqual(findMultiLineAdvisories([vuln("lodash", "4.17.20", "4.17.21")]), []);
   });
 });
 
