@@ -697,6 +697,43 @@ export function applyOverrideChanges(
 // Orphaned-override reconciliation
 // ---------------------------------------------------------------------------
 
+export type OrphanVerdict =
+  | { action: "keep-no-data"; latestRanges: string[] }
+  | { action: "remove"; latestRanges: string[] }
+  | { action: "keep-load-bearing"; latestRanges: string[] }
+  | { action: "escape"; latestRanges: string[]; escaping: EscapingDependent[] };
+
+/**
+ * The removal decision for an orphaned override (no open alert), from its
+ * dependents' registry ranges and the override floor. Pure — the registry fetch
+ * and all logging live in reconcileOrphanedOverride.
+ *
+ *   - keep-no-data      — no usable latest range; keep conservatively.
+ *   - remove            — every latest upstream range now requests a safe
+ *                         version, so the override no longer does anything.
+ *   - escape            — still load-bearing, but the resolved version forces a
+ *                         dependent past its declared range (no in-range fix).
+ *   - keep-load-bearing — still needed, routine.
+ *
+ * Reads the LATEST published ranges, not the installed ones: the question is
+ * forward-looking ("has upstream moved on?"), since after an update you resolve
+ * to the latest dependents anyway. Proven live against debug@2.0.0 → ms, whose
+ * latest requests ms ^2.1.3 above a >=2.0.0 override → remove.
+ */
+export function judgeOrphanedOverride(
+  dependents: DependentRange[],
+  floor: string,
+  resolvedVersion: string | undefined,
+): OrphanVerdict {
+  const latestRanges = [...new Set(dependents.map((d) => d.latestRange).filter((r): r is string => r !== null))];
+  if (latestRanges.length === 0) return { action: "keep-no-data", latestRanges };
+  const stillNeeded = latestRanges.some((range) => rangeCouldResolveVulnerable(range, floor));
+  if (!stillNeeded) return { action: "remove", latestRanges };
+  const escaping = findEscapingDependents(resolvedVersion ?? floor, dependents);
+  if (escaping.length > 0) return { action: "escape", latestRanges, escaping };
+  return { action: "keep-load-bearing", latestRanges };
+}
+
 /**
  * For an override with no open alert in any group, decide whether it is still
  * load-bearing by checking the upstream ranges dependents declare in the npm
@@ -729,62 +766,52 @@ async function reconcileOrphanedOverride(
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
   const dependents = await pm.collectDependentRanges(name, manifestDir);
-  const latestRanges = [...new Set(dependents.map((d) => d.latestRange).filter((r): r is string => r !== null))];
-
-  if (latestRanges.length === 0) {
-    log(
-      `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert. ` +
-        `Could not determine upstream ranges from registry. ` +
-        `Keeping conservatively — remove manually once upstream packages ` +
-        `raise their own minimum requirements.`,
-    );
-    return null;
-  }
-
-  // Removal asks a forward-looking question — "has upstream moved on?" — so it
-  // reads the LATEST published ranges: after an update you resolve to those
-  // dependents anyway.
-  const stillNeeded = latestRanges.some((range) => rangeCouldResolveVulnerable(range, patchedVersion));
-  if (!stillNeeded) {
-    log(
-      `   ✂️  Override for ${name} (${overrideSpec}) is no longer needed — ` +
-        `latest upstream versions all request safe ranges: ${latestRanges.join(", ")}`,
-    );
-    allAlertedNames.add(name);
-    return null;
-  }
-
-  // Load-bearing, but check *why*. If what this override actually resolves to
-  // sits outside what the dependents declare, keeping it isn't routine — it's
-  // forcing them past their range, the same condition an alert-driven override
-  // gets flagged for. This asks about the tree you have, so it reads the
-  // resolved version and the INSTALLED ranges.
   // An override normally collapses the tree to one copy, but not always (a
-  // nested override or a peer-suffixed instance can survive). Judge by the
-  // HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
+  // nested override or a peer-suffixed instance can survive). Judge escapes by
+  // the HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
   // that's the copy pushing dependents furthest past their range.
-  const resolvedVersions = findInstalledVersions(name, tree);
-  const resolvedVersion = resolvedVersions.at(-1);
-  const escaping = findEscapingDependents(resolvedVersion ?? patchedVersion, dependents);
-  if (escaping.length > 0) {
-    const resolvedSuffix = resolvedVersion ? ` → resolved ${resolvedVersion}` : "";
-    log(
-      `   ⚠️  Override for ${name} (${overrideSpec}${resolvedSuffix}) has ` +
-        `no open alert and is still load-bearing, but no in-range fix exists for its dependents:`,
-    );
-    for (const d of escaping) {
-      const via = d.source === "latest" ? " (latest — installed version unresolved)" : "";
-      const hint = d.fixedByUpdate ? ` — updating ${d.name} resolves this` : "";
-      log(`         ${d.name}@${d.version} declares ${d.range}${via}${hint}`);
-    }
-    return { packageName: name, spec: overrideSpec, floor: patchedVersion, resolvedVersion, dependents: escaping };
-  }
+  const resolvedVersion = findInstalledVersions(name, tree).at(-1);
+  const verdict = judgeOrphanedOverride(dependents, patchedVersion, resolvedVersion);
 
-  log(
-    `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
-      `still load-bearing — latest upstream versions request: ${latestRanges.join(", ")}`,
-  );
-  return null;
+  switch (verdict.action) {
+    case "keep-no-data":
+      log(
+        `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert. ` +
+          `Could not determine upstream ranges from registry. ` +
+          `Keeping conservatively — remove manually once upstream packages ` +
+          `raise their own minimum requirements.`,
+      );
+      return null;
+
+    case "remove":
+      log(
+        `   ✂️  Override for ${name} (${overrideSpec}) is no longer needed — ` +
+          `latest upstream versions all request safe ranges: ${verdict.latestRanges.join(", ")}`,
+      );
+      allAlertedNames.add(name);
+      return null;
+
+    case "escape": {
+      const resolvedSuffix = resolvedVersion ? ` → resolved ${resolvedVersion}` : "";
+      log(
+        `   ⚠️  Override for ${name} (${overrideSpec}${resolvedSuffix}) has ` +
+          `no open alert and is still load-bearing, but no in-range fix exists for its dependents:`,
+      );
+      for (const d of verdict.escaping) {
+        const via = d.source === "latest" ? " (latest — installed version unresolved)" : "";
+        const hint = d.fixedByUpdate ? ` — updating ${d.name} resolves this` : "";
+        log(`         ${d.name}@${d.version} declares ${d.range}${via}${hint}`);
+      }
+      return { packageName: name, spec: overrideSpec, floor: patchedVersion, resolvedVersion, dependents: verdict.escaping };
+    }
+
+    case "keep-load-bearing":
+      log(
+        `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
+          `still load-bearing — latest upstream versions request: ${verdict.latestRanges.join(", ")}`,
+      );
+      return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
