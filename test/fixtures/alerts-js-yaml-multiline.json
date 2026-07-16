@@ -1,0 +1,194 @@
+[
+  {
+    "number": 1,
+    "state": "fixed",
+    "dependency": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "manifest_path": "package-lock.json",
+      "scope": "runtime"
+    },
+    "security_advisory": {
+      "summary": "js-yaml has prototype pollution in merge (<<)",
+      "severity": "medium",
+      "vulnerabilities": [
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": ">= 4.0.0, < 4.1.1",
+          "first_patched_version": {
+            "identifier": "4.1.1"
+          }
+        },
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": "< 3.14.2",
+          "first_patched_version": {
+            "identifier": "3.14.2"
+          }
+        }
+      ]
+    },
+    "security_vulnerability": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "vulnerable_version_range": ">= 4.0.0, < 4.1.1",
+      "first_patched_version": {
+        "identifier": "4.1.1"
+      }
+    }
+  },
+  {
+    "number": 2,
+    "state": "fixed",
+    "dependency": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "manifest_path": "package-lock.json",
+      "scope": "runtime"
+    },
+    "security_advisory": {
+      "summary": "js-yaml has prototype pollution in merge (<<)",
+      "severity": "medium",
+      "vulnerabilities": [
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": ">= 4.0.0, < 4.1.1",
+          "first_patched_version": {
+            "identifier": "4.1.1"
+          }
+        },
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": "< 3.14.2",
+          "first_patched_version": {
+            "identifier": "3.14.2"
+          }
+        }
+      ]
+    },
+    "security_vulnerability": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "vulnerable_version_range": "< 3.14.2",
+      "first_patched_version": {
+        "identifier": "3.14.2"
+      }
+    }
+  },
+  {
+    "number": 3,
+    "state": "fixed",
+    "dependency": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "manifest_path": "package-lock.json",
+      "scope": "runtime"
+    },
+    "security_advisory": {
+      "summary": "JS-YAML: Quadratic-complexity DoS in merge key handling via repeated aliases",
+      "severity": "medium",
+      "vulnerabilities": [
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": ">= 4.0.0, <= 4.1.1",
+          "first_patched_version": {
+            "identifier": "4.2.0"
+          }
+        },
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": "< 3.15.0",
+          "first_patched_version": {
+            "identifier": "3.15.0"
+          }
+        }
+      ]
+    },
+    "security_vulnerability": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "vulnerable_version_range": ">= 4.0.0, <= 4.1.1",
+      "first_patched_version": {
+        "identifier": "4.2.0"
+      }
+    }
+  },
+  {
+    "number": 4,
+    "state": "fixed",
+    "dependency": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "manifest_path": "package-lock.json",
+      "scope": "runtime"
+    },
+    "security_advisory": {
+      "summary": "JS-YAML: Quadratic-complexity DoS in merge key handling via repeated aliases",
+      "severity": "medium",
+      "vulnerabilities": [
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": ">= 4.0.0, <= 4.1.1",
+          "first_patched_version": {
+            "identifier": "4.2.0"
+          }
+        },
+        {
+          "package": {
+            "ecosystem": "npm",
+            "name": "js-yaml"
+          },
+          "vulnerable_version_range": "< 3.15.0",
+          "first_patched_version": {
+            "identifier": "3.15.0"
+          }
+        }
+      ]
+    },
+    "security_vulnerability": {
+      "package": {
+        "ecosystem": "npm",
+        "name": "js-yaml"
+      },
+      "vulnerable_version_range": "< 3.15.0",
+      "first_patched_version": {
+        "identifier": "3.15.0"
+      }
+    }
+  }
+]
