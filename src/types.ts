@@ -67,6 +67,42 @@ export interface VulnerablePackage {
   scope: DepScope;
   foundInParents: string[]; // dependency chain that brought this in
   alertNumber: number;
+  /**
+   * Every (vulnerable range → patch) pair this package's alerts reported, one
+   * per alert. Kept because a package has no single safety threshold: an
+   * advisory carries one vulnerable range per release line, each with its own
+   * first_patched_version.
+   *
+   * Reported, never acted on — patchedVersion above is still the max. See
+   * findMultiLineAdvisories() and issue #2.
+   */
+  alertRanges: AlertRange[];
+}
+
+/** One alert's vulnerable range and the version that closes it. */
+export interface AlertRange {
+  range: string; // GitHub's vulnerable_version_range, e.g. ">= 4.0.0, < 4.1.1"
+  patch: string; // that range's first_patched_version
+}
+
+/**
+ * A package whose alerts span disjoint release lines, so that the version being
+ * written is higher than any advisory actually requires.
+ *
+ * Purely a finding: an override is flat, so one version reaches every consumer
+ * and the max is the only choice that can't leave a vulnerable copy resolvable
+ * (see mergeAlert). This records that the cost was paid, and what it would have
+ * been had each line been addressable on its own — which needs scoped overrides,
+ * tracked in issue #2.
+ */
+export interface MultiLineAdvisory {
+  packageName: string;
+  /** The distinct lines, ascending by patch. */
+  lines: AlertRange[];
+  /** The max — what actually gets written. */
+  chosenPatch: string;
+  /** The lowest single version clearing every range. Always below chosenPatch. */
+  lowestClearing: string;
 }
 
 export interface OverrideChange {

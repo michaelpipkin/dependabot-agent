@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Added
+
+- **Multi-line advisories are reported instead of firing silently.** An advisory carries one vulnerable range per release line, each with its own patch, so a package vulnerable on two lines at once has no single patched version. The agent writes the highest — [deliberately, since it is the only choice that can't leave a vulnerable copy quietly resolvable](https://github.com/michaelpipkin/dependabot-agent/pull/3) — which forces the lower line's consumer across a major no advisory demands. Nothing said so. Replaying a real repository's full alert history turned up **five occurrences across ten months**, every one invisible: `js-yaml` merged to 4.1.1 where 3.14.2 cleared both ranges, `jws` to 4.0.1 over 3.2.3, `ajv` to 8.18.0 over 6.14.0, and `minimatch` twice — once forcing a 3.x consumer to 10.2.3, seven majors, where 3.1.4 cleared all three ranges. They were invisible because the agent fetches `?state=open`, so the case is unreachable from the only window it ever looks through. Now reported as a dedicated block with a summary count, naming each line and the version that would have sufficed. Informational: the override is unchanged, and there is nothing to act on until scoped overrides exist ([#2](https://github.com/michaelpipkin/dependabot-agent/issues/2)) — but the cost stops being paid in silence.
+- **A range predicate for GitHub's `vulnerable_version_range`.** Built from the shapes that actually occur rather than the ones a spec implies: across 228 real alerts on two repositories there are exactly five — `>= V, < V`, `< V`, `>= V, <= V`, `<= V`, `= V`. It returns "unknown" rather than "clears" on anything it can't parse, so an unfamiliar range can never manufacture a false all-clear; and it detects nothing rather than guessing. The detector is the fix [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2) proposed and 0.1.8 disproved — computing the lowest patch that clears every range is unsafe to *write*, but it is exactly the right number to *compare* the max against.
+
 ## [0.1.8]
 
 ### Changed

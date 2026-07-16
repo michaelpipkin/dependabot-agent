@@ -6,8 +6,10 @@ import {
   computeBoundedSpec,
   escapesCompatibleRange,
   formatCeiling,
+  lowestPatchClearingAll,
   parseSemver,
   rangeCouldResolveVulnerable,
+  satisfiesVulnerableRange,
 } from "../src/semver.js";
 
 describe("parseSemver", () => {
@@ -157,6 +159,93 @@ describe("computeBoundedSpec", () => {
 
   it("falls back to an unbounded floor when nothing is parseable", () => {
     assert.equal(computeBoundedSpec("garbage", undefined), ">=garbage");
+  });
+});
+
+describe("satisfiesVulnerableRange", () => {
+  // The five shapes GitHub actually emits, by frequency across 228 real alerts
+  // on two repositories. Nothing else has ever been observed.
+  it("handles '>= V, < V' — the most common shape (87 of 228)", () => {
+    assert.equal(satisfiesVulnerableRange("4.0.5", ">= 4.0.0, < 4.1.1"), true);
+    assert.equal(satisfiesVulnerableRange("4.1.1", ">= 4.0.0, < 4.1.1"), false);
+    assert.equal(satisfiesVulnerableRange("3.14.2", ">= 4.0.0, < 4.1.1"), false);
+  });
+
+  it("handles '< V' (84 of 228)", () => {
+    assert.equal(satisfiesVulnerableRange("3.13.0", "< 3.14.2"), true);
+    assert.equal(satisfiesVulnerableRange("3.14.2", "< 3.14.2"), false);
+  });
+
+  it("handles '>= V, <= V' — inclusive upper bound, absent from issue #2's sketch (31 of 228)", () => {
+    assert.equal(satisfiesVulnerableRange("5.1.4", ">= 5.0.0-alpha.0, <= 5.1.4"), true);
+    assert.equal(satisfiesVulnerableRange("5.1.5", ">= 5.0.0-alpha.0, <= 5.1.4"), false);
+  });
+
+  it("handles '<= V' (24 of 228) — the real tar shape", () => {
+    assert.equal(satisfiesVulnerableRange("7.5.15", "<= 7.5.15"), true);
+    assert.equal(satisfiesVulnerableRange("7.5.16", "<= 7.5.15"), false);
+  });
+
+  it("handles '= V' (2 of 228) — the real jws shape", () => {
+    assert.equal(satisfiesVulnerableRange("4.0.0", "= 4.0.0"), true);
+    assert.equal(satisfiesVulnerableRange("4.0.1", "= 4.0.0"), false);
+    assert.equal(satisfiesVulnerableRange("3.2.3", "= 4.0.0"), false);
+  });
+
+  it("treats a pre-release lower bound as its stable version", () => {
+    // Real: ajv ">= 7.0.0-alpha.0, < 8.18.0" and @angular/core ">= 21.0.0-next.0".
+    // parseSemver strips the pre-release; for a LOWER bound that admits exactly
+    // the same stable versions, which is all these ranges are ever used for.
+    assert.equal(satisfiesVulnerableRange("6.14.0", ">= 7.0.0-alpha.0, < 8.18.0"), false);
+    assert.equal(satisfiesVulnerableRange("7.0.0", ">= 7.0.0-alpha.0, < 8.18.0"), true);
+    assert.equal(satisfiesVulnerableRange("8.18.0", ">= 7.0.0-alpha.0, < 8.18.0"), false);
+  });
+
+  it("returns null — not false — when it cannot tell", () => {
+    // false would read as "outside the vulnerable range", i.e. safe. An
+    // unparseable bound must never manufacture an all-clear.
+    assert.equal(satisfiesVulnerableRange("1.0.0", "^1.0.0"), null); // no comparator
+    assert.equal(satisfiesVulnerableRange("1.0.0", "< garbage"), null);
+    assert.equal(satisfiesVulnerableRange("garbage", "< 1.0.0"), null);
+    assert.equal(satisfiesVulnerableRange("1.0.0", ""), null);
+  });
+});
+
+describe("lowestPatchClearingAll", () => {
+  it("finds the patch that clears both lines of a two-line advisory", () => {
+    // GHSA-mh29-5h37-fv8m, exactly as it landed on pip-cost-sharing 2025-11-18.
+    const patches = ["3.14.2", "4.1.1"];
+    const ranges = ["< 3.14.2", ">= 4.0.0, < 4.1.1"];
+    assert.equal(lowestPatchClearingAll(patches, ranges), "3.14.2");
+  });
+
+  it("returns the max when every range sits on one line — the real tar case", () => {
+    // Seven nested advisories, all on 7.x. Only the highest patch clears them
+    // all, so there is nothing to report: max IS the minimum here.
+    const patches = ["7.5.3", "7.5.4", "7.5.7", "7.5.8", "7.5.10", "7.5.11", "7.5.16"];
+    const ranges = ["<= 7.5.2", "<= 7.5.3", "< 7.5.7", "< 7.5.8", "<= 7.5.9", "<= 7.5.10", "<= 7.5.15"];
+    assert.equal(lowestPatchClearingAll(patches, ranges), "7.5.16");
+  });
+
+  it("spans four lines — the real minimatch case", () => {
+    const patches = ["8.0.6", "9.0.6", "9.0.7", "10.2.3"];
+    const ranges = [">= 8.0.0, < 8.0.6", ">= 9.0.0, < 9.0.6", ">= 9.0.0, < 9.0.7", ">= 10.0.0, < 10.2.3"];
+    assert.equal(lowestPatchClearingAll(patches, ranges), "8.0.6");
+  });
+
+  it("returns null when any range is unparseable, rather than guessing", () => {
+    assert.equal(lowestPatchClearingAll(["1.0.0", "2.0.0"], ["< 1.0.0", "^2.0.0"]), null);
+  });
+
+  it("returns null when nothing clears every range", () => {
+    // Contrived: neither patch escapes both windows.
+    assert.equal(lowestPatchClearingAll(["1.5.0"], ["< 1.0.0", ">= 1.0.0"]), null);
+  });
+
+  it("ignores duplicate ranges — Dependabot raises one alert per vulnerable copy", () => {
+    const patches = ["3.14.2", "4.1.1", "4.1.1"];
+    const ranges = ["< 3.14.2", ">= 4.0.0, < 4.1.1", ">= 4.0.0, < 4.1.1"];
+    assert.equal(lowestPatchClearingAll(patches, ranges), "3.14.2");
   });
 });
 

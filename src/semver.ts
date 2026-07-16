@@ -82,6 +82,105 @@ export function rangeCouldResolveVulnerable(specifier: string, patchedVersion: s
 }
 
 /**
+ * True when `version` falls inside a GitHub advisory's `vulnerable_version_range`.
+ *
+ * The format is a comma-separated conjunction of comparators. Across 228 real
+ * alerts on two repositories, exactly five shapes occur and nothing else:
+ *
+ *   ">= V, < V"   (87)     "< V"    (84)     ">= V, <= V"  (31)
+ *   "<= V"        (24)     "= V"     (2)
+ *
+ * `>` has never been observed, but absence from a 228-sample isn't proof and it
+ * costs one map entry.
+ *
+ * Returns **null** rather than false when the version or any bound won't parse.
+ * The distinction matters: false reads as "outside the vulnerable range", i.e.
+ * safe, which would let an unparseable range manufacture a false all-clear.
+ * Callers must treat null as "cannot tell" and fall back to their conservative
+ * branch.
+ *
+ * Pre-release is discarded by parseSemver, which is correct for every shape
+ * observed: the only pre-release bounds in real data are lower bounds of the
+ * form ">= 21.0.0-next.0" or ">= 7.0.0-alpha.0", and stripping them to
+ * ">= 21.0.0" / ">= 7.0.0" admits exactly the same stable versions. Ordering
+ * pre-releases properly would buy nothing here.
+ */
+export function satisfiesVulnerableRange(version: string, range: string): boolean | null {
+  const v = parseSemver(version);
+  if (!v) return null;
+
+  const parts = range
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  if (parts.length === 0) return null;
+
+  let inRange = true;
+  for (const part of parts) {
+    // No \s* between the groups: `.` would also match the space, and the two
+    // overlapping quantifiers backtrack. parseSemver trims its own input.
+    const m = /^(<=|>=|<|>|=)(.+)$/.exec(part);
+    if (!m) return null;
+    const bound = parseSemver(m[2]);
+    if (!bound) return null;
+
+    const c = compareSemver(v, bound);
+    const satisfied: Record<string, boolean> = {
+      "<": c < 0,
+      "<=": c <= 0,
+      ">": c > 0,
+      ">=": c >= 0,
+      "=": c === 0,
+    };
+    // Conjunction: one unsatisfied comparator puts the version outside the
+    // range, but keep going so an unparseable later part still returns null.
+    if (!satisfied[m[1]]) inRange = false;
+  }
+
+  return inRange;
+}
+
+/**
+ * The lowest of `patches` that falls inside NONE of `ranges` — the minimum
+ * single version that would clear every one of a package's alerts at once.
+ *
+ * This is the number issue #2 proposed writing as the override. It is not safe
+ * to write (the bounded spec's ceiling anchors on the highest installed copy, so
+ * a patch below that copy yields a range still admitting it, and escapes are
+ * only detected upward — the CVE would stay live in silence). It is, however,
+ * exactly the right number to *compare* against: when it sits below the max, the
+ * package is vulnerable on disjoint release lines and the max is forcing someone
+ * up further than any advisory requires. The rejected answer makes a sound
+ * detector. See findMultiLineAdvisories() in reconcile.ts.
+ *
+ * Returns null when nothing clears every range, or when any range is
+ * unparseable — we only report what we can prove.
+ */
+export function lowestPatchClearingAll(patches: string[], ranges: string[]): string | null {
+  const distinctRanges = [...new Set(ranges)];
+
+  const candidates = [...new Set(patches)]
+    .map((p) => ({ raw: p, parsed: parseSemver(p) }))
+    .filter((c): c is { raw: string; parsed: [number, number, number] } => c.parsed !== null)
+    .sort((a, b) => compareSemver(a.parsed, b.parsed));
+
+  for (const candidate of candidates) {
+    let clearsAll = true;
+    for (const range of distinctRanges) {
+      const hit = satisfiesVulnerableRange(candidate.raw, range);
+      if (hit === null) return null; // can't prove anything about this package
+      if (hit) {
+        clearsAll = false;
+        break;
+      }
+    }
+    if (clearsAll) return candidate.raw;
+  }
+
+  return null;
+}
+
+/**
  * The exclusive upper bound of the caret-compatible range around a version —
  * i.e. the first version that is considered a breaking change from it.
  *
