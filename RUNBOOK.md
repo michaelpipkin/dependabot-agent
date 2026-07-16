@@ -75,3 +75,7 @@ A genuine live removal needs a package with real alert history whose dependents 
 - `pnpm-list-*.json` — `pnpm list -r --json --depth=Infinity` in a vulnerable workspace.
 - `npm-ls-*.json` — `npm ls --all --json` in a vulnerable workspace.
 - `dependents-*.json` — the `DependentRange[]` shape (`{dependent, version, installedRange, latestRange, latestKnown}`).
+
+## Known edges to verify live
+
+- **pnpm `deduped` dependents** (`collectDependentRanges`, `src/package-manager/pnpm.ts`). The dependent walk skips `deduped` nodes, relying on the canonical occurrence appearing elsewhere in the same `pnpm why --json` output. A dependent appearing *only* deduped would contribute no range and bias the orphan-removal check toward remove (bounded by the `fixed`-alert gate). Capture real `pnpm why <pkg> --json` from a workspace with a deduped dependent and confirm whether a deduped node carries its `version` field before changing the walk to include them.

@@ -121,6 +121,23 @@ describe("computeOverrideChanges", () => {
     assert.match(stale!.reason, /Superseded/);
   });
 
+  it("keeps a user's hand-written scoped pin (non->= spec) when its base is alerted — finding #2", () => {
+    // A user deliberately pins `js-yaml@3: "3.14.1"` (an exact compat pin, not an
+    // agent-shaped ">=…" bound). js-yaml later gets a single-line 4.x alert → a
+    // flat override is written. The stale-key cleanup must NOT discard the user's
+    // pin: only agent-authored ">=" keys are treated as superseded.
+    const changes = computeOverrideChanges(
+      { "js-yaml@3": "3.14.1" },
+      [vuln("js-yaml", "4.1.1", "4.1.1")],
+      new Set(),
+    );
+    assert.equal(
+      changes.find((c) => c.packageName === "js-yaml@3"),
+      undefined,
+      "the user's non->= scoped pin is preserved",
+    );
+  });
+
   describe("no-in-range-fix flagging", () => {
     it("flags a major escape and says so in the reason", () => {
       const changes = computeOverrideChanges({}, [vuln("react", "18.2.0", "19.0.0")], new Set(["react"]));
@@ -477,6 +494,27 @@ describe("computeOverrideChanges — scoped overrides for multi-line advisories"
     ]);
     const keys = computeOverrideChanges({}, [pkg], new Set(["js-yaml"])).map((c) => c.packageName);
     assert.deepEqual(keys.sort(), ["js-yaml@3", "js-yaml@4"]);
+  });
+
+  it("falls back to flat when a vulnerable copy sits on a major BETWEEN scoped lines — finding #1", () => {
+    // Three disjoint lines patch to majors 3, 5, 6 (non-adjacent). An installed
+    // 4.5.0 is vulnerable via the open-below "< 5.1.0" line, but none of the
+    // {pkg@3, pkg@5, pkg@6} selectors match a 4.x copy — scoping would leave it
+    // live and report the advisory as handled. The guard must catch a copy on any
+    // uncovered major, not just one below the lowest, so it bails to the flat
+    // override (covers every copy, flags the escape).
+    const pkg = vuln("pkg", ["3.13.0", "4.5.0", "6.0.5"], "6.2.0", [
+      line("< 3.14.2", "3.14.2"),
+      line("< 5.1.0", "5.1.0"),
+      line(">= 6.0.0, < 6.2.0", "6.2.0"),
+    ]);
+    const changes = computeOverrideChanges({}, [pkg], new Set(["pkg"]));
+    assert.deepEqual(
+      changes.map((c) => c.packageName),
+      ["pkg"],
+    ); // flat, not pkg@3 / pkg@5 / pkg@6
+    assert.equal(changes[0].noInRangeFix, true);
+    assert.ok(changes[0].escapingVersions?.includes("4.5.0"), "the uncovered 4.x copy is flagged as an escape");
   });
 
   it("writes one bounded override per major, collapsing two advisories on each line", () => {

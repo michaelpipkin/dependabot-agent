@@ -234,13 +234,21 @@ export function baseNameOfOverrideKey(key: string): string {
  *     selector can't match the vulnerable copy). Those fall back to the flat max,
  *     with the multi-line report still warning. See issue #2.
  */
-/** A vulnerable installed copy on a major below every scoped selector — which no name@major key can match. */
-function hasVulnerableCopyBelowMajor(pkg: VulnerablePackage, lowestScopedMajor: number): boolean {
+/**
+ * A vulnerable installed copy on a major that NO scoped selector covers — no
+ * `name@major` key can match it, so scoping would leave it unpatched. This
+ * catches a copy below the lowest selector (an open-below line like "< 3.14.2"
+ * covers 2.x, but `js-yaml@3` doesn't) AND one wedged between non-adjacent
+ * selectors (a 4.x copy when the lines patch to majors 3, 5, 6) — either way the
+ * caller must bail to the flat override, which covers every copy and flags the
+ * escape.
+ */
+function hasVulnerableCopyOutsideScopedMajors(pkg: VulnerablePackage, scopedMajors: Set<number>): boolean {
   return pkg.installedVersions.some((v) => {
     const parsed = parseSemver(v);
     return (
       parsed !== null &&
-      parsed[0] < lowestScopedMajor &&
+      !scopedMajors.has(parsed[0]) &&
       pkg.alertRanges.some((ar) => satisfiesVulnerableRange(v, ar.range) === true)
     );
   });
@@ -275,14 +283,13 @@ function computeScopedSpecs(pkg: VulnerablePackage): ScopedSpec[] | null {
   }
   if (patchesByMajor.size < 2) return null; // one major → flat handles it
 
-  // A vulnerable copy on a major BELOW the lowest scoped selector can't be
-  // matched by any name@major key: an open-ended-below line like "< 3.14.2"
-  // covers 2.x too, but a `js-yaml@3` selector only matches 3.x. Scoping would
-  // leave that copy unpatched and unflagged, where the flat override covers every
-  // copy and reports the escape — so bail to flat. (Only reachable pre-fix; once
-  // flat closes the alerts the package leaves stillVulnerable and this isn't run
-  // again, so it doesn't fight idempotency.)
-  if (hasVulnerableCopyBelowMajor(pkg, Math.min(...patchesByMajor.keys()))) return null;
+  // A vulnerable copy on a major with no scoped selector — below the lowest, or
+  // wedged between non-adjacent lines — can't be matched by any name@major key,
+  // so scoping would leave it unpatched and unflagged where the flat override
+  // covers every copy and reports the escape. Bail to flat. (Only reachable
+  // pre-fix; once flat closes the alerts the package leaves stillVulnerable and
+  // this isn't run again, so it doesn't fight idempotency.)
+  if (hasVulnerableCopyOutsideScopedMajors(pkg, new Set(patchesByMajor.keys()))) return null;
 
   const higher = (a: string, b: string): string =>
     compareSemver(parseSemver(a)!, parseSemver(b)!) >= 0 ? a : b;
@@ -455,12 +462,18 @@ export function computeOverrideChanges(
   // the installed tree — is neither, so its pin stays untouched (README
   // guarantee: open ⇒ keep the override; a load-bearing pin is never dropped
   // while its alert is unresolved).
+  //
+  // The stale-variant cleanup only removes an AGENT-authored key. Every spec the
+  // agent writes is a bounded ">=…" from computeBoundedSpec, so a key whose spec
+  // isn't ">="-shaped is a user's hand-written pin (e.g. `foo@2: "2.3.1"`) — left
+  // untouched even when its base is alerted, so we don't discard a deliberate
+  // per-line pin the agent never wrote.
   const handledBaseNames = new Set([...handledKeys].map(baseNameOfOverrideKey));
   for (const [key, existingSpec] of Object.entries(currentOverrides)) {
     if (handledKeys.has(key)) continue; // this exact key was written or kept above
 
     const base = baseNameOfOverrideKey(key);
-    const superseded = handledBaseNames.has(base);
+    const superseded = handledBaseNames.has(base) && existingSpec.startsWith(">=");
     if (superseded || orphanRemovedNames.has(base)) {
       changes.push({
         packageName: key,

@@ -47,19 +47,35 @@ function buildNpmPackageJsonSource(filePath: string): OverrideSource {
     exitWithError(`No package.json found at ${filePath}`);
   }
   const raw = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
-  const overrides = (raw.overrides ?? {}) as Record<string, string>;
+
+  // npm's `overrides` allows nested object values (`"webpack": { "loader-utils":
+  // "^2.0.4" }`), which the reconciliation logic — keyed on string specs — can't
+  // model. Split them out: only string-valued overrides are reconciled; nested
+  // ones are preserved verbatim and merged back on write, never read or clobbered.
+  const rawOverrides = (raw.overrides ?? {}) as Record<string, unknown>;
+  const overrides: Record<string, string> = {};
+  const nested: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(rawOverrides)) {
+    if (typeof value === "string") overrides[key] = value;
+    else nested[key] = value;
+  }
 
   log(`   Using top-level "overrides" in package.json (npm).`);
+  const nestedKeys = Object.keys(nested);
+  if (nestedKeys.length > 0) {
+    log(`   ℹ️  Leaving ${nestedKeys.length} nested override(s) untouched (only string-valued specs are managed): ${nestedKeys.join(", ")}`);
+  }
 
   return {
     label: "package.json (npm overrides)",
     filePath,
     overrides,
     write(newOverrides: Record<string, string>): void {
-      if (Object.keys(newOverrides).length === 0) {
+      const merged = { ...nested, ...newOverrides };
+      if (Object.keys(merged).length === 0) {
         delete raw.overrides;
       } else {
-        raw.overrides = sortObjectKeys(newOverrides);
+        raw.overrides = sortObjectKeys(merged);
       }
       fs.writeFileSync(filePath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
     },
