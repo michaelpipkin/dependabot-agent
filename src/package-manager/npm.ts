@@ -74,11 +74,19 @@ export function parseNpmLsOutput(raw: string, cwd: string): InstalledTree[] {
  * no usable stdout at all.
  */
 function npmJson(cmd: string, cwd: string): string {
+  // Pipe stderr instead of letting it inherit the console. `npm ls` prints an
+  // ELSPROBLEMS block ("invalid: pkg@x") whenever an override forces a copy out
+  // of its declared range — which is the normal steady state for a repo using
+  // this tool, not a failure. We read the JSON it still emits on stdout; a real
+  // failure surfaces below when there's no usable stdout to fall back on.
   try {
-    return shell(cmd, { cwd, maxBuffer: 64 * 1024 * 1024 });
+    return shell(cmd, { cwd, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
   } catch (e) {
     const stdout = (e as { stdout?: Buffer | string }).stdout;
-    if (stdout) return stdout.toString();
+    if (stdout?.toString().trim()) {
+      log(`   (npm flags override-forced copies as "invalid" — expected; reading the tree anyway.)`);
+      return stdout.toString();
+    }
     throw e;
   }
 }

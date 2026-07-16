@@ -709,8 +709,31 @@ function logNoInRangeFixWarning(
  * warning: the flat max forced the lower line across a major no advisory
  * demanded. See issue #2.
  */
-function logMultiLineAdvisories(advisories: MultiLineAdvisory[], changes: OverrideChange[]): void {
+/** The override set as it stands AFTER applying this run's changes to the current one. */
+export function effectiveOverrideSpecs(
+  currentOverrides: Record<string, string>,
+  changes: OverrideChange[],
+): Record<string, string> {
+  const final = { ...currentOverrides };
+  for (const c of changes) {
+    if (c.action === "remove") delete final[c.packageName];
+    else if (c.newVersion) final[c.packageName] = c.newVersion;
+  }
+  return final;
+}
+
+export function logMultiLineAdvisories(
+  advisories: MultiLineAdvisory[],
+  changes: OverrideChange[],
+  currentOverrides: Record<string, string>,
+): void {
   if (advisories.length === 0) return;
+
+  // Read the override shape that will be ON DISK after this run, not just this
+  // run's changes: on an idempotent re-run the scoped keys are already present
+  // and no change is emitted, so keying off `changes` alone would wrongly report
+  // the flat fallback for a package that is correctly scoped.
+  const finalSpecs = effectiveOverrideSpecs(currentOverrides, changes);
 
   log(`\nℹ️  MULTI-LINE ADVISORY — ${advisories.length} package(s) vulnerable on disjoint release lines:`);
   for (const a of advisories) {
@@ -720,16 +743,13 @@ function logMultiLineAdvisories(advisories: MultiLineAdvisory[], changes: Overri
     const indent = " ".repeat(`      ${a.packageName}: ${a.lines.length} lines — `.length);
     for (const line of rest) log(`${indent}"${line.range}" → ${line.patch}`);
 
-    // Scoped overrides carry a `name@major` key whose base is this package.
-    const scoped = changes.filter(
-      (c) =>
-        c.action !== "remove" &&
-        c.packageName !== a.packageName &&
-        baseNameOfOverrideKey(c.packageName) === a.packageName,
-    );
-    if (scoped.length > 0) {
+    // Scoped iff the final override set carries a `name@major` key for this package.
+    const scopedKeys = Object.keys(finalSpecs)
+      .filter((k) => k !== a.packageName && baseNameOfOverrideKey(k) === a.packageName)
+      .sort();
+    if (scopedKeys.length > 0) {
       log(`         Split into per-line overrides — each consumer stays on its own line:`);
-      for (const c of scoped) log(`            ${c.packageName} → ${c.newVersion}`);
+      for (const k of scopedKeys) log(`            ${k} → ${finalSpecs[k]}`);
     } else {
       log(`         Forcing ${a.chosenPatch}. ${a.lowestClearing} clears every range, but a flat`);
       log(`         override hands one version to every consumer. See issue #2.`);
@@ -986,14 +1006,22 @@ function logDeploymentRecommendation(recommendations: DeploymentRecommendation[]
   if (needsDeploy.length > 0) {
     log("   Packages in PRODUCTION dependency graph (deployment recommended):");
     for (const r of needsDeploy) {
-      log(`      ⚠️  ${r.packageName} — via: ${r.productionPaths.join(", ")}`);
+      // productionPaths comes from the local tree walk; scope can still be
+      // "production" from Dependabot's own classification when the walk resolved
+      // no path (a forced/deep transitive copy). Don't print a dangling "via:".
+      const via =
+        r.productionPaths.length > 0
+          ? ` — via: ${r.productionPaths.join(", ")}`
+          : " — flagged runtime by Dependabot (no local path resolved)";
+      log(`      ⚠️  ${r.packageName}${via}`);
     }
   }
 
   if (devOnly.length > 0) {
     log("   Packages in DEV/TEST dependencies only (branch push is sufficient):");
     for (const r of devOnly) {
-      log(`      ✅ ${r.packageName} — via: ${r.devPaths.join(", ")}`);
+      const via = r.devPaths.length > 0 ? ` — via: ${r.devPaths.join(", ")}` : "";
+      log(`      ✅ ${r.packageName}${via}`);
     }
   }
 
@@ -1154,7 +1182,7 @@ async function processManifestGroup(
   // in-range fix to offer, so they read as the explanation rather than a new
   // finding.
   const multiLine = findMultiLineAdvisories(stillVulnerable);
-  logMultiLineAdvisories(multiLine, changes);
+  logMultiLineAdvisories(multiLine, changes, source.overrides);
 
   return {
     alerts: groupAlerts.length,

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **A multi-line advisory whose scoped overrides are already in place no longer reports itself as a flat override.** The multi-line report chose its "split into per-line overrides" vs "forcing a flat version" wording from _this run's changes_ only. On an idempotent re-run — the scoped `js-yaml@3` / `js-yaml@4` keys already on disk, so no change is emitted — it fell through to the flat message, wrongly claiming a single version was being forced on every consumer. It now reads the override shape that will be on disk after the run (current overrides plus this run's changes), so an already-scoped package is reported as scoped. Reporting only; the overrides written are unchanged. Caught by the live add-path smoke test.
+- **`npm ls`'s expected "invalid" errors no longer leak to the console.** When an override forces a copy out of its declared range — the normal steady state for any repo using this tool — `npm ls` exits non-zero and prints an `ELSPROBLEMS … invalid: pkg@x` block to stderr. The agent already read the JSON `npm ls` still emits, but the raw npm error text was inheriting the console and reading as a failure. Its stderr is now captured, replaced by a one-line note that override-forced copies are expected. A genuine `npm ls` failure (no usable output) still surfaces.
+- **The deployment-impact report no longer prints a dangling "via:".** A package Dependabot classifies as runtime but for which the local tree walk resolved no path printed `— via:` with nothing after it. It now says the classification came from Dependabot with no local path resolved, and omits the empty "via:" for dev-scoped packages.
+
 ## [0.1.15]
 
 ### Fixed

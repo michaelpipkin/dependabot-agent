@@ -6,10 +6,12 @@ import {
   findEscapingDependents,
   findMultiLineAdvisories,
   findVulnerableInstalls,
+  effectiveOverrideSpecs,
   groupAlertsByManifestDir,
   highestOverrideFloor,
   judgeOrphanedOverride,
   loadBearingAlertNames,
+  logMultiLineAdvisories,
   overrideFloor,
 } from "../src/reconcile.js";
 import * as path from "node:path";
@@ -944,5 +946,63 @@ describe("highestOverrideFloor — issue #1 (scoped-key removal threshold)", () 
     assert.notEqual(judgeOrphanedOverride(dependents, floor, "4.3.0").action, "remove");
     // Discrimination: the old lowest-floor behaviour DID remove it (the CVE bug).
     assert.equal(judgeOrphanedOverride(dependents, "3.14.2", "4.3.0").action, "remove");
+  });
+});
+
+describe("effectiveOverrideSpecs", () => {
+  it("returns the current overrides unchanged when there are no changes (idempotent run)", () => {
+    const current = { "js-yaml@3": ">=3.15.0 <4", "js-yaml@4": ">=4.2.0 <5" };
+    assert.deepEqual(effectiveOverrideSpecs(current, []), current);
+  });
+
+  it("applies adds, updates, and removes to the current set", () => {
+    const current = { lodash: ">=4.17.19 <5", "js-yaml@3": ">=3.14.2 <4" };
+    const final = effectiveOverrideSpecs(current, [
+      { packageName: "lodash", action: "update", oldVersion: ">=4.17.19 <5", newVersion: ">=4.17.21 <5", reason: "" },
+      { packageName: "js-yaml@4", action: "add", newVersion: ">=4.2.0 <5", reason: "" },
+      { packageName: "js-yaml@3", action: "remove", oldVersion: ">=3.14.2 <4", reason: "" },
+    ]);
+    assert.deepEqual(final, { lodash: ">=4.17.21 <5", "js-yaml@4": ">=4.2.0 <5" });
+  });
+});
+
+describe("logMultiLineAdvisories reports the final override shape (idempotent-flat mislabel fix)", () => {
+  const advisory = {
+    packageName: "js-yaml",
+    lines: [
+      { range: "< 3.14.2", patch: "3.14.2" },
+      { range: ">= 4.0.0, < 4.1.1", patch: "4.1.1" },
+    ],
+    chosenPatch: "4.1.1",
+    lowestClearing: "3.14.2",
+  };
+
+  const capture = (fn: () => void): string => {
+    const original = console.log;
+    const out: string[] = [];
+    console.log = (m?: unknown) => out.push(String(m));
+    try {
+      fn();
+    } finally {
+      console.log = original;
+    }
+    return out.join("\n");
+  };
+
+  it("reports 'Split into per-line overrides' when the scoped keys are already in place and no change is emitted", () => {
+    // The live-fixture case: an idempotent re-run emits no changes, but the scoped
+    // keys are on disk. Keying off `changes` alone wrongly printed the flat message.
+    const out = capture(() =>
+      logMultiLineAdvisories([advisory], [], { "js-yaml@3": ">=3.14.2 <4", "js-yaml@4": ">=4.1.1 <5" }),
+    );
+    assert.match(out, /Split into per-line overrides/);
+    assert.match(out, /js-yaml@3 → >=3\.14\.2 <4/);
+    assert.doesNotMatch(out, /Forcing/);
+  });
+
+  it("reports the flat 'Forcing …' message only when the package is genuinely on a single flat override", () => {
+    const out = capture(() => logMultiLineAdvisories([advisory], [], { "js-yaml": ">=4.1.1 <5" }));
+    assert.match(out, /Forcing 4\.1\.1/);
+    assert.doesNotMatch(out, /Split into per-line/);
   });
 });
