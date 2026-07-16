@@ -1,6 +1,6 @@
 {
   "name": "dependabot-agent",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "author": "Michael Pipkin <michael.a.pipkin@gmail.com>",
   "description": "On-demand CLI agent that reconciles npm/pnpm dependency overrides with GitHub Dependabot alerts",
   "license": "MIT",
