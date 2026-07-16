@@ -19,7 +19,7 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 
 ## Requirements
 
-- Node 20+
+- Node 22+
 - npm or pnpm
 - A GitHub Personal Access Token (classic or fine-grained) with **`security_events` read** permission, scoped to the repo.
   **In CI, this must be a real PAT stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
