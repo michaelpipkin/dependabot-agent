@@ -233,7 +233,7 @@ The `cookie` example above is the common shape of this, not a contrived one — 
 
 An advisory carries one vulnerable range **per release line**, each with its own patch, so a package vulnerable on two lines at once has no single patched version. `GHSA-mh29-5h37-fv8m` patches `js-yaml`'s `< 3.14.2` at `3.14.2` and its `>= 4.0.0, < 4.1.1` at `4.1.1` — and `3.14.2` clears both. A single flat override would drag the 3.x consumer across a major no advisory demands.
 
-**On pnpm the agent writes one bounded override per line** using pnpm's version-selector key, so each installed copy stays on its own release line:
+**The agent writes one bounded override per line** using a version-selector key, so each installed copy stays on its own release line:
 
 ```
 ℹ️  MULTI-LINE ADVISORY — 1 package(s) vulnerable on disjoint release lines:
@@ -244,9 +244,9 @@ An advisory carries one vulnerable range **per release line**, each with its own
             js-yaml@4 → >=4.1.1 <5
 ```
 
-The selector patches a line by the version installed, not by which parent pulled it, so no parent attribution is needed. Two advisories on one line collapse to a single selector at the higher patch. This was proven end-to-end: applied to a live repository, pnpm resolved each consumer to its own patched line and GitHub closed the alerts, neither consumer crossing a major.
+Both pnpm and npm honor the `name@major` selector — including for transitive copies — so the same specs work in either `pnpm-workspace.yaml` or a package.json `overrides` block. The selector patches a line by the version installed, not by which parent pulled it, so no parent attribution is needed. Two advisories on one line collapse to a single selector at the higher patch. Proven end-to-end on pnpm against a live repository (each consumer resolved to its own patched line, GitHub closed the alerts), and the selector mechanism verified on npm for both direct and registry-transitive copies.
 
-**Fallbacks keep the flat max** — and the warning form of the report ("Forcing 4.1.1 … See issue #2") — for the two cases a per-line selector can't express: **npm** (whose `overrides` have no version-selector), and **0.x packages** (where `pkg@0` is too broad, since a 0.x release line is a minor, not a major). Those still write the highest patch; see [Override safety](#override-safety) for why the highest is the safe flat choice. Scoped npm support is tracked in [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+**The flat max is a fallback** — with the warning form of the report ("Forcing 4.1.1 … See issue #2") — for **0.x packages**, where `pkg@0` is too broad (a 0.x release line is a minor, not a major). Those write the highest patch; see [Override safety](#override-safety) for why the highest is the safe flat choice. One npm caveat: the selector matches published copies, not a dependency linked via `file:` (npm resolves linked packages' own dependencies independently of the root's overrides).
 
 The condition is rarer than it sounds — most packages accumulate several advisories on a *single* line, where the highest patch is also the lowest that clears them all and nothing special happens.
 
@@ -431,7 +431,7 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 ### Override safety
 
 - Overrides for packages **not mentioned in any Dependabot alert** are never removed automatically.
-- When multiple alerts reference the same package on **one release line**, the **highest** `first_patched_version` wins — it is the lowest version that clears every range on that line. When they span **disjoint lines** (a [multi-line advisory](#multi-line-advisory)), pnpm gets one bounded override per line so each consumer stays put; npm and 0.x packages fall back to the flat highest. The flat highest is a safe fallback rather than an arbitrary one: a lower patch would clear the older line but, because the spec's ceiling anchors on the highest installed copy and escapes are only detected upward, would still admit the newer vulnerable copy with nothing to flag it — so the highest is the only flat choice that cannot fail silently. It forces the older consumer up and reports it as [no in-range fix](#no-in-range-fix). Scoped npm support is tracked in [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+- When multiple alerts reference the same package on **one release line**, the **highest** `first_patched_version` wins — it is the lowest version that clears every range on that line. When they span **disjoint lines** (a [multi-line advisory](#multi-line-advisory)), both pnpm and npm get one bounded override per line so each consumer stays put; only 0.x packages fall back to the flat highest. The flat highest is a safe fallback rather than an arbitrary one: a lower patch would clear the older line but, because the spec's ceiling anchors on the highest installed copy and escapes are only detected upward, would still admit the newer vulnerable copy with nothing to flag it — so the highest is the only flat choice that cannot fail silently. It forces the older consumer up and reports it as [no in-range fix](#no-in-range-fix).
 - Override specs are bounded at the first breaking version above the patch, per npm's caret rules (`>=4.17.21 <5`, `>=0.7.0 <0.8`, `>=0.0.5 <0.0.6`) — compatible with both npm and pnpm. The bound can never exclude its own floor, so a bounded spec can't produce an `ETARGET` at install.
 - Specs that escape the installed version's compatible range are reported as [no in-range fix](#no-in-range-fix) rather than applied silently.
 - The agent trusts the **alert state** (open ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides.

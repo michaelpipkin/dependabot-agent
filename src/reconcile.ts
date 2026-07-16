@@ -77,9 +77,9 @@ function mergeScope(a: DepScope, b: DepScope): DepScope {
 // assumed. Pinned by the findVulnerableInstalls tests in test/reconcile.test.ts;
 // the mechanism the argument rests on is pinned in test/semver.test.ts.
 //
-// Handing each line its own patch needs scoped overrides ("parent>child"), the
-// only mechanism that can give different consumers different versions — see
-// https://github.com/michaelpipkin/dependabot-agent/issues/2.
+// This merged max is the flat threshold and the fallback; when copies span two
+// majors the agent instead writes one scoped override per line (see
+// computeScopedSpecs) so each consumer keeps its own version. See issue #2.
 function mergeAlert(
   byName: Map<string, VulnerablePackage>,
   alert: DependabotAlert,
@@ -195,7 +195,7 @@ function rangeLowerMajor(range: string): number | null {
 }
 
 /**
- * The base package name behind an override key, stripping a pnpm version-selector
+ * The base package name behind an override key, stripping a version-selector
  * suffix: "js-yaml@3" → "js-yaml", "@babel/core@7" → "@babel/core", "lodash" →
  * "lodash". The leading `@` of a scoped package name is never treated as a
  * selector (the suffix must start with a digit).
@@ -212,9 +212,10 @@ export function baseNameOfOverrideKey(key: string): string {
  * max, which hands one version to every consumer and drags the lower line across
  * a major no advisory requires.
  *
- * Uses pnpm's version-selector key (`name@major`), which patches a line by the
- * version installed rather than by which parent pulled it — so no parent
- * attribution is needed. Proven end-to-end against the fixture repo for issue #2.
+ * Uses a version-selector key (`name@major`) that both pnpm and npm honor,
+ * including for transitive copies. It patches a line by the version installed
+ * rather than by which parent pulled it — so no parent attribution is needed.
+ * Proven end-to-end against the fixture repo for issue #2.
  *
  * Derived from the advisory ranges, not the installed versions — the agent
  * trusts the alert state, and once an override is applied the installed copies
@@ -605,10 +606,11 @@ function logNoInRangeFixWarning(
 /**
  * Report packages vulnerable on more than one release line at once.
  *
- * When per-line scoped overrides were written (pnpm), this reads as handled: it
- * names the scoped specs that keep each consumer on its own line. When they were
- * not — npm, or the 0.x fallback — it reads as a warning: the flat max forced the
- * lower line across a major no advisory demanded. See issue #2.
+ * When per-line scoped overrides were written, this reads as handled: it names
+ * the scoped specs that keep each consumer on its own line. When they were not —
+ * the 0.x fallback, where a version selector would be too broad — it reads as a
+ * warning: the flat max forced the lower line across a major no advisory
+ * demanded. See issue #2.
  */
 function logMultiLineAdvisories(advisories: MultiLineAdvisory[], changes: OverrideChange[]): void {
   if (advisories.length === 0) return;
