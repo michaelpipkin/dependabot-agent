@@ -113,12 +113,16 @@ export class PnpmPackageManager implements PackageManager {
       const dependents = new Map<string, { name: string; version: string }>();
       function collectDependents(deps: PnpmWhyDependent[]): void {
         for (const dep of deps) {
-          // Skip `deduped` nodes: their canonical (non-deduped) occurrence appears
-          // elsewhere in the same output at the same name@version and supplies the
-          // range. Known edge (not yet reproduced live): a dependent that appears
-          // ONLY deduped would contribute no range, biasing the orphan check toward
-          // remove — bounded by the fixed-alert gate. Verify against real `pnpm why`
-          // output before changing (a deduped node's `version` field may be absent).
+          // Skipping `deduped` nodes is a safe optimization, not a correctness gate.
+          // pnpm prints a subtree in full at its FIRST occurrence and marks every
+          // later one `deduped`, so a deduped node's name@version always has a
+          // non-deduped occurrence elsewhere in the same output — and this Map is
+          // keyed by name@version, so including deduped nodes would add nothing.
+          // Deduped nodes also carry no `dependents`, so there is no subtree lost by
+          // not recursing. Verified against real `pnpm why --json` (pnpm 10): deduped
+          // nodes carry both name and version and no children, and every one had a
+          // canonical full occurrence. So a dependent appearing ONLY deduped can't
+          // arise, and the orphan check can't be starved of a range this way.
           if (!dep.deduped) dependents.set(`${dep.name}@${dep.version}`, { name: dep.name, version: dep.version });
           if (dep.dependents) collectDependents(dep.dependents);
         }
