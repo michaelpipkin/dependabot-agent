@@ -231,19 +231,24 @@ The `cookie` example above is the common shape of this, not a contrived one — 
 
 ### Multi-line advisory
 
-An advisory carries one vulnerable range **per release line**, each with its own patch, so a package vulnerable on two lines at once has no single patched version. `GHSA-mh29-5h37-fv8m` patches `js-yaml`'s `< 3.14.2` at `3.14.2` and its `>= 4.0.0, < 4.1.1` at `4.1.1` — and `3.14.2` clears both. With copies installed on both lines, the agent writes the **highest** (see [Override safety](#override-safety)), which forces the 3.x consumer across a major no advisory demands. It reports when that happens:
+An advisory carries one vulnerable range **per release line**, each with its own patch, so a package vulnerable on two lines at once has no single patched version. `GHSA-mh29-5h37-fv8m` patches `js-yaml`'s `< 3.14.2` at `3.14.2` and its `>= 4.0.0, < 4.1.1` at `4.1.1` — and `3.14.2` clears both. A single flat override would drag the 3.x consumer across a major no advisory demands.
+
+**On pnpm the agent writes one bounded override per line** using pnpm's version-selector key, so each installed copy stays on its own release line:
 
 ```
 ℹ️  MULTI-LINE ADVISORY — 1 package(s) vulnerable on disjoint release lines:
       js-yaml: 2 lines — "< 3.14.2" → 3.14.2
                         ">= 4.0.0, < 4.1.1" → 4.1.1
-         Forcing 4.1.1. 3.14.2 clears every range, but a flat
-         override hands one version to every consumer. See issue #2.
+         Split into per-line overrides — each consumer stays on its own line:
+            js-yaml@3 → >=3.14.2 <4
+            js-yaml@4 → >=4.1.1 <5
 ```
 
-This is informational — nothing is wrong, and there is nothing to act on. An override is flat: one version reaches every consumer, so when consumers span two majors somebody moves either way, and the highest is the only choice that can't leave a vulnerable copy quietly resolvable. Handing each line its own patch needs scoped overrides, tracked in [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+The selector patches a line by the version installed, not by which parent pulled it, so no parent attribution is needed. Two advisories on one line collapse to a single selector at the higher patch. This was proven end-to-end: applied to a live repository, pnpm resolved each consumer to its own patched line and GitHub closed the alerts, neither consumer crossing a major.
 
-It is usually the explanation for a [no in-range fix](#no-in-range-fix) above it: in every occurrence measured on a real repository the lines sat on different majors, so the forced version was necessarily outside the lower consumer's range. The condition is rarer than it sounds — most packages accumulate several advisories on a *single* line, where the highest patch is also the lowest that clears them all and nothing is reported.
+**Fallbacks keep the flat max** — and the warning form of the report ("Forcing 4.1.1 … See issue #2") — for the two cases a per-line selector can't express: **npm** (whose `overrides` have no version-selector), and **0.x packages** (where `pkg@0` is too broad, since a 0.x release line is a minor, not a major). Those still write the highest patch; see [Override safety](#override-safety) for why the highest is the safe flat choice. Scoped npm support is tracked in [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+
+The condition is rarer than it sounds — most packages accumulate several advisories on a *single* line, where the highest patch is also the lowest that clears them all and nothing special happens.
 
 ### Direct dependencies vs. overrides (npm's spec-match rule)
 
@@ -426,7 +431,7 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 ### Override safety
 
 - Overrides for packages **not mentioned in any Dependabot alert** are never removed automatically.
-- When multiple alerts reference the same package, the **highest** `first_patched_version` wins. An advisory carries one vulnerable range per release line, each with its own patch, so a package vulnerable on two lines at once has no single patched version — and a flat override hands one version to every consumer regardless, so when consumers span two majors someone moves either way. The highest is chosen because it is the only choice that cannot fail silently: a lower patch does clear the older line, but the spec's ceiling anchors on the highest installed copy, so the range would still admit the newer vulnerable copy, and escapes are only ever detected upward — nothing would flag it. The highest instead forces the older consumer up and reports it as [no in-range fix](#no-in-range-fix), alongside a [multi-line advisory](#multi-line-advisory) note saying what the minimum would have been. Giving each release line its own patch needs scoped overrides; see [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+- When multiple alerts reference the same package on **one release line**, the **highest** `first_patched_version` wins — it is the lowest version that clears every range on that line. When they span **disjoint lines** (a [multi-line advisory](#multi-line-advisory)), pnpm gets one bounded override per line so each consumer stays put; npm and 0.x packages fall back to the flat highest. The flat highest is a safe fallback rather than an arbitrary one: a lower patch would clear the older line but, because the spec's ceiling anchors on the highest installed copy and escapes are only detected upward, would still admit the newer vulnerable copy with nothing to flag it — so the highest is the only flat choice that cannot fail silently. It forces the older consumer up and reports it as [no in-range fix](#no-in-range-fix). Scoped npm support is tracked in [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
 - Override specs are bounded at the first breaking version above the patch, per npm's caret rules (`>=4.17.21 <5`, `>=0.7.0 <0.8`, `>=0.0.5 <0.0.6`) — compatible with both npm and pnpm. The bound can never exclude its own floor, so a bounded spec can't produce an `ETARGET` at install.
 - Specs that escape the installed version's compatible range are reported as [no in-range fix](#no-in-range-fix) rather than applied silently.
 - The agent trusts the **alert state** (open ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides.
