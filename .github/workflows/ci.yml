@@ -1,0 +1,43 @@
+name: ci
+
+# Gate every pull request (and the merge commit on main) across the Node
+# versions and operating systems the package supports. The agent shells out to
+# real pnpm/npm and has Windows-specific path handling, so "passes on my
+# machine" isn't enough — this proves it on each combination.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same branch/PR cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # let every combination report, not just the first to fail
+      matrix:
+        node: [22, 24] # 22 = engines floor (LTS), 24 = current
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6 # uses the version from packageManager
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm run build

@@ -25,7 +25,13 @@ try {
   normalizeChildEnv();
 
   const config = resolveConfig(args, process.env);
-  await run(config);
+  const result = await run(config);
+
+  // Opt-in CI signal: exit 2 (distinct from 1 = error) when override changes
+  // were found, so `--dry-run --exit-code` fails a build on override drift.
+  if (config.exitCode && result.overrideChanges > 0) {
+    process.exitCode = 2;
+  }
 } catch (err) {
   // AgentError carries an already-formatted, user-facing message; anything else
   // is an unexpected crash worth a full dump. Set exitCode rather than calling

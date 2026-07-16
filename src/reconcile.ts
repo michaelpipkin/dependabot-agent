@@ -1211,7 +1211,13 @@ function resolveScope(v: VulnerablePackage, pm: PackageManager, manifestDir: str
   return { ...local, scope: v.scope };
 }
 
-export async function run(cfg: ResolvedConfig): Promise<void> {
+/** Outcome of a run, for the caller to derive a process exit code from. */
+export interface RunResult {
+  /** Override keys added, updated, or removed across every manifest group. */
+  overrideChanges: number;
+}
+
+export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   log("🤖 Dependabot Override Agent");
   log("================================");
   if (cfg.dryRun) log("⚠️  DRY RUN MODE — no files will be modified\n");
@@ -1304,4 +1310,6 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
     log(`\n${"═".repeat(48)}`);
     logDeploymentRecommendation(allRecommendations);
   }
+
+  return { overrideChanges: totalAdded + totalRemoved };
 }

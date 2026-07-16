@@ -12,10 +12,12 @@ _Groundwork for a 1.0.0 release — intended to ship together with that version.
 
 ### Added
 
+- **`--exit-code` flag (`EXIT_CODE=true`) for CI drift gating.** When set, the agent exits `2` if it finds any override changes — pair it with `--dry-run` to fail a build when a repo's overrides have fallen out of date with its Dependabot alerts. `2` is deliberately distinct from `1` (a real error) so CI can tell drift apart from a broken run; a clean run stays `0`.
 - **A "Versioning & stability" policy in the README.** States the contract the version numbers describe from 1.0.0 on — the CLI flags, env vars, config schema, exit codes, and which overrides the agent writes for a given input — and what counts as a major/minor/patch change. Console output and internal modules are explicitly outside the contract.
 
 ### Changed
 
+- **The minimum Node version is now 22** (was 20). Node 20 reached end-of-life in April 2026, and the project's own toolchain (pnpm) requires Node 22.13+, so Node 20 can no longer be built or tested against. The CI matrix runs on Node 22 and 24, across Linux and Windows.
 - **The package now declares no importable API.** It has always been a CLI-only tool, but `main`/`types` pointed at the CLI entry (which runs on import and exports nothing). Those fields are removed and an `exports` restriction is added, so `import "dependabot-agent"` and deep imports of internal `dist/` modules are no longer resolvable — preventing internal functions from becoming an accidental, frozen public API. The `dependabot-agent` command is unaffected.
 
 ### Fixed

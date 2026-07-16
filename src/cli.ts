@@ -13,6 +13,7 @@ export interface CliArgs {
   updateStrategy?: UpdateStrategy;
   dryRun?: boolean;
   skipUpdate?: boolean;
+  exitCode?: boolean;
   config?: string;
 }
 
@@ -31,6 +32,8 @@ Options:
                                    Default: compatible (does not cross majors).
   --dry-run                        Print planned changes without writing (or DRY_RUN=true).
   --skip-update                    Skip the dependency update step (or SKIP_UPDATE=true).
+  --exit-code                      Exit 2 if any override changes are found (or EXIT_CODE=true).
+                                   Pair with --dry-run in CI to fail on override drift.
   --config <path>                  Path to a config file (JSON).
   -h, --help                       Show this help and exit.
   -v, --version                    Show version and exit.
@@ -105,6 +108,9 @@ export function parseArgs(argv: string[], version: string): CliArgs {
         break;
       case "--skip-update":
         args.skipUpdate = true;
+        break;
+      case "--exit-code":
+        args.exitCode = true;
         break;
       case "-h":
       case "--help":

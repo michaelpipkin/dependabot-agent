@@ -19,7 +19,7 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 
 ## Requirements
 
-- Node 20+
+- Node 22+
 - npm or pnpm
 - A GitHub Personal Access Token (classic or fine-grained) with **`security_events` read** permission, scoped to the repo.
   **In CI, this must be a real PAT stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
@@ -156,9 +156,14 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--update-strategy <compatible\|latest>` | `UPDATE_STRATEGY` | `compatible` | See [Update strategy](#update-strategy). |
 | `--dry-run` | `DRY_RUN=true` | `false` | Print planned changes without writing. |
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
+| `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
 Precedence: **flags > environment variables > config file > defaults.**
+
+### Exit codes
+
+`0` — ran successfully (whether or not it wrote anything). `1` — the agent failed (bad token, unreadable manifest, an unexpected error). With `--exit-code`, `2` — the run found override changes (in `--dry-run`, that means your overrides have drifted out of date). `2` is deliberately distinct from `1` so CI can tell "drift detected" apart from "the tool broke."
 
 ## Config file reference
 
@@ -429,6 +434,19 @@ jobs:
   protection on code scanning, either allowlist this, or switch Code Scanning to "Advanced setup"
   and add a `paths-ignore` for manifest/lockfile-only changes so the job doesn't run on these PRs at
   all.
+
+### Fail a build on override drift
+
+To gate CI instead of opening PRs — fail the build when a repo's overrides fall out of date with its alerts — run a dry-run with `--exit-code`. It exits `2` when there is override work to do, `0` when everything is in place, `1` on a real error:
+
+```yaml
+- name: Check for override drift
+  env:
+    GITHUB_TOKEN: ${{ secrets.DEPENDABOT_PAT }} # PAT with security_events scope
+  run: npx dependabot-agent --repo ${{ github.repository }} --dry-run --exit-code
+```
+
+A green run means the overrides are current; a red one (exit `2`) means someone should run the agent for real and commit the result. Because `2` is distinct from `1`, a genuine failure (bad token, network) still reads as a failure rather than as drift.
 
 ## Design notes
 

@@ -15,6 +15,7 @@ export interface ResolvedConfig {
   updateStrategy: UpdateStrategy;
   dryRun: boolean;
   skipUpdate: boolean;
+  exitCode: boolean; // exit 2 when any override changes are found (CI drift gate)
   discoverPackages: boolean; // auto-discover isolated sub-packages (own lockfile)
   packages: string[]; // extra manifest dirs to always process (relative to root)
 }
@@ -26,6 +27,7 @@ interface ConfigFile {
   updateStrategy?: UpdateStrategy;
   dryRun?: boolean;
   skipUpdate?: boolean;
+  exitCode?: boolean;
   discoverPackages?: boolean;
   packages?: string[];
   token?: string; // not allowed — warned and ignored
@@ -130,6 +132,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
 
   const dryRun = args.dryRun ?? envBool(env.DRY_RUN) ?? config.dryRun ?? false;
   const skipUpdate = args.skipUpdate ?? envBool(env.SKIP_UPDATE) ?? config.skipUpdate ?? false;
+  const exitCode = args.exitCode ?? envBool(env.EXIT_CODE) ?? config.exitCode ?? false;
 
   // Monorepo / isolated-package discovery (config-file only).
   const discoverPackages = config.discoverPackages ?? true;
@@ -155,6 +158,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     updateStrategy,
     dryRun,
     skipUpdate,
+    exitCode,
     discoverPackages,
     packages,
   };
