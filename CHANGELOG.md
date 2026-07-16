@@ -12,6 +12,7 @@ _Groundwork for a 1.0.0 release — intended to ship together with that version.
 
 ### Added
 
+- **`--exit-code` flag (`EXIT_CODE=true`) for CI drift gating.** When set, the agent exits `2` if it finds any override changes — pair it with `--dry-run` to fail a build when a repo's overrides have fallen out of date with its Dependabot alerts. `2` is deliberately distinct from `1` (a real error) so CI can tell drift apart from a broken run; a clean run stays `0`.
 - **A "Versioning & stability" policy in the README.** States the contract the version numbers describe from 1.0.0 on — the CLI flags, env vars, config schema, exit codes, and which overrides the agent writes for a given input — and what counts as a major/minor/patch change. Console output and internal modules are explicitly outside the contract.
 
 ### Changed
