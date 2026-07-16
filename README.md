@@ -11,7 +11,7 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 3. **Fetches** all open npm Dependabot alerts for your repo via the GitHub API.
 4. **Updates** dependencies (range-bound by default — see [Update strategy](#update-strategy)).
 5. **Walks** the full installed dependency tree and confirms each alerted package is actually present.
-6. **Adds or updates** override entries for packages that remain vulnerable, writing a spec bounded at the first breaking version above the patch (`>=0.7.0 <0.8`, `>=4.17.21 <5`) so a fix never drags the tree further than it has to.
+6. **Adds or updates** override entries for packages that remain vulnerable, writing a spec bounded at the first breaking version above the patch (`>=0.7.0 <0.8`, `>=4.17.21 <5`) so a fix never drags the tree further than it has to. When one advisory spans **disjoint release lines** — a package vulnerable on, say, both 3.x and 4.x at once — it writes one bounded override *per line* (`js-yaml@3`, `js-yaml@4`) so each consumer stays on its own major instead of being forced up. See [Multi-line advisory](#multi-line-advisory).
 7. **Flags** the cases where no in-range fix exists — the earliest patched version sits outside what's installed can accept — separately from routine changes. See [No in-range fix](#no-in-range-fix).
 8. **Removes** overrides whose vulnerability has been resolved.
 9. **Leaves untouched** any overrides for packages that don't appear in any Dependabot alert (assumed intentional).
@@ -447,14 +447,16 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 
 ### Orphaned overrides
 
-For an override with no matching open alert, the agent finds its installed dependents and asks the npm registry what range each declares for the overridden package. Registry data is used because your installed tree's *resolved* versions reflect whatever the overrides forced; reading the declared range off disk would mean knowing each package manager's `node_modules` layout, so the registry keeps this package-manager independent.
+For an override with no matching open alert, the agent finds its installed dependents and works out whether it's still load-bearing.
 
-Two different questions get asked here, of two different versions of each dependent:
+For a **published** dependent it asks the npm registry what range that dependent declares for the overridden package — reading the registry rather than your installed tree, whose *resolved* versions already reflect whatever the override forced. Two different questions get asked, of two different versions of each dependent:
 
-- **"Can this override be removed?"** reads the range each dependent's **latest published** version declares. It's forward-looking — after an update you resolve to those versions anyway — so the override is only removed if every latest upstream range now requests a safe version. Otherwise it's kept as still load-bearing.
+- **"Can this override be removed?"** reads the range the dependent's **latest published** version declares. It's forward-looking — after an update you resolve to those versions anyway — so the override is only removed if every dependent's latest range now requests a safe version. Otherwise it's kept as still load-bearing.
 - **"Is this override forcing a dependent past its range?"** reads the range the **installed** version declares, because that's a question about the tree you actually have. A hit is reported as [no in-range fix](#no-in-range-fix), naming the dependent and version.
 
-The distinction matters. An override can look routine against latest and be forcing a major bump on the copy you have: if the newest release of a dependent asks for `^7.5.3` but the version installed asks for `^6.1.11`, an override at `>=7.5.16` is dragging your installed copy across a major, and only the installed range shows it. Where a dependent's installed manifest can't be resolved from the registry, the escape check falls back to its latest range and the report says so.
+For a **workspace-internal** dependent — a `packages/*` member with no registry entry — there's no published version to look up. Its committed `package.json` *is* its authoritative current requirement, so the agent reads the declared range straight from disk and folds it in as both the installed and latest range. Without this, an override reachable only through workspace members could never age out, even after those members raised their own ranges to safe versions. The read stays strictly conservative: a member contributes only what it explicitly declares, and workspace globs the agent can't confidently parse are skipped rather than guessed — silence never counts as "safe to remove."
+
+The distinction between installed and latest matters. An override can look routine against latest and be forcing a major bump on the copy you have: if the newest release of a dependent asks for `^7.5.3` but the version installed asks for `^6.1.11`, an override at `>=7.5.16` is dragging your installed copy across a major, and only the installed range shows it. Where a published dependent's installed manifest can't be resolved from the registry, the escape check falls back to its latest range and the report says so.
 
 > **Note on YAML comments:** `js-yaml` doesn't round-trip comments, so hand-written comments in `pnpm-workspace.yaml` are lost on the first write.
 

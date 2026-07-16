@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [0.1.12]
+
+### Changed
+
+- **Documentation caught up with behaviour.** The "What it does" overview now mentions that a multi-line advisory is fixed with one scoped override per release line (shipped 0.1.10), and the "Orphaned overrides" section now describes reading a workspace member's local manifest to decide removal (shipped 0.1.11) — it previously said only the npm registry was consulted, which stopped being true. No code change; this release exists to publish the corrected README to npm.
+
 ## [0.1.11]
 
 ### Added
