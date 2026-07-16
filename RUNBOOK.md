@@ -54,29 +54,18 @@ Then wait for Dependabot to re-scan; the four **lockfile**-keyed alerts should g
 
 *(To re-run from a clean slate: revert the overrides, reinstall, push, and wait for the alerts to reopen.)*
 
-## Remove — either manager
+## Remove — deterministic tests, not a live fixture
 
-`dependabot-agent-fixture-removal` installs `debug@2.6.9` (which declares `ms 2.0.0`) with an override forcing `ms >=2.1.0 <3`. `debug@latest` declares `ms ^2.1.3` — above the floor — so the override is dead weight.
+Removal only touches an override whose package was **alerted at some point** — the agent leaves a hand-added, never-alerted pin untouched (README guarantee; the `everAlertedNames` guard, fetched across all alert states). That makes a synthetic live removal fixture impossible: an override that was never a real Dependabot alert is, by design, left alone. `dependabot-agent-fixture-removal` (`debug@2.6.9` + a never-alerted `ms` override) now demonstrates exactly that **leave-alone** behaviour — the agent reports no changes.
 
-```bash
-git clone https://github.com/michaelpipkin/dependabot-agent-fixture-removal && cd dependabot-agent-fixture-removal
-npm install
-GITHUB_TOKEN=$(gh auth token) dependabot-agent --repo michaelpipkin/dependabot-agent-fixture-removal --dry-run
-```
+So the removal decision is proven deterministically instead:
 
-**Expect**:
+- `judgeOrphanedOverride` (`test/reconcile.test.ts`) — remove / keep-load-bearing / escape / keep-no-data, including the strategy-aware `compatible`-vs-`latest` behaviour and the highest-floor scoped-key threshold.
+- `highestOverrideFloor` (`test/reconcile.test.ts`) — the conservative floor across scoped keys.
+- workspace-member local ranges (`test/workspace.test.ts`) — a member declaring a safe range ages the override out; a vulnerable one keeps it.
 
-```
-🔍 Checking npm registry for upstream dependency ranges for ms...
-✂️  Override for ms (>=2.1.0 <3) is no longer needed — latest upstream versions all request safe ranges: ^2.1.3
-   - REMOVE ms: ">=2.1.0 <3"
-```
+A genuine live removal needs a package with real alert history whose dependents have since moved on — reproduce from a repo that actually hit such a case rather than a constructed fixture.
 
-This scenario is **registry-driven, not alert-driven** — the repo has no vulnerabilities, so the agent fetches zero alerts and the `ms` override is a pure orphan. (The repo still needs Dependabot alerts *enabled* so the fetch returns `[]` rather than a 403 — this fixture has them on.) The removal decision reads `debug@latest`'s range (`^2.1.3`), not the installed `debug@2.6.9`'s (`2.0.0`); that forward-looking check is the whole point. The decision logic itself is pinned deterministically by `judgeOrphanedOverride` in `test/reconcile.test.ts`.
-
-### Remove — workspace-internal dependent variant
-
-The removal fixture uses a *published* dependent (`debug`), which the registry can resolve. A **workspace member** can't be looked up in the registry, so its declared range is read from its own `package.json` on disk instead (issue #14). Because that's local-manifest-driven, it needs no live repo — it's covered deterministically in `test/workspace.test.ts` (a member declaring a safe range ages the override out; a vulnerable range keeps it). To eyeball it live: make a throwaway pnpm/npm workspace where a member declares a package at a range at or above an existing override's floor, then run the agent `--dry-run` — it plans `REMOVE`; drop the member's range below the floor and it keeps the override.
 
 ## Regenerating the captured fixtures
 

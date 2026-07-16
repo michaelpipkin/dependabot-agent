@@ -16,6 +16,7 @@ import {
   lowestPatchClearingAll,
   parseSemver,
   rangeCouldResolveVulnerable,
+  satisfiesVulnerableRange,
 } from "./semver.js";
 import { findInstalledVersions } from "./tree.js";
 import { workspaceMemberDependents } from "./workspace.js";
@@ -31,6 +32,7 @@ import {
   OrphanEscape,
   OverrideChange,
   PackageManagerId,
+  UpdateStrategy,
   VulnerablePackage,
 } from "./types.js";
 import { exitWithError, log } from "./util.js";
@@ -233,6 +235,18 @@ export function baseNameOfOverrideKey(key: string): string {
  *     selector can't match the vulnerable copy). Those fall back to the flat max,
  *     with the multi-line report still warning. See issue #2.
  */
+/** A vulnerable installed copy on a major below every scoped selector — which no name@major key can match. */
+function hasVulnerableCopyBelowMajor(pkg: VulnerablePackage, lowestScopedMajor: number): boolean {
+  return pkg.installedVersions.some((v) => {
+    const parsed = parseSemver(v);
+    return (
+      parsed !== null &&
+      parsed[0] < lowestScopedMajor &&
+      pkg.alertRanges.some((ar) => satisfiesVulnerableRange(v, ar.range) === true)
+    );
+  });
+}
+
 function computeScopedSpecs(pkg: VulnerablePackage): ScopedSpec[] | null {
   // Same gate as the report: only when the lines are genuinely disjoint.
   const lowestClearing = lowestPatchClearingAll(
@@ -261,6 +275,15 @@ function computeScopedSpecs(pkg: VulnerablePackage): ScopedSpec[] | null {
     patchesByMajor.get(pv[0])!.push(ar.patch);
   }
   if (patchesByMajor.size < 2) return null; // one major → flat handles it
+
+  // A vulnerable copy on a major BELOW the lowest scoped selector can't be
+  // matched by any name@major key: an open-ended-below line like "< 3.14.2"
+  // covers 2.x too, but a `js-yaml@3` selector only matches 3.x. Scoping would
+  // leave that copy unpatched and unflagged, where the flat override covers every
+  // copy and reports the escape — so bail to flat. (Only reachable pre-fix; once
+  // flat closes the alerts the package leaves stillVulnerable and this isn't run
+  // again, so it doesn't fight idempotency.)
+  if (hasVulnerableCopyBelowMajor(pkg, Math.min(...patchesByMajor.keys()))) return null;
 
   const higher = (a: string, b: string): string =>
     compareSemver(parseSemver(a)!, parseSemver(b)!) >= 0 ? a : b;
@@ -434,6 +457,25 @@ export function computeOverrideChanges(
 /** The floor of an override spec: ">=11.1.1" and ">=7.29.6 <8" both yield the lower bound. */
 export function overrideFloor(spec: string): string {
   return spec.replace(/^>=/, "").split(" ")[0].trim();
+}
+
+/**
+ * The highest floor across a package's override specs. When a package is held by
+ * scoped keys on several lines (js-yaml@3 → >=3.14.2, js-yaml@4 → >=4.1.1), the
+ * removal check judges against ONE threshold, and the highest is the only
+ * conservative single choice: a lower floor clears more dependents and removes
+ * more, which for scoped overrides drops the higher line's still-load-bearing key
+ * and reintroduces its CVE. Over-keeping a line that's already safe is harmless;
+ * wrongly removing one is not. Unparseable floors are ignored for the max.
+ */
+export function highestOverrideFloor(specs: string[]): string {
+  const floors = specs.map(overrideFloor);
+  return floors.reduce((hi, f) => {
+    const a = parseSemver(hi);
+    const b = parseSemver(f);
+    if (!a || !b) return hi;
+    return compareSemver(b, a) > 0 ? f : hi;
+  }, floors[0]);
 }
 
 /**
@@ -725,10 +767,22 @@ export function judgeOrphanedOverride(
   dependents: DependentRange[],
   floor: string,
   resolvedVersion: string | undefined,
+  strategy: UpdateStrategy,
 ): OrphanVerdict {
   const latestRanges = [...new Set(dependents.map((d) => d.latestRange).filter((r): r is string => r !== null))];
-  if (latestRanges.length === 0) return { action: "keep-no-data", latestRanges };
-  const stillNeeded = latestRanges.some((range) => rangeCouldResolveVulnerable(range, floor));
+  // Under `latest` the update moves each dependent to its latest release, so the
+  // latest range is what will resolve — the forward-looking question. Under
+  // `compatible` the update can't cross a major, so a dependent pinned below its
+  // latest stays at its INSTALLED range; removing on the strength of a safe
+  // latest would reintroduce the CVE that installed dependent still pulls. So
+  // compatible checks both, keeping the override if EITHER could resolve vulnerable.
+  const installedRanges =
+    strategy === "compatible"
+      ? [...new Set(dependents.map((d) => d.installedRange).filter((r): r is string => r !== null))]
+      : [];
+  const rangesToCheck = [...new Set([...latestRanges, ...installedRanges])];
+  if (rangesToCheck.length === 0) return { action: "keep-no-data", latestRanges };
+  const stillNeeded = rangesToCheck.some((range) => rangeCouldResolveVulnerable(range, floor));
   if (!stillNeeded) return { action: "remove", latestRanges };
   const escaping = findEscapingDependents(resolvedVersion ?? floor, dependents);
   if (escaping.length > 0) return { action: "escape", latestRanges, escaping };
@@ -750,20 +804,14 @@ async function reconcileOrphanedOverride(
   pm: PackageManager,
   allAlertedNames: Set<string>,
   tree: InstalledTree[],
+  strategy: UpdateStrategy,
 ): Promise<OrphanEscape | null> {
   // `name` is a base package name; it may be held by a flat key or by one or
-  // more scoped selectors (js-yaml@3, js-yaml@4). Describe it by its keys, and
-  // judge "still needed" against the LOWEST floor — the most conservative
-  // threshold, so any line a dependent might still resolve below keeps the set.
+  // more scoped selectors (js-yaml@3, js-yaml@4). Describe it by its keys and
+  // judge against the highest floor across them — see highestOverrideFloor.
   const keys = Object.keys(source.overrides).filter((k) => baseNameOfOverrideKey(k) === name);
   const overrideSpec = keys.map((k) => source.overrides[k]).join(", ");
-  const floors = keys.map((k) => overrideFloor(source.overrides[k]));
-  const patchedVersion = floors.reduce((lo, f) => {
-    const a = parseSemver(lo);
-    const b = parseSemver(f);
-    if (!a || !b) return lo;
-    return compareSemver(b, a) < 0 ? f : lo;
-  }, floors[0]);
+  const patchedVersion = highestOverrideFloor(keys.map((k) => source.overrides[k]));
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
   const dependents = await pm.collectDependentRanges(name, manifestDir);
@@ -791,7 +839,7 @@ async function reconcileOrphanedOverride(
   // the HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
   // that's the copy pushing dependents furthest past their range.
   const resolvedVersion = findInstalledVersions(name, tree).at(-1);
-  const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion);
+  const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion, strategy);
 
   switch (verdict.action) {
     case "keep-no-data":
@@ -966,6 +1014,7 @@ async function processManifestGroup(
   ctx: RunContext,
   rootPmId: PackageManagerId,
   globalAlertedNames: Set<string>,
+  everAlertedNames: Set<string>,
 ): Promise<GroupResult> {
   const isRoot = manifestDir === cfg.workspaceRoot;
   const label = isRoot ? "root" : path.relative(cfg.workspaceRoot, manifestDir);
@@ -989,13 +1038,15 @@ async function processManifestGroup(
   // For overrides with no active alert in ANY group, check whether any
   // dependent still requests a vulnerable range. Work in base package names: a
   // scoped key like "js-yaml@3" belongs to "js-yaml", which is what the alert
-  // set and the registry are keyed by.
+  // set and the registry are keyed by. Only reconcile a base the agent could
+  // have authored — one that was alerted at some point; a package never alerted
+  // is a hand-written pin the agent must leave untouched (README guarantee).
   const orphanedBaseNames = [...new Set(Object.keys(source.overrides).map(baseNameOfOverrideKey))].filter(
-    (base) => !globalAlertedNames.has(base),
+    (base) => !globalAlertedNames.has(base) && everAlertedNames.has(base),
   );
   const orphanEscapes: OrphanEscape[] = [];
   for (const base of orphanedBaseNames) {
-    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, allAlertedNames, tree);
+    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, allAlertedNames, tree, cfg.updateStrategy);
     if (escape) orphanEscapes.push(escape);
   }
 
@@ -1071,8 +1122,12 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
     log(`🧩 Isolated package(s): ${extraDirs.map((d) => path.relative(cfg.workspaceRoot, d)).join(", ")}`);
   }
 
-  // 1. Fetch all open npm alerts
-  const alerts = await fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token });
+  // 1. Fetch npm alerts (all states), then split: open drives the override
+  // decisions; every alerted name (any state) marks which overrides the agent
+  // could have authored, so a never-alerted hand-pin is left untouched.
+  const allAlerts = await fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token });
+  const alerts = allAlerts.filter((a) => a.state === "open");
+  const everAlertedNames = new Set(allAlerts.map((a) => a.security_vulnerability.package.name));
 
   // 2. Group alerts by manifest directory (plus root + extra dirs)
   const alertsByDir = groupAlertsByManifestDir(alerts, cfg.workspaceRoot, extraDirs);
@@ -1091,7 +1146,15 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   const globalAlertedNames = new Set(alerts.map((a) => a.security_vulnerability.package.name));
 
   for (const [manifestDir, groupAlerts] of alertsByDir) {
-    const result = await processManifestGroup(manifestDir, groupAlerts, cfg, ctx, rootPmId, globalAlertedNames);
+    const result = await processManifestGroup(
+      manifestDir,
+      groupAlerts,
+      cfg,
+      ctx,
+      rootPmId,
+      globalAlertedNames,
+      everAlertedNames,
+    );
 
     totalAlerts += result.alerts;
     totalAdded += result.added;

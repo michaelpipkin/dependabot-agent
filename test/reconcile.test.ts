@@ -6,6 +6,7 @@ import {
   findMultiLineAdvisories,
   findVulnerableInstalls,
   groupAlertsByManifestDir,
+  highestOverrideFloor,
   judgeOrphanedOverride,
   overrideFloor,
 } from "../src/reconcile.js";
@@ -408,6 +409,35 @@ describe("computeOverrideChanges — scoped overrides for multi-line advisories"
       line(">= 4.0.0, <= 4.1.1", "4.2.0"),
     ]);
 
+  it("falls back to flat when a vulnerable copy sits below the lowest scoped major — issue #4", () => {
+    // Installed copies span 2.x/3.x/4.x; the "< 3.14.2" line covers the 2.5.0 copy,
+    // but a js-yaml@3 selector wouldn't match it. Scoping would leave 2.5.0
+    // unpatched and unflagged, so the agent uses the flat override (which covers
+    // every copy) and reports the escape.
+    const pkg = vuln("js-yaml", ["2.5.0", "3.13.0", "4.0.5"], "4.1.1", [
+      line("< 3.14.2", "3.14.2"),
+      line(">= 4.0.0, < 4.1.1", "4.1.1"),
+    ]);
+    const changes = computeOverrideChanges({}, [pkg], new Set(["js-yaml"]));
+    assert.deepEqual(
+      changes.map((c) => c.packageName),
+      ["js-yaml"],
+    ); // flat, not js-yaml@3 / js-yaml@4
+    assert.equal(changes[0].noInRangeFix, true);
+    assert.ok(changes[0].escapingVersions?.includes("2.5.0"));
+  });
+
+  it("still scopes when the same advisory has no sub-major copy", () => {
+    // Same lines, but only 3.x/4.x installed → scoped as normal (the #4 guard is
+    // specific to a copy below the lowest scoped major).
+    const pkg = vuln("js-yaml", ["3.13.0", "4.0.5"], "4.1.1", [
+      line("< 3.14.2", "3.14.2"),
+      line(">= 4.0.0, < 4.1.1", "4.1.1"),
+    ]);
+    const keys = computeOverrideChanges({}, [pkg], new Set(["js-yaml"])).map((c) => c.packageName);
+    assert.deepEqual(keys.sort(), ["js-yaml@3", "js-yaml@4"]);
+  });
+
   it("writes one bounded override per major, collapsing two advisories on each line", () => {
     const changes = computeOverrideChanges({}, [jsYamlTwoAdvisories()], new Set(["js-yaml"]));
     const byKey = Object.fromEntries(changes.map((c) => [c.packageName, c]));
@@ -693,29 +723,75 @@ describe("judgeOrphanedOverride", () => {
   it("removes when every latest upstream range now requests a safe version — the debug/ms case", () => {
     // Proven live: debug@2.0.0 pulls ms 0.6.2, an override forces ms >=2.0.0, and
     // debug@latest declares ms ^2.1.3 — upstream moved on, so the override is dead.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "0.6.2", "^2.1.3")], "2.0.0", "2.1.3");
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "0.6.2", "^2.1.3")], "2.0.0", "2.1.3", "latest");
     assert.equal(verdict.action, "remove");
   });
 
   it("keeps (load-bearing) when a latest range could still resolve below the floor", () => {
     // debug@latest still asks ^1.0.0 for ms; without the >=2.0.0 override a stale
     // consumer could resolve 1.x. The forced 2.1.3 is inside ^2.0.0, so no escape.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^2.0.0", "^1.0.0")], "2.0.0", "2.1.3");
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^2.0.0", "^1.0.0")], "2.0.0", "2.1.3", "latest");
     assert.equal(verdict.action, "keep-load-bearing");
   });
 
   it("keeps conservatively when the registry yields no latest range (dropped or unpublished)", () => {
     // A dependent whose latest dropped the dep (or is unpublished) gives no data —
     // never infer 'safe to remove' from silence.
-    const verdict = judgeOrphanedOverride([dep("local-pkg", "1.0.0", "^1.0.0", null)], "2.0.0", "2.1.3");
+    const verdict = judgeOrphanedOverride([dep("local-pkg", "1.0.0", "^1.0.0", null)], "2.0.0", "2.1.3", "latest");
     assert.equal(verdict.action, "keep-no-data");
   });
 
   it("flags an escape when load-bearing and the resolved version forces a dependent past its range", () => {
     // Latest still asks ^1.0.0 (load-bearing), and the override resolved 3.0.0 —
     // outside ^1.0.0, no in-range fix.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^1.0.0", "^1.0.0")], "2.0.0", "3.0.0");
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^1.0.0", "^1.0.0")], "2.0.0", "3.0.0", "latest");
     assert.equal(verdict.action, "escape");
     if (verdict.action === "escape") assert.equal(verdict.escaping.length, 1);
+  });
+
+  it("under `compatible`, keeps when the INSTALLED range could resolve vulnerable even if latest is safe", () => {
+    // Review finding #2: a dependent pinned at an old version can't reach its safe
+    // latest under `compatible` (no major crossing), so removing on latest alone
+    // reintroduces the CVE. debug@2.0.0 declares ms 0.6.2 (vulnerable), latest wants
+    // ^2.1.3 (safe). Under `latest` → remove; under `compatible` → keep.
+    const dependents = [dep("debug", "2.0.0", "0.6.2", "^2.1.3")];
+    assert.equal(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "latest").action, "remove");
+    assert.notEqual(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "compatible").action, "remove");
+  });
+
+  it("under `compatible`, still removes when installed and latest are both safe", () => {
+    // No regression: aging-out still works when nothing lags.
+    const dependents = [dep("debug", "3.0.0", "^2.1.3", "^2.1.3")];
+    assert.equal(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "compatible").action, "remove");
+  });
+});
+
+describe("highestOverrideFloor — issue #1 (scoped-key removal threshold)", () => {
+  const dep = (
+    dependent: string,
+    version: string,
+    installedRange: string | null,
+    latestRange: string | null = installedRange,
+    latestKnown = true,
+  ): DependentRange => ({ dependent, version, installedRange, latestRange, latestKnown });
+
+  it("returns the highest floor across a package's scoped specs", () => {
+    // The bug: collapsing to the LOWEST floor removed a scoped set while a higher
+    // line was still load-bearing. The highest floor is the conservative choice.
+    assert.equal(highestOverrideFloor([">=3.14.2 <4", ">=4.1.1 <5"]), "4.1.1");
+    assert.equal(highestOverrideFloor([">=4.1.1 <5", ">=3.14.2 <4"]), "4.1.1");
+    assert.equal(highestOverrideFloor([">=11.1.1"]), "11.1.1");
+  });
+
+  it("keeps a scoped set when a higher line's dependent is still load-bearing", () => {
+    // The end-to-end #1 guard: js-yaml@3 (>=3.14.2) + js-yaml@4 (>=4.1.1) as an
+    // orphan, a dependent's latest is ^4.0.0 → could resolve 4.0.x < 4.1.1. Judged
+    // against the highest floor (4.1.1) it is KEPT; against the old lowest (3.14.2)
+    // it was wrongly removed, reintroducing the 4.x CVE.
+    const floor = highestOverrideFloor([">=3.14.2 <4", ">=4.1.1 <5"]);
+    const dependents = [dep("some-dep", "1.0.0", "^4.0.0", "^4.0.0")];
+    assert.notEqual(judgeOrphanedOverride(dependents, floor, "4.3.0", "latest").action, "remove");
+    // Discrimination: the old lowest-floor behaviour DID remove it (the CVE bug).
+    assert.equal(judgeOrphanedOverride(dependents, "3.14.2", "4.3.0", "latest").action, "remove");
   });
 });
