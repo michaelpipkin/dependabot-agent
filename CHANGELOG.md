@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+_Groundwork for a 1.0.0 release — intended to ship together with that version._
+
+### Added
+
+- **A "Versioning & stability" policy in the README.** States the contract the version numbers describe from 1.0.0 on — the CLI flags, env vars, config schema, exit codes, and which overrides the agent writes for a given input — and what counts as a major/minor/patch change. Console output and internal modules are explicitly outside the contract.
+
+### Changed
+
+- **The package now declares no importable API.** It has always been a CLI-only tool, but `main`/`types` pointed at the CLI entry (which runs on import and exports nothing). Those fields are removed and an `exports` restriction is added, so `import "dependabot-agent"` and deep imports of internal `dist/` modules are no longer resolvable — preventing internal functions from becoming an accidental, frozen public API. The `dependabot-agent` command is unaffected.
+
+### Fixed
+
+- **An empty `--repo=` no longer masks `GITHUB_REPO` or the config file.** Repo resolution used `??`, so an empty inline value won over the environment and config; it now uses `||` (matching `--token`) and falls through.
+
 ## [0.1.16]
 
 ### Fixed
