@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **A load-bearing override kept on the strength of an installed range now says so.** When an orphaned override was kept because a dependent's _installed_ range still dips below the floor — while its _latest_ range is already safe — the report printed only the (safe-looking) latest ranges, so the keep read as unexplained. It now names the dependent and the specific below-floor range holding the override, the way the escape report already does. Observability only; the keep decision is unchanged. Surfaced by a live run where `@babel/core` was correctly kept but the message showed only its safe latest versions.
+
 ## [0.1.14]
 
 ### Fixed

@@ -887,6 +887,20 @@ describe("judgeOrphanedOverride", () => {
     assert.equal(verdict.action, "keep-load-bearing");
   });
 
+  it("names the dependent holding the override even when its latest is safe — the @babel/core case", () => {
+    // Live PipSplit case: an installed dependent still declares a range below the
+    // floor (^7.0.0 < 7.29.6) while its latest is safe (7.29.7). Kept — and
+    // `holding` surfaces the INSTALLED range that's the real reason, so the report
+    // can explain the keep instead of printing only the (safe-looking) latest.
+    const verdict = judgeOrphanedOverride([dep("some-dep", "1.0.0", "^7.0.0", "7.29.7")], "7.29.6", "7.29.6");
+    assert.equal(verdict.action, "keep-load-bearing");
+    if (verdict.action === "keep-load-bearing") {
+      assert.deepEqual(verdict.holding, [
+        { name: "some-dep", version: "1.0.0", range: "^7.0.0", source: "installed" },
+      ]);
+    }
+  });
+
   it("keeps conservatively when the registry yields no range at all (dropped or unpublished)", () => {
     // A dependent whose installed AND latest ranges are both unknown gives no
     // data — never infer 'safe to remove' from silence.
