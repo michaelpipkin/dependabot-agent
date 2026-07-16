@@ -6,6 +6,7 @@ import {
   findMultiLineAdvisories,
   findVulnerableInstalls,
   groupAlertsByManifestDir,
+  judgeOrphanedOverride,
   overrideFloor,
 } from "../src/reconcile.js";
 import * as path from "node:path";
@@ -677,5 +678,44 @@ describe("findEscapingDependents", () => {
       const escaping = findEscapingDependents("11.1.1", [dep("private-pkg", "1.0.0", "^9.0.1", null, false)]);
       assert.equal(escaping[0].fixedByUpdate, false);
     });
+  });
+});
+
+describe("judgeOrphanedOverride", () => {
+  const dep = (
+    dependent: string,
+    version: string,
+    installedRange: string | null,
+    latestRange: string | null = installedRange,
+    latestKnown = true,
+  ): DependentRange => ({ dependent, version, installedRange, latestRange, latestKnown });
+
+  it("removes when every latest upstream range now requests a safe version — the debug/ms case", () => {
+    // Proven live: debug@2.0.0 pulls ms 0.6.2, an override forces ms >=2.0.0, and
+    // debug@latest declares ms ^2.1.3 — upstream moved on, so the override is dead.
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "0.6.2", "^2.1.3")], "2.0.0", "2.1.3");
+    assert.equal(verdict.action, "remove");
+  });
+
+  it("keeps (load-bearing) when a latest range could still resolve below the floor", () => {
+    // debug@latest still asks ^1.0.0 for ms; without the >=2.0.0 override a stale
+    // consumer could resolve 1.x. The forced 2.1.3 is inside ^2.0.0, so no escape.
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^2.0.0", "^1.0.0")], "2.0.0", "2.1.3");
+    assert.equal(verdict.action, "keep-load-bearing");
+  });
+
+  it("keeps conservatively when the registry yields no latest range (dropped or unpublished)", () => {
+    // A dependent whose latest dropped the dep (or is unpublished) gives no data —
+    // never infer 'safe to remove' from silence.
+    const verdict = judgeOrphanedOverride([dep("local-pkg", "1.0.0", "^1.0.0", null)], "2.0.0", "2.1.3");
+    assert.equal(verdict.action, "keep-no-data");
+  });
+
+  it("flags an escape when load-bearing and the resolved version forces a dependent past its range", () => {
+    // Latest still asks ^1.0.0 (load-bearing), and the override resolved 3.0.0 —
+    // outside ^1.0.0, no in-range fix.
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^1.0.0", "^1.0.0")], "2.0.0", "3.0.0");
+    assert.equal(verdict.action, "escape");
+    if (verdict.action === "escape") assert.equal(verdict.escaping.length, 1);
   });
 });
