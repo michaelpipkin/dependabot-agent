@@ -28,6 +28,16 @@ describe("parseSemver", () => {
     assert.deepEqual(parseSemver("1.2.3-beta.1"), [1, 2, 3]);
   });
 
+  it("drops build metadata, which is ignored for precedence", () => {
+    // Build metadata (+…) does not affect ordering, so 1.2.3+build IS 1.2.3.
+    // Before this was stripped, the "3+build" segment failed the digit check
+    // and the whole version parsed as null → callers went conservative.
+    assert.deepEqual(parseSemver("1.2.3+build"), [1, 2, 3]);
+    assert.deepEqual(parseSemver("1.2.3+build.5"), [1, 2, 3]);
+    // Both suffixes at once, in spec order (pre-release then build).
+    assert.deepEqual(parseSemver("1.2.3-rc.1+build"), [1, 2, 3]);
+  });
+
   it("defaults missing positions to zero", () => {
     assert.deepEqual(parseSemver("1"), [1, 0, 0]);
     assert.deepEqual(parseSemver("1.2"), [1, 2, 0]);

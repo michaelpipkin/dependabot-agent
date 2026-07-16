@@ -3,9 +3,19 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Parse a semver string into a [major, minor, patch] tuple, ignoring
- * pre-release. Returns null for anything that isn't a plain dotted version, so
- * callers can fall back to their conservative branch.
+ * Parse a semver string into a [major, minor, patch] tuple. A leading range
+ * operator (>=, ^, ~, …) is stripped, as are pre-release and build-metadata
+ * suffixes: "1.2.3-rc.1" and "1.2.3+build" both parse as [1, 2, 3]. Returns null
+ * for anything that isn't a plain dotted version, so callers fall back to their
+ * conservative branch.
+ *
+ * Dropping the pre-release loses its ordering (1.2.3-rc < 1.2.3), a deliberate
+ * approximation: the pre-release the agent actually meets is in a range LOWER
+ * bound — GitHub writes ">= 21.0.0-next.0" — where ">= X-pre" admits exactly the
+ * same stable versions as ">= X". A pre-release as an installed VERSION would be
+ * mis-ordered, but Dependabot patch identifiers and installed trees are
+ * effectively always stable, so that case doesn't arise. Build metadata, by
+ * contrast, is ignored for precedence outright, so stripping it is exact.
  *
  * Segments are validated as digit strings rather than passed through Number():
  * Number("") is 0, not NaN, so a bare "" or a "1..3" would otherwise parse as a
@@ -14,7 +24,7 @@
 export function parseSemver(version: string): [number, number, number] | null {
   const clean = version
     .replace(/^[~^>=<\s]+/, "")
-    .split("-")[0] // strip range prefix & pre-release
+    .split(/[-+]/)[0] // drop pre-release and build metadata: 1.2.3-rc.1+build → 1.2.3
     .trim();
   if (clean === "") return null;
 

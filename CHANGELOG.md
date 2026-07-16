@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Fixed
+
+- **Versions carrying build metadata now parse.** `parseSemver` stripped the pre-release suffix but not build metadata, so `1.2.3+build` failed to parse and callers fell back to their conservative branch. Build metadata is ignored for precedence by the semver spec, so it is now stripped too — `1.2.3+build` compares as `1.2.3`. (Pre-release versions remain flattened, which is exact for the range *lower bounds* GitHub emits, e.g. `>= 21.0.0-next.0`.)
+
 ## [0.1.13]
 
 ### Fixed
