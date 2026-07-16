@@ -74,6 +74,10 @@ GITHUB_TOKEN=$(gh auth token) dependabot-agent --repo michaelpipkin/dependabot-a
 
 This scenario is **registry-driven, not alert-driven** — the repo has no vulnerabilities, so the agent fetches zero alerts and the `ms` override is a pure orphan. (The repo still needs Dependabot alerts *enabled* so the fetch returns `[]` rather than a 403 — this fixture has them on.) The removal decision reads `debug@latest`'s range (`^2.1.3`), not the installed `debug@2.6.9`'s (`2.0.0`); that forward-looking check is the whole point. The decision logic itself is pinned deterministically by `judgeOrphanedOverride` in `test/reconcile.test.ts`.
 
+### Remove — workspace-internal dependent variant
+
+The removal fixture uses a *published* dependent (`debug`), which the registry can resolve. A **workspace member** can't be looked up in the registry, so its declared range is read from its own `package.json` on disk instead (issue #14). Because that's local-manifest-driven, it needs no live repo — it's covered deterministically in `test/workspace.test.ts` (a member declaring a safe range ages the override out; a vulnerable range keeps it). To eyeball it live: make a throwaway pnpm/npm workspace where a member declares a package at a range at or above an existing override's floor, then run the agent `--dry-run` — it plans `REMOVE`; drop the member's range below the floor and it keeps the override.
+
 ## Regenerating the captured fixtures
 
 `test/fixtures/` holds real output captured once. To refresh after an intentional format change:

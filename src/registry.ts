@@ -87,7 +87,7 @@ export async function fetchDependentRanges(
 }
 
 /** A wildcard or empty range tells us nothing about what a dependent needs. */
-function usableRange(range: string | null): string | null {
+export function usableRange(range: string | null): string | null {
   if (range === null || range === "*" || range === "") return null;
   return range;
 }

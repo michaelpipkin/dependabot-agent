@@ -18,6 +18,7 @@ import {
   rangeCouldResolveVulnerable,
 } from "./semver.js";
 import { findInstalledVersions } from "./tree.js";
+import { workspaceMemberDependents } from "./workspace.js";
 import {
   AlertRange,
   DependabotAlert,
@@ -766,12 +767,31 @@ async function reconcileOrphanedOverride(
 
   log(`   🔍 Checking npm registry for upstream dependency ranges for ${name}...`);
   const dependents = await pm.collectDependentRanges(name, manifestDir);
+
+  // Workspace members aren't in the registry, so collectDependentRanges can't
+  // see them. Add any that declare this package from their own manifests: a
+  // member's committed package.json is its authoritative "latest" range. Without
+  // this, an override whose only remaining dependents are workspace-internal
+  // never ages out (issue #14). Deduped by name — a registry hit wins, since it
+  // carries both installed and latest ranges.
+  const seen = new Set(dependents.map((d) => d.dependent));
+  const memberDependents: DependentRange[] = workspaceMemberDependents(manifestDir, pm.id, name)
+    .filter((m) => !seen.has(m.name))
+    .map((m) => ({
+      dependent: m.name,
+      version: m.version,
+      installedRange: m.range,
+      latestRange: m.range,
+      latestKnown: true,
+    }));
+  const allDependents = [...dependents, ...memberDependents];
+
   // An override normally collapses the tree to one copy, but not always (a
   // nested override or a peer-suffixed instance can survive). Judge escapes by
   // the HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
   // that's the copy pushing dependents furthest past their range.
   const resolvedVersion = findInstalledVersions(name, tree).at(-1);
-  const verdict = judgeOrphanedOverride(dependents, patchedVersion, resolvedVersion);
+  const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion);
 
   switch (verdict.action) {
     case "keep-no-data":
