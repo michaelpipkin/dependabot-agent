@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Added
+
+- **Multi-line advisories are fixed with per-line scoped overrides (pnpm), not just reported.** When a package is vulnerable on disjoint release lines — `js-yaml` on both 3.x and 4.x, say — the agent now writes one bounded override per line using pnpm's version-selector key (`js-yaml@3` → `>=3.15.0 <4`, `js-yaml@4` → `>=4.2.0 <5`) instead of a single flat max that drags the lower line's consumer across a major no advisory demands. Each installed copy stays on its own line. Two advisories on the same line collapse to one selector (the higher patch); a package on 0.x, or npm (whose overrides can't express a version selector), falls back to the flat max with the existing warning. The version-selector form needs no parent attribution — it patches a line by the version installed, not by which parent pulled it — and was [proven end-to-end](https://github.com/michaelpipkin/dependabot-agent/issues/2): applied to a live fixture, pnpm resolved each consumer to its own patched line and GitHub closed the alerts, neither consumer crossing a major. Detection ([0.1.9](#019)) reported the case; this resolves it. See [#2](https://github.com/michaelpipkin/dependabot-agent/issues/2).
+
+### Fixed
+
+- **Workspace member dependencies are now visible: `pnpm list -r`.** The installed-tree read ran `pnpm list` without `-r`, so in a shared-lockfile pnpm workspace a dependency declared only in a `packages/*` member was invisible at the root — the package was skipped before detection ran and no override was written. The agent did nothing on such a workspace. It now lists every workspace project; a single non-workspace project is unaffected. (Projects with their own lockfile were already walked as isolated dirs, which is why this went unnoticed.)
+
 ## [0.1.9]
 
 ### Added

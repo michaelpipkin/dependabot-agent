@@ -223,10 +223,10 @@ describe("findVulnerableInstalls", () => {
   ];
 
   it("takes the highest patch when alerts span two release lines", () => {
-    // 3.14.2 would clear both ranges, so the max drags the 3.x consumer across
-    // a major no advisory demands. That cost is accepted deliberately: see the
-    // mergeAlert comment, and the mechanism pinned in semver.test.ts. The max is
-    // the only choice that can't leave a vulnerable copy installed in silence.
+    // patchedVersion is the flat max — the detection threshold and the fallback
+    // when scoping doesn't apply. The override actually written is now per-line
+    // scoped (see the scoped-override test below); this pins the merged max that
+    // still drives detection.
     const pkgs = findVulnerableInstalls([jsYamlAlert(1, 0), jsYamlAlert(2, 1)], jsYamlTree);
     assert.equal(pkgs.length, 1);
     assert.equal(pkgs[0].patchedVersion, "4.1.1");
@@ -263,14 +263,21 @@ describe("findVulnerableInstalls", () => {
     assert.equal(findMultiLineAdvisories(pkgs)[0].lowestClearing, "3.14.2");
   });
 
-  it("reports the major bump the two-line case forces rather than applying it silently", () => {
-    // The end of the path that matters: the 3.x consumer really is dragged to
-    // 4.x, and it is named as a no-in-range fix instead of slipping through.
+  it("splits the two-line case into scoped overrides — each consumer stays on its own line", () => {
+    // The whole point of issue #2: instead of forcing the 3.x consumer to 4.1.1,
+    // write one bounded override per release line. 3.13.0 stays on 3.x (>=3.14.2),
+    // 4.0.5 on 4.x (>=4.1.1) — neither crosses a major, neither is a no-in-range
+    // fix. Proven end-to-end against the fixture repo.
     const pkgs = findVulnerableInstalls([jsYamlAlert(1, 0), jsYamlAlert(2, 1)], jsYamlTree);
     const changes = computeOverrideChanges({}, pkgs, new Set(["js-yaml"]));
-    assert.equal(changes[0].newVersion, ">=4.1.1 <5");
-    assert.equal(changes[0].noInRangeFix, true);
-    assert.deepEqual(changes[0].escapingVersions, ["3.13.0"]);
+    const byKey = Object.fromEntries(changes.map((c) => [c.packageName, c]));
+    assert.deepEqual(Object.keys(byKey).sort(), ["js-yaml@3", "js-yaml@4"]);
+    assert.equal(byKey["js-yaml@3"].newVersion, ">=3.14.2 <4");
+    assert.equal(byKey["js-yaml@4"].newVersion, ">=4.1.1 <5");
+    assert.equal(byKey["js-yaml@3"].noInRangeFix, false);
+    assert.equal(byKey["js-yaml@4"].noInRangeFix, false);
+    // No flat js-yaml override is written.
+    assert.equal(byKey["js-yaml"], undefined);
   });
 });
 
@@ -380,6 +387,101 @@ describe("findMultiLineAdvisories", () => {
 
   it("reports nothing for a package with no alert ranges recorded", () => {
     assert.deepEqual(findMultiLineAdvisories([vuln("lodash", "4.17.20", "4.17.21")]), []);
+  });
+});
+
+describe("computeOverrideChanges — scoped overrides for multi-line advisories", () => {
+  const line = (range: string, patch: string): AlertRange => ({ range, patch });
+
+  // The fixture's real state: js-yaml carries TWO multi-line advisories at once —
+  // GHSA-mh29 (< 3.14.2 → 3.14.2, >= 4.0.0, < 4.1.1 → 4.1.1) and GHSA-h67p
+  // (< 3.15.0 → 3.15.0, >= 4.0.0, <= 4.1.1 → 4.2.0). Copies 3.14.1 and 4.1.0 are
+  // installed; the flat max is 4.2.0. Proven end-to-end against the fixture repo.
+  const jsYamlTwoAdvisories = (): VulnerablePackage =>
+    vuln("js-yaml", ["3.14.1", "4.1.0"], "4.2.0", [
+      line("< 3.14.2", "3.14.2"),
+      line("< 3.15.0", "3.15.0"),
+      line(">= 4.0.0, < 4.1.1", "4.1.1"),
+      line(">= 4.0.0, <= 4.1.1", "4.2.0"),
+    ]);
+
+  it("writes one bounded override per major, collapsing two advisories on each line", () => {
+    const changes = computeOverrideChanges({}, [jsYamlTwoAdvisories()], new Set(["js-yaml"]));
+    const byKey = Object.fromEntries(changes.map((c) => [c.packageName, c]));
+    assert.deepEqual(Object.keys(byKey).sort(), ["js-yaml@3", "js-yaml@4"]);
+    // 3.x needs the higher of 3.14.2/3.15.0; 4.x the higher of 4.1.1/4.2.0.
+    assert.equal(byKey["js-yaml@3"].newVersion, ">=3.15.0 <4");
+    assert.equal(byKey["js-yaml@4"].newVersion, ">=4.2.0 <5");
+    assert.equal(byKey["js-yaml@3"].noInRangeFix, false);
+    assert.equal(byKey["js-yaml@4"].noInRangeFix, false);
+  });
+
+  it("replaces a pre-existing flat override with the scoped set", () => {
+    const changes = computeOverrideChanges({ "js-yaml": ">=4.2.0 <5" }, [jsYamlTwoAdvisories()], new Set(["js-yaml"]));
+    const byKey = Object.fromEntries(changes.map((c) => [c.packageName, c]));
+    assert.equal(byKey["js-yaml@3"].action, "add");
+    assert.equal(byKey["js-yaml@4"].action, "add");
+    assert.equal(byKey["js-yaml"].action, "remove");
+  });
+
+  it("is idempotent — no changes when the scoped keys are already correct", () => {
+    const changes = computeOverrideChanges(
+      { "js-yaml@3": ">=3.15.0 <4", "js-yaml@4": ">=4.2.0 <5" },
+      [jsYamlTwoAdvisories()],
+      new Set(["js-yaml"]),
+    );
+    assert.deepEqual(changes, []);
+  });
+
+  it("removes scoped keys once the vulnerability resolves", () => {
+    // js-yaml no longer vulnerable (absent from stillVulnerable) but resolved in
+    // this group — its scoped keys must be cleaned up, matched by base name.
+    const changes = computeOverrideChanges(
+      { "js-yaml@3": ">=3.15.0 <4", "js-yaml@4": ">=4.2.0 <5" },
+      [],
+      new Set(["js-yaml"]),
+    );
+    assert.deepEqual(
+      changes.map((c) => [c.packageName, c.action]).sort(),
+      [
+        ["js-yaml@3", "remove"],
+        ["js-yaml@4", "remove"],
+      ],
+    );
+  });
+
+  it("stays flat when copies sit on one major (same-major advisories) — the real tar case", () => {
+    // tar's seven advisories are all on the 7.x line; 7.5.16 clears them all, so
+    // it is NOT multi-line. The 6.2.1 copy still escapes (6.x → 7.x), flagged flat
+    // as no-in-range-fix. Must not be scoped.
+    const tar = vuln("tar", ["6.2.1", "7.5.20"], "7.5.16", [
+      line("<= 7.5.2", "7.5.3"),
+      line("<= 7.5.15", "7.5.16"),
+    ]);
+    const changes = computeOverrideChanges({}, [tar], new Set(["tar"]));
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].packageName, "tar");
+    assert.equal(changes[0].newVersion, ">=7.5.16 <8");
+    assert.deepEqual(changes[0].escapingVersions, ["6.2.1"]);
+  });
+
+  it("stays flat for a single-line package", () => {
+    const changes = computeOverrideChanges({}, [vuln("lodash", "4.17.20", "4.17.21", [line("< 4.17.21", "4.17.21")])], new Set(["lodash"]));
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].packageName, "lodash");
+    assert.equal(changes[0].newVersion, ">=4.17.21 <5");
+  });
+
+  it("stays flat for a 0.x package — name@0 would be too broad", () => {
+    // Disjoint 0.x lines exist, but a "pkg@0" selector matches all of 0.x. Bail to
+    // flat + keep the report warning rather than emit a wrong selector.
+    const changes = computeOverrideChanges(
+      {},
+      [vuln("zero-pkg", ["0.5.1", "0.7.2"], "0.8.0", [line("< 0.6.0", "0.6.0"), line(">= 0.7.0, < 0.8.0", "0.8.0")])],
+      new Set(["zero-pkg"]),
+    );
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].packageName, "zero-pkg");
   });
 });
 
