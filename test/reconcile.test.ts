@@ -9,6 +9,7 @@ import {
   groupAlertsByManifestDir,
   highestOverrideFloor,
   judgeOrphanedOverride,
+  loadBearingAlertNames,
   overrideFloor,
 } from "../src/reconcile.js";
 import * as path from "node:path";
@@ -579,6 +580,26 @@ describe("computeOverrideChanges — scoped overrides for multi-line advisories"
   });
 });
 
+describe("loadBearingAlertNames (finding #3 — dismissed alerts stay load-bearing)", () => {
+  const alert = (name: string, state: string): DependabotAlert =>
+    ({ state, security_vulnerability: { package: { name } } }) as DependabotAlert;
+
+  it("counts open, dismissed, and auto_dismissed as still load-bearing", () => {
+    // Only `fixed` means the vulnerability is actually gone. A dismissed alert is
+    // acknowledged but still vulnerable — its override must not be orphan-removed.
+    const names = loadBearingAlertNames([
+      alert("still-open", "open"),
+      alert("accepted-risk", "dismissed"),
+      alert("auto", "auto_dismissed"),
+      alert("patched", "fixed"),
+    ]);
+    assert.ok(names.has("still-open"));
+    assert.ok(names.has("accepted-risk"), "a dismissed-but-unfixed alert stays load-bearing");
+    assert.ok(names.has("auto"));
+    assert.ok(!names.has("patched"), "only a fixed alert frees the override for removal");
+  });
+});
+
 describe("groupAlertsByManifestDir", () => {
   const root = path.resolve("/repo");
   const alertAt = (manifestPath: string): DependabotAlert =>
@@ -792,49 +813,55 @@ describe("judgeOrphanedOverride", () => {
     latestKnown = true,
   ): DependentRange => ({ dependent, version, installedRange, latestRange, latestKnown });
 
-  it("removes when every latest upstream range now requests a safe version — the debug/ms case", () => {
-    // Proven live: debug@2.0.0 pulls ms 0.6.2, an override forces ms >=2.0.0, and
-    // debug@latest declares ms ^2.1.3 — upstream moved on, so the override is dead.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "0.6.2", "^2.1.3")], "2.0.0", "2.1.3", "latest");
+  it("removes when both the installed and latest ranges request a safe version", () => {
+    // Upstream moved on and the tree already reflects it: debug@3.0.0 declares
+    // ms ^2.1.3 — above the >=2.0.0 override floor — on both installed and latest.
+    const verdict = judgeOrphanedOverride([dep("debug", "3.0.0", "^2.1.3", "^2.1.3")], "2.0.0", "2.1.3");
     assert.equal(verdict.action, "remove");
+  });
+
+  it("keeps when the INSTALLED range could resolve below the floor even if latest is safe — finding #1", () => {
+    // The captured debug/ms case, read correctly: debug@2.0.0 declares ms 0.6.2
+    // (vulnerable) and a parent pins it below its safe latest (^2.1.3), so no
+    // update reaches the fix — only the override does. Removal must never trust
+    // latest alone, under ANY strategy; the installed range keeps it load-bearing.
+    // (Surfaces as an escape here — the forced 2.1.3 is far past debug's 0.6.2 —
+    // but the point is: never "remove".)
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "0.6.2", "^2.1.3")], "2.0.0", "2.1.3");
+    assert.notEqual(verdict.action, "remove");
+  });
+
+  it("removal is strategy-independent — a vulnerable installed range keeps it, a safe one lets it go (finding #1)", () => {
+    // Discrimination guard: before the round-3 fix, `latest` dropped the
+    // installed-range check and would REMOVE the stuck case below. Now the two
+    // cases differ only by whether the installed range is still vulnerable —
+    // strategy no longer enters the decision at all.
+    const stuck = [dep("debug", "2.0.0", "0.6.2", "^2.1.3")];
+    const moved = [dep("debug", "3.0.0", "^2.1.3", "^2.1.3")];
+    assert.notEqual(judgeOrphanedOverride(stuck, "2.0.0", "2.1.3").action, "remove");
+    assert.equal(judgeOrphanedOverride(moved, "2.0.0", "2.1.3").action, "remove");
   });
 
   it("keeps (load-bearing) when a latest range could still resolve below the floor", () => {
     // debug@latest still asks ^1.0.0 for ms; without the >=2.0.0 override a stale
     // consumer could resolve 1.x. The forced 2.1.3 is inside ^2.0.0, so no escape.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^2.0.0", "^1.0.0")], "2.0.0", "2.1.3", "latest");
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^2.0.0", "^1.0.0")], "2.0.0", "2.1.3");
     assert.equal(verdict.action, "keep-load-bearing");
   });
 
-  it("keeps conservatively when the registry yields no latest range (dropped or unpublished)", () => {
-    // A dependent whose latest dropped the dep (or is unpublished) gives no data —
-    // never infer 'safe to remove' from silence.
-    const verdict = judgeOrphanedOverride([dep("local-pkg", "1.0.0", "^1.0.0", null)], "2.0.0", "2.1.3", "latest");
+  it("keeps conservatively when the registry yields no range at all (dropped or unpublished)", () => {
+    // A dependent whose installed AND latest ranges are both unknown gives no
+    // data — never infer 'safe to remove' from silence.
+    const verdict = judgeOrphanedOverride([dep("local-pkg", "1.0.0", null, null)], "2.0.0", "2.1.3");
     assert.equal(verdict.action, "keep-no-data");
   });
 
   it("flags an escape when load-bearing and the resolved version forces a dependent past its range", () => {
     // Latest still asks ^1.0.0 (load-bearing), and the override resolved 3.0.0 —
     // outside ^1.0.0, no in-range fix.
-    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^1.0.0", "^1.0.0")], "2.0.0", "3.0.0", "latest");
+    const verdict = judgeOrphanedOverride([dep("debug", "2.0.0", "^1.0.0", "^1.0.0")], "2.0.0", "3.0.0");
     assert.equal(verdict.action, "escape");
     if (verdict.action === "escape") assert.equal(verdict.escaping.length, 1);
-  });
-
-  it("under `compatible`, keeps when the INSTALLED range could resolve vulnerable even if latest is safe", () => {
-    // Review finding #2: a dependent pinned at an old version can't reach its safe
-    // latest under `compatible` (no major crossing), so removing on latest alone
-    // reintroduces the CVE. debug@2.0.0 declares ms 0.6.2 (vulnerable), latest wants
-    // ^2.1.3 (safe). Under `latest` → remove; under `compatible` → keep.
-    const dependents = [dep("debug", "2.0.0", "0.6.2", "^2.1.3")];
-    assert.equal(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "latest").action, "remove");
-    assert.notEqual(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "compatible").action, "remove");
-  });
-
-  it("under `compatible`, still removes when installed and latest are both safe", () => {
-    // No regression: aging-out still works when nothing lags.
-    const dependents = [dep("debug", "3.0.0", "^2.1.3", "^2.1.3")];
-    assert.equal(judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "compatible").action, "remove");
   });
 });
 
@@ -862,8 +889,8 @@ describe("highestOverrideFloor — issue #1 (scoped-key removal threshold)", () 
     // it was wrongly removed, reintroducing the 4.x CVE.
     const floor = highestOverrideFloor([">=3.14.2 <4", ">=4.1.1 <5"]);
     const dependents = [dep("some-dep", "1.0.0", "^4.0.0", "^4.0.0")];
-    assert.notEqual(judgeOrphanedOverride(dependents, floor, "4.3.0", "latest").action, "remove");
+    assert.notEqual(judgeOrphanedOverride(dependents, floor, "4.3.0").action, "remove");
     // Discrimination: the old lowest-floor behaviour DID remove it (the CVE bug).
-    assert.equal(judgeOrphanedOverride(dependents, "3.14.2", "4.3.0", "latest").action, "remove");
+    assert.equal(judgeOrphanedOverride(dependents, "3.14.2", "4.3.0").action, "remove");
   });
 });

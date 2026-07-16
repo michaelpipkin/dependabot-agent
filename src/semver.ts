@@ -68,6 +68,10 @@ export function rangeCouldResolveVulnerable(specifier: string, patchedVersion: s
   // Wildcards — can't determine minimum, keep conservatively
   if (trimmed === "*" || trimmed === "") return true;
 
+  // Upper-bound-only ranges (<X, <=X) declare no lower bound, so they can resolve
+  // to any version below the ceiling — including below the floor. Always keep.
+  if (trimmed.startsWith("<")) return true;
+
   // Strip the range operator to get the base version (the minimum the range can resolve to)
   const base = parseSemver(trimmed);
   if (!base) return true;

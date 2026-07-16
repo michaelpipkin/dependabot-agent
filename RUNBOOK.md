@@ -60,7 +60,7 @@ Removal only touches an override whose package was **alerted at some point** —
 
 So the removal decision is proven deterministically instead:
 
-- `judgeOrphanedOverride` (`test/reconcile.test.ts`) — remove / keep-load-bearing / escape / keep-no-data, including the strategy-aware `compatible`-vs-`latest` behaviour and the highest-floor scoped-key threshold.
+- `judgeOrphanedOverride` (`test/reconcile.test.ts`) — remove / keep-load-bearing / escape / keep-no-data, including strategy-independent removal (installed **and** latest ranges checked, so a parent-pinned dependent's override survives regardless of `--update-strategy`) and the highest-floor scoped-key threshold.
 - `highestOverrideFloor` (`test/reconcile.test.ts`) — the conservative floor across scoped keys.
 - workspace-member local ranges (`test/workspace.test.ts`) — a member declaring a safe range ages the override out; a vulnerable one keeps it.
 

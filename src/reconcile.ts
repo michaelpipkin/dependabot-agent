@@ -32,7 +32,6 @@ import {
   OrphanEscape,
   OverrideChange,
   PackageManagerId,
-  UpdateStrategy,
   VulnerablePackage,
 } from "./types.js";
 import { exitWithError, log } from "./util.js";
@@ -336,6 +335,18 @@ export function findVulnerableInstalls(alerts: DependabotAlert[], tree: Installe
   const results = [...byName.values()];
   log(`   Found ${results.length} package(s) still needing overrides.`);
   return results;
+}
+
+/**
+ * Package names whose vulnerability is NOT resolved — every alert state except
+ * `fixed`. An override for such a package is still load-bearing and must never be
+ * orphan-removed: `open` is unfixed by definition, and `dismissed` /
+ * `auto_dismissed` are acknowledged but still vulnerable (a user may have
+ * dismissed the alert precisely *because* the override mitigates it). Only
+ * `fixed` means the vulnerability is actually gone and the override may age out.
+ */
+export function loadBearingAlertNames(alerts: DependabotAlert[]): Set<string> {
+  return new Set(alerts.filter((a) => a.state !== "fixed").map((a) => a.security_vulnerability.package.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -776,39 +787,35 @@ export type OrphanVerdict =
   | { action: "escape"; latestRanges: string[]; escaping: EscapingDependent[] };
 
 /**
- * The removal decision for an orphaned override (no open alert), from its
+ * The removal decision for an orphaned override (no unfixed alert), from its
  * dependents' registry ranges and the override floor. Pure — the registry fetch
  * and all logging live in reconcileOrphanedOverride.
  *
- *   - keep-no-data      — no usable latest range; keep conservatively.
- *   - remove            — every latest upstream range now requests a safe
- *                         version, so the override no longer does anything.
+ *   - keep-no-data      — no usable range at all; keep conservatively.
+ *   - remove            — every dependent range, installed AND latest, now
+ *                         requests a safe version, so the override does nothing.
  *   - escape            — still load-bearing, but the resolved version forces a
  *                         dependent past its declared range (no in-range fix).
  *   - keep-load-bearing — still needed, routine.
  *
- * Reads the LATEST published ranges, not the installed ones: the question is
- * forward-looking ("has upstream moved on?"), since after an update you resolve
- * to the latest dependents anyway. Proven live against debug@2.0.0 → ms, whose
- * latest requests ms ^2.1.3 above a >=2.0.0 override → remove.
+ * Checks BOTH the installed and the latest published ranges, and keeps the
+ * override if EITHER could still resolve below the floor. Removal must not depend
+ * on the update strategy: even under `latest`, a dependent pinned by a parent (an
+ * exact or capped range) can't move to its safe latest — only the override could,
+ * and that's what's being removed — so judging by latest alone would reintroduce
+ * the CVE that stuck dependent still pulls. The installed range is read from the
+ * tree the run actually produced (after its update pass), so a dependent that
+ * *could* update already shows its safe range here and still ages the override
+ * out; one that couldn't keeps it. Strategy affects what the run forces and
+ * bounds, never whether it is safe to remove.
  */
 export function judgeOrphanedOverride(
   dependents: DependentRange[],
   floor: string,
   resolvedVersion: string | undefined,
-  strategy: UpdateStrategy,
 ): OrphanVerdict {
   const latestRanges = [...new Set(dependents.map((d) => d.latestRange).filter((r): r is string => r !== null))];
-  // Under `latest` the update moves each dependent to its latest release, so the
-  // latest range is what will resolve — the forward-looking question. Under
-  // `compatible` the update can't cross a major, so a dependent pinned below its
-  // latest stays at its INSTALLED range; removing on the strength of a safe
-  // latest would reintroduce the CVE that installed dependent still pulls. So
-  // compatible checks both, keeping the override if EITHER could resolve vulnerable.
-  const installedRanges =
-    strategy === "compatible"
-      ? [...new Set(dependents.map((d) => d.installedRange).filter((r): r is string => r !== null))]
-      : [];
+  const installedRanges = [...new Set(dependents.map((d) => d.installedRange).filter((r): r is string => r !== null))];
   const rangesToCheck = [...new Set([...latestRanges, ...installedRanges])];
   if (rangesToCheck.length === 0) return { action: "keep-no-data", latestRanges };
   const stillNeeded = rangesToCheck.some((range) => rangeCouldResolveVulnerable(range, floor));
@@ -833,7 +840,6 @@ async function reconcileOrphanedOverride(
   pm: PackageManager,
   orphanRemovedNames: Set<string>,
   tree: InstalledTree[],
-  strategy: UpdateStrategy,
 ): Promise<OrphanEscape | null> {
   // `name` is a base package name; it may be held by a flat key or by one or
   // more scoped selectors (js-yaml@3, js-yaml@4). Describe it by its keys and
@@ -869,7 +875,7 @@ async function reconcileOrphanedOverride(
   // that's the copy pushing dependents furthest past their range.
   const installedCopies = findInstalledVersions(name, tree);
   const resolvedVersion = installedCopies.at(-1);
-  const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion, strategy);
+  const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion);
 
   switch (verdict.action) {
     case "keep-no-data":
@@ -1057,7 +1063,7 @@ async function processManifestGroup(
   cfg: ResolvedConfig,
   ctx: RunContext,
   rootPmId: PackageManagerId,
-  globalAlertedNames: Set<string>,
+  loadBearingNames: Set<string>,
   everAlertedNames: Set<string>,
 ): Promise<GroupResult> {
   const isRoot = manifestDir === cfg.workspaceRoot;
@@ -1082,18 +1088,20 @@ async function processManifestGroup(
   // not act on it this run (no published patch, or absent from the tree).
   const orphanRemovedNames = new Set<string>();
 
-  // For overrides with no active alert in ANY group, check whether any
-  // dependent still requests a vulnerable range. Work in base package names: a
-  // scoped key like "js-yaml@3" belongs to "js-yaml", which is what the alert
-  // set and the registry are keyed by. Only reconcile a base the agent could
-  // have authored — one that was alerted at some point; a package never alerted
-  // is a hand-written pin the agent must leave untouched (README guarantee).
+  // For overrides whose vulnerability is resolved (no unfixed alert in ANY
+  // group), check whether any dependent still requests a vulnerable range. Work
+  // in base package names: a scoped key like "js-yaml@3" belongs to "js-yaml",
+  // which is what the alert set and the registry are keyed by. Only reconcile a
+  // base the agent could have authored — one that was alerted at some point; a
+  // package never alerted is a hand-written pin the agent must leave untouched
+  // (README guarantee). A dismissed-but-unfixed alert stays load-bearing, so it
+  // is excluded here and its override is never removed.
   const orphanedBaseNames = [...new Set(Object.keys(source.overrides).map(baseNameOfOverrideKey))].filter(
-    (base) => !globalAlertedNames.has(base) && everAlertedNames.has(base),
+    (base) => !loadBearingNames.has(base) && everAlertedNames.has(base),
   );
   const orphanEscapes: OrphanEscape[] = [];
   for (const base of orphanedBaseNames) {
-    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, orphanRemovedNames, tree, cfg.updateStrategy);
+    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, orphanRemovedNames, tree);
     if (escape) orphanEscapes.push(escape);
   }
 
@@ -1187,10 +1195,11 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
   let totalMultiLine = 0;
   const allRecommendations: DeploymentRecommendation[] = [];
 
-  // Global set of all alerted package names across every group. Prevents a
-  // package added as an override in one group from being treated as orphaned
-  // and removed in another group's cleanup pass.
-  const globalAlertedNames = new Set(alerts.map((a) => a.security_vulnerability.package.name));
+  // Names still load-bearing by alert state across every group — anything not
+  // `fixed` (open, dismissed, auto_dismissed). Prevents a package from being
+  // orphan-removed in one group's cleanup pass while it is still vulnerable
+  // elsewhere or merely dismissed rather than actually fixed.
+  const loadBearingNames = loadBearingAlertNames(allAlerts);
 
   for (const [manifestDir, groupAlerts] of alertsByDir) {
     const result = await processManifestGroup(
@@ -1199,7 +1208,7 @@ export async function run(cfg: ResolvedConfig): Promise<void> {
       cfg,
       ctx,
       rootPmId,
-      globalAlertedNames,
+      loadBearingNames,
       everAlertedNames,
     );
 
