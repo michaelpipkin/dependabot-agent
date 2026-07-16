@@ -345,7 +345,7 @@ export function findVulnerableInstalls(alerts: DependabotAlert[], tree: Installe
 export function computeOverrideChanges(
   currentOverrides: Record<string, string>,
   stillVulnerable: VulnerablePackage[],
-  resolvedAlertNames: Set<string>,
+  orphanRemovedNames: Set<string>,
 ): OverrideChange[] {
   const changes: OverrideChange[] = [];
   // Every override key we write or keep this run — so the removal pass below
@@ -435,20 +435,31 @@ export function computeOverrideChanges(
     // else: already correct — no change needed
   }
 
-  // Remove overrides that are no longer needed. A scoped key (js-yaml@3) carries
-  // its base name for the resolved-alert check.
+  // Remove overrides only where there are positive grounds to — never merely
+  // because a package is alerted. Two grounds: the base is handled THIS run under
+  // a different key (a stale scoped/flat variant left over from a shape change,
+  // e.g. js-yaml@3 after the package reverted to a flat js-yaml), or the orphan
+  // pass judged it removable (no open alert, upstream moved on). A package we
+  // could NOT act on — an open alert with no published patch, or one absent from
+  // the installed tree — is neither, so its pin stays untouched (README
+  // guarantee: open ⇒ keep the override; a load-bearing pin is never dropped
+  // while its alert is unresolved).
+  const handledBaseNames = new Set([...handledKeys].map(baseNameOfOverrideKey));
   for (const [key, existingSpec] of Object.entries(currentOverrides)) {
-    if (handledKeys.has(key)) continue; // written or kept above
+    if (handledKeys.has(key)) continue; // this exact key was written or kept above
 
-    if (resolvedAlertNames.has(baseNameOfOverrideKey(key))) {
+    const base = baseNameOfOverrideKey(key);
+    const superseded = handledBaseNames.has(base);
+    if (superseded || orphanRemovedNames.has(base)) {
       changes.push({
         packageName: key,
         action: "remove",
         oldVersion: existingSpec,
-        reason: "Vulnerability resolved — override no longer needed",
+        reason: superseded
+          ? "Superseded by the override written for this package"
+          : "Vulnerability resolved — override no longer needed",
       });
     }
-    // Overrides for packages not in any alert are left untouched
   }
 
   return changes;
@@ -535,6 +546,24 @@ export function findEscapingDependents(forcedVersion: string, dependents: Depend
   }
 
   return escaping;
+}
+
+/**
+ * Narrow a set of escaping dependents to those that escape EVERY installed copy.
+ *
+ * findEscapingDependents judges against one forced version — fine when a package
+ * resolves to a single copy, but scoped per-line overrides leave several copies
+ * in the tree at once (js-yaml 3.x alongside 4.x). A dependent on the lower line
+ * resolves to its own copy, so judging it against the highest copy reports a
+ * false escape. If SOME installed copy sits within a dependent's compatible
+ * range, that dependent can resolve there and is not escaping. With no installed
+ * copies there is nothing to refine against and the input is returned unchanged.
+ */
+export function dependentsEscapingEveryCopy(
+  escaping: EscapingDependent[],
+  installedCopies: string[],
+): EscapingDependent[] {
+  return escaping.filter((e) => installedCopies.every((copy) => escapesCompatibleRange(copy, e.range)));
 }
 
 /**
@@ -795,14 +824,14 @@ export function judgeOrphanedOverride(
  * registry (registry data is unaffected by local overrides — unlike
  * node_modules, which reflects whatever the PM resolved after overrides
  * applied). If every upstream range now requests a safe version, mark it
- * eligible for removal by adding it to allAlertedNames.
+ * eligible for removal by adding it to orphanRemovedNames.
  */
 async function reconcileOrphanedOverride(
   name: string,
   source: OverrideSource,
   manifestDir: string,
   pm: PackageManager,
-  allAlertedNames: Set<string>,
+  orphanRemovedNames: Set<string>,
   tree: InstalledTree[],
   strategy: UpdateStrategy,
 ): Promise<OrphanEscape | null> {
@@ -838,7 +867,8 @@ async function reconcileOrphanedOverride(
   // nested override or a peer-suffixed instance can survive). Judge escapes by
   // the HIGHEST copy: escapesCompatibleRange() rises with the forced version, so
   // that's the copy pushing dependents furthest past their range.
-  const resolvedVersion = findInstalledVersions(name, tree).at(-1);
+  const installedCopies = findInstalledVersions(name, tree);
+  const resolvedVersion = installedCopies.at(-1);
   const verdict = judgeOrphanedOverride(allDependents, patchedVersion, resolvedVersion, strategy);
 
   switch (verdict.action) {
@@ -856,21 +886,35 @@ async function reconcileOrphanedOverride(
         `   ✂️  Override for ${name} (${overrideSpec}) is no longer needed — ` +
           `latest upstream versions all request safe ranges: ${verdict.latestRanges.join(", ")}`,
       );
-      allAlertedNames.add(name);
+      orphanRemovedNames.add(name);
       return null;
 
     case "escape": {
+      // The verdict judged escapes against the single highest installed copy.
+      // With scoped per-line overrides several copies coexist (js-yaml 3.x AND
+      // 4.x), and a dependent on a lower line resolves to its own copy, not the
+      // highest — so an escape that some installed copy actually satisfies is a
+      // false alarm. Keep only dependents that escape EVERY installed copy (with
+      // no copies, nothing to refine against, so the verdict stands).
+      const escaping = dependentsEscapingEveryCopy(verdict.escaping, installedCopies);
+      if (escaping.length === 0) {
+        log(
+          `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
+            `still load-bearing — each dependent resolves within an installed copy.`,
+        );
+        return null;
+      }
       const resolvedSuffix = resolvedVersion ? ` → resolved ${resolvedVersion}` : "";
       log(
         `   ⚠️  Override for ${name} (${overrideSpec}${resolvedSuffix}) has ` +
           `no open alert and is still load-bearing, but no in-range fix exists for its dependents:`,
       );
-      for (const d of verdict.escaping) {
+      for (const d of escaping) {
         const via = d.source === "latest" ? " (latest — installed version unresolved)" : "";
         const hint = d.fixedByUpdate ? ` — updating ${d.name} resolves this` : "";
         log(`         ${d.name}@${d.version} declares ${d.range}${via}${hint}`);
       }
-      return { packageName: name, spec: overrideSpec, floor: patchedVersion, resolvedVersion, dependents: verdict.escaping };
+      return { packageName: name, spec: overrideSpec, floor: patchedVersion, resolvedVersion, dependents: escaping };
     }
 
     case "keep-load-bearing":
@@ -1032,8 +1076,11 @@ async function processManifestGroup(
   const tree = pm.getInstalledTree(manifestDir);
   const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
 
-  // Only remove overrides for packages whose alert in this group is resolved.
-  const allAlertedNames = new Set(groupAlerts.map((a) => a.security_vulnerability.package.name));
+  // Names the orphan pass judges removable (no open alert, upstream moved on).
+  // Seeded empty and filled by reconcileOrphanedOverride below; a package with an
+  // open alert is never added here, so its override is kept even when we could
+  // not act on it this run (no published patch, or absent from the tree).
+  const orphanRemovedNames = new Set<string>();
 
   // For overrides with no active alert in ANY group, check whether any
   // dependent still requests a vulnerable range. Work in base package names: a
@@ -1046,11 +1093,11 @@ async function processManifestGroup(
   );
   const orphanEscapes: OrphanEscape[] = [];
   for (const base of orphanedBaseNames) {
-    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, allAlertedNames, tree, cfg.updateStrategy);
+    const escape = await reconcileOrphanedOverride(base, source, manifestDir, pm, orphanRemovedNames, tree, cfg.updateStrategy);
     if (escape) orphanEscapes.push(escape);
   }
 
-  const changes = computeOverrideChanges(source.overrides, stillVulnerable, allAlertedNames);
+  const changes = computeOverrideChanges(source.overrides, stillVulnerable, orphanRemovedNames);
   applyOverrideChanges(changes, source.overrides, source, cfg.dryRun, pmId);
   const escapedChanges = changes.filter((c) => c.noInRangeFix);
   // The tree was read without an update pass, so it is whatever was already on
