@@ -8,6 +8,10 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 
 ## [Unreleased]
 
+### Added
+
+- **Overrides whose only dependents are workspace-internal can now age out.** Removal of an override with no open alert asks "has upstream moved on?" by reading the dependents' latest ranges from the npm registry — but a workspace member (`packages/*`) has no registry entry, so it was dropped, and an override reachable only through such members was kept indefinitely even after those members raised their own ranges to safe versions. The agent now also reads each workspace member's own `package.json` (its committed range *is* its authoritative "latest") and folds those in: if every member that declares the package now requests a safe range, the override is removed; if any still declares a vulnerable one, it's kept. Strictly conservative — a member contributes only what it explicitly declares, unfamiliar workspace globs are skipped rather than guessed, and with no registry data and no member declaration the override is still kept. ([#14](https://github.com/michaelpipkin/dependabot-agent/issues/14))
+
 ### Fixed
 
 - **A failed alert fetch now exits cleanly instead of crashing.** When the Dependabot alert fetch failed for any reason — bad token (401), alerts disabled (403), network error, any non-2xx — the agent printed the correct error and then aborted with a libuv assertion (`UV_HANDLE_CLOSING`) and a non-standard exit code (127 instead of 1). The cause: `exitWithError` called `process.exit()` synchronously from inside the async fetch path, tearing the process down while undici's handles were still open (Windows/Node 24). It now throws a typed `AgentError` that the top-level handler prints and turns into `process.exitCode = 1`, letting the event loop drain — no assertion, correct exit code, same message. ([#12](https://github.com/michaelpipkin/dependabot-agent/issues/12))
