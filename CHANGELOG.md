@@ -15,6 +15,7 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 ### Fixed
 
 - **Workspace member dependencies are now visible: `pnpm list -r`.** The installed-tree read ran `pnpm list` without `-r`, so in a shared-lockfile pnpm workspace a dependency declared only in a `packages/*` member was invisible at the root — the package was skipped before detection ran and no override was written. The agent did nothing on such a workspace. It now lists every workspace project; a single non-workspace project is unaffected. (Projects with their own lockfile were already walked as isolated dirs, which is why this went unnoticed.)
+- **Workspace member alerts no longer spawn member-local override files.** GitHub keys a member's direct-dependency alert to `packages/x/package.json`, and the agent grouped by that path — treating a shared-lockfile member as its own isolated package and writing a `packages/x/pnpm-workspace.yaml` the package manager never reads (overrides resolve from the root). Alerts for members without their own lockfile now fold into the root group, so the fix lands once, in the root override file. A member with its own lockfile, or one named explicitly via `--packages`, still owns its overrides.
 
 ## [0.1.9]
 

@@ -817,15 +817,25 @@ function logDeploymentRecommendation(recommendations: DeploymentRecommendation[]
  * manifest_path is relative to repo root, e.g. "package.json" or
  * "functions/package.json"; "." means the repo root.
  */
-function groupAlertsByManifestDir(
+export function groupAlertsByManifestDir(
   alerts: DependabotAlert[],
   workspaceRoot: string,
   extraDirs: string[],
 ): Map<string, DependabotAlert[]> {
+  // Dirs that own their override resolution: the root, plus discovered isolated
+  // packages (their own lockfile) and explicitly-configured ones. A Dependabot
+  // alert is often keyed to a workspace member's package.json, but a member that
+  // shares the root lockfile is not its own override target — pnpm and npm read
+  // overrides from the root. Folding such members into the root group keeps the
+  // fix in one place instead of writing member-local override files the package
+  // manager ignores.
+  const ownSources = new Set([workspaceRoot, ...extraDirs].map((d) => path.resolve(d)));
+
   const alertsByDir = new Map<string, DependabotAlert[]>();
   for (const alert of alerts) {
     const rawDir = path.dirname(alert.dependency.manifest_path);
-    const manifestDir = rawDir === "." ? workspaceRoot : path.join(workspaceRoot, rawDir);
+    const dir = rawDir === "." ? workspaceRoot : path.join(workspaceRoot, rawDir);
+    const manifestDir = ownSources.has(path.resolve(dir)) ? dir : workspaceRoot;
     const group = alertsByDir.get(manifestDir) ?? [];
     group.push(alert);
     alertsByDir.set(manifestDir, group);

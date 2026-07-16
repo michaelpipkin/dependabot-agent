@@ -5,8 +5,10 @@ import {
   findEscapingDependents,
   findMultiLineAdvisories,
   findVulnerableInstalls,
+  groupAlertsByManifestDir,
   overrideFloor,
 } from "../src/reconcile.js";
+import * as path from "node:path";
 import {
   AlertRange,
   DependabotAlert,
@@ -482,6 +484,42 @@ describe("computeOverrideChanges — scoped overrides for multi-line advisories"
     );
     assert.equal(changes.length, 1);
     assert.equal(changes[0].packageName, "zero-pkg");
+  });
+});
+
+describe("groupAlertsByManifestDir", () => {
+  const root = path.resolve("/repo");
+  const alertAt = (manifestPath: string): DependabotAlert =>
+    ({ dependency: { manifest_path: manifestPath } }) as DependabotAlert;
+
+  it("folds shared-lockfile workspace members into the root group", () => {
+    // GitHub keys a member's direct-dep alert to packages/x/package.json, but a
+    // member with no own lockfile isn't its own override target — overrides go in
+    // the root pnpm-workspace.yaml. The whole workspace resolves as one group.
+    const groups = groupAlertsByManifestDir(
+      [
+        alertAt("pnpm-lock.yaml"),
+        alertAt("packages/consumer-old/package.json"),
+        alertAt("packages/consumer-new/package.json"),
+      ],
+      root,
+      [],
+    );
+    assert.deepEqual([...groups.keys()], [root]);
+    assert.equal(groups.get(root)!.length, 3);
+  });
+
+  it("keeps a genuinely isolated package (own lockfile) as its own group", () => {
+    // functions/ has its own lockfile, so it is passed in extraDirs and owns its
+    // overrides — its alerts must NOT fold into the root.
+    const functionsDir = path.join(root, "functions");
+    const groups = groupAlertsByManifestDir(
+      [alertAt("pnpm-lock.yaml"), alertAt("functions/pnpm-lock.yaml")],
+      root,
+      [functionsDir],
+    );
+    assert.equal(groups.get(root)!.length, 1);
+    assert.equal(groups.get(functionsDir)!.length, 1);
   });
 });
 
