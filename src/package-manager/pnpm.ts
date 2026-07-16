@@ -72,8 +72,15 @@ export class PnpmPackageManager implements PackageManager {
 
   getInstalledTree(cwd: string): InstalledTree[] {
     log(`🔍 Reading installed dependency tree (pnpm) in ${cwd}...`);
+    // -r lists every project in the workspace, not just the one in cwd. Without
+    // it, a dependency declared only in a `packages/*` member of a shared-lockfile
+    // workspace is invisible at the root, so its vulnerable copies are never found
+    // and no override is written. The return is already an array of workspace
+    // projects, and findInstalledVersions() already walks all of them, so -r just
+    // fills in the members. For a single, non-workspace project it returns the
+    // same one-element array as before.
     const raw = shell(
-      "pnpm list --json --depth=Infinity",
+      "pnpm list -r --json --depth=Infinity",
       { cwd, maxBuffer: 64 * 1024 * 1024 }, // 64MB — large monorepos can exceed the 1MB default
     );
     const parsed: PnpmListOutput[] = JSON.parse(raw);
