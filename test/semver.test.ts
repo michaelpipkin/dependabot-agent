@@ -307,4 +307,14 @@ describe("rangeCouldResolveVulnerable", () => {
     assert.equal(rangeCouldResolveVulnerable("^7.5.3 || ^8.0.0", "7.5.16"), true);
     assert.equal(rangeCouldResolveVulnerable("^1.0.0", "garbage"), true);
   });
+
+  it("keeps the override for an upper-bound-only range, which has no lower bound", () => {
+    // Finding #2: "<=4.18.0" / "<4.19.0" strip to a base at/above the floor, but
+    // they declare no minimum and can resolve to 4.17.15 — below the floor. The
+    // pre-fix code compared the ceiling and wrongly returned false (removable).
+    assert.equal(rangeCouldResolveVulnerable("<=4.18.0", "4.17.21"), true);
+    assert.equal(rangeCouldResolveVulnerable("<4.19.0", "4.17.21"), true);
+    // Even a ceiling well above the floor: still unbounded below, still keep.
+    assert.equal(rangeCouldResolveVulnerable("<99.0.0", "4.17.21"), true);
+  });
 });

@@ -67,26 +67,27 @@ describe("scenario: ADD per-line scoped overrides for a multi-line advisory", ()
 
 describe("scenario: REMOVE an override once upstream has moved on", () => {
   // The decision is package-manager-agnostic — it runs on the dependents'
-  // registry ranges, however pnpm or npm discovered them. Captured from the live
-  // debug@2.0.0 → ms case: latest debug requests ms ^2.1.3, above a >=2.0.0
-  // override, so the override is dead.
-  const dependents = loadJson<DependentRange[]>("dependents-debug-ms.json");
+  // registry ranges, however pnpm or npm discovered them.
+  const captured = loadJson<DependentRange[]>("dependents-debug-ms.json");
 
-  it("removes when every latest upstream range is safe", () => {
-    // debug is a published dependent, so `latest` reflects its real registry range.
-    const verdict = judgeOrphanedOverride(dependents, "2.0.0", "2.1.3", "latest");
-    assert.equal(verdict.action, "remove");
-  });
-
-  it("keeps (does not remove) when a latest range could still resolve below the floor", () => {
-    // Same dependents, but the floor is above what latest requests (^2.1.3 could
-    // resolve below 3.0.0) — still load-bearing, so it is NOT removed. Here it
-    // surfaces as an escape: debug@2.0.0 declares ms 0.6.2, and the resolved 2.1.3
-    // is past that range. The point for this scenario is the negative — never
-    // "remove".
-    const verdict = judgeOrphanedOverride(dependents, "3.0.0", "2.1.3", "latest");
+  it("keeps the captured debug/ms override — installed debug still declares a vulnerable range (finding #1)", () => {
+    // Real captured data: debug@2.0.0 declares ms 0.6.2 (vulnerable), its latest
+    // declares ms ^2.1.3 (safe). Removal reads BOTH ranges: the installed one is
+    // still below the >=2.0.0 floor, so a parent-pinned debug@2.0.0 would pull ms
+    // 0.6.2 back if the override went. Kept (surfaces as an escape), never removed
+    // — regardless of update strategy.
+    const verdict = judgeOrphanedOverride(captured, "2.0.0", "2.1.3");
     assert.notEqual(verdict.action, "remove");
     assert.equal(verdict.action, "escape");
+  });
+
+  it("removes once the tree has actually moved on — installed and latest both safe", () => {
+    // The same dependent after it updated: debug@4.3.0 declares ms ^2.1.3 on both
+    // installed and latest, all above the floor, so the override is dead and ages out.
+    const moved: DependentRange[] = [
+      { dependent: "debug", version: "4.3.0", installedRange: "^2.1.3", latestRange: "^2.1.3", latestKnown: true },
+    ];
+    assert.equal(judgeOrphanedOverride(moved, "2.0.0", "2.1.3").action, "remove");
   });
 });
 
