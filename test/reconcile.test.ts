@@ -435,6 +435,27 @@ describe("computeOverrideChanges — scoped overrides for multi-line advisories"
     assert.deepEqual(changes, []);
   });
 
+  it("stays scoped when the installed copies are already patched — the re-run case", () => {
+    // Regression guard: on a second run the overrides are applied, so the tree
+    // holds the PATCHED copies (3.15.0, 4.3.0), not the vulnerable ones. Keying
+    // the line detection off installed versions made scoping find nothing and
+    // revert to the flat max — un-writing its own fix. The lines come from the
+    // advisory ranges, which persist, so the scoped specs are unchanged.
+    const patchedTree = vuln("js-yaml", ["3.15.0", "4.3.0"], "4.2.0", [
+      line("< 3.14.2", "3.14.2"),
+      line("< 3.15.0", "3.15.0"),
+      line(">= 4.0.0, < 4.1.1", "4.1.1"),
+      line(">= 4.0.0, <= 4.1.1", "4.2.0"),
+    ]);
+    const changes = computeOverrideChanges(
+      { "js-yaml@3": ">=3.15.0 <4", "js-yaml@4": ">=4.2.0 <5" },
+      [patchedTree],
+      new Set(["js-yaml"]),
+    );
+    // Already correct → no churn. And crucially, no flat "js-yaml" add/remove.
+    assert.deepEqual(changes, []);
+  });
+
   it("removes scoped keys once the vulnerability resolves", () => {
     // js-yaml no longer vulnerable (absent from stillVulnerable) but resolved in
     // this group — its scoped keys must be cleaned up, matched by base name.
