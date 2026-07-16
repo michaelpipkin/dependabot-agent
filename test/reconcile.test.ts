@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   computeOverrideChanges,
+  dependentsEscapingEveryCopy,
   findEscapingDependents,
   findMultiLineAdvisories,
   findVulnerableInstalls,
@@ -15,6 +16,7 @@ import {
   AlertRange,
   DependabotAlert,
   DependentRange,
+  EscapingDependent,
   InstalledTree,
   VulnerablePackage,
 } from "../src/types.js";
@@ -78,6 +80,44 @@ describe("computeOverrideChanges", () => {
     // Assumed intentional — a hand-written pin the agent did not place.
     const changes = computeOverrideChanges({ "some-pin": "1.2.3" }, [], new Set());
     assert.deepEqual(changes, []);
+  });
+
+  it("keeps an override for a still-open alert the run could not act on (finding #1)", () => {
+    // some-lib has an OPEN, unpatched alert (no first_patched_version), so it is
+    // dropped from stillVulnerable and never handled. Because the alert is open,
+    // the orphan pass skips it too, so it is not in orphanRemovedNames (empty
+    // here). Its hand-pinned mitigation MUST survive — removing it would
+    // reintroduce the still-live CVE and falsely report it resolved. Removal is
+    // now driven only by what was handled or orphan-judged, never by an
+    // alerted-name set the caller used to (wrongly) supply.
+    const changes = computeOverrideChanges(
+      { "some-lib": ">=1.2.6", lodash: ">=4.17.19 <5" },
+      [vuln("lodash", "4.17.20", "4.17.21")],
+      new Set(),
+    );
+    assert.equal(
+      changes.find((c) => c.packageName === "some-lib"),
+      undefined,
+      "the open-but-unpatched override must not be removed",
+    );
+    // The genuinely-handled package is still updated — the fix doesn't freeze removal.
+    assert.equal(changes.find((c) => c.packageName === "lodash")?.action, "update");
+  });
+
+  it("removes a stale scoped key when its package reverts to a flat override", () => {
+    // js-yaml is vulnerable on a single line now, so it takes a flat override and
+    // the leftover js-yaml@3 from a previous multi-line run is superseded. The
+    // cleanup is derived from what was handled THIS run (js-yaml), not from any
+    // alerted-name set — the mechanism that lets finding #1's fix seed removal
+    // empty and still tidy up stale keys.
+    const changes = computeOverrideChanges(
+      { "js-yaml": ">=4.1.0 <5", "js-yaml@3": ">=3.14.2 <4" },
+      [vuln("js-yaml", "4.1.1", "4.1.1")],
+      new Set(),
+    );
+    const stale = changes.find((c) => c.packageName === "js-yaml@3");
+    assert.equal(stale?.action, "remove");
+    assert.match(stale!.reason, /Superseded/);
   });
 
   describe("no-in-range-fix flagging", () => {
@@ -708,6 +748,38 @@ describe("findEscapingDependents", () => {
       const escaping = findEscapingDependents("11.1.1", [dep("private-pkg", "1.0.0", "^9.0.1", null, false)]);
       assert.equal(escaping[0].fixedByUpdate, false);
     });
+  });
+});
+
+describe("dependentsEscapingEveryCopy (finding #3 — scoped orphan escapes)", () => {
+  const esc = (name: string, range: string): EscapingDependent => ({
+    name,
+    version: "1.0.0",
+    range,
+    source: "installed",
+    fixedByUpdate: false,
+  });
+
+  it("drops a dependent that some installed copy still satisfies", () => {
+    // A scoped orphan leaves js-yaml 3.x AND 4.x in the tree. A 3.x consumer
+    // (^3.14.2) escapes the highest copy (4.1.1) — which is what the single-copy
+    // check flagged — but resolves happily to the 3.x copy. Not a real escape.
+    assert.deepEqual(dependentsEscapingEveryCopy([esc("three-consumer", "^3.14.2")], ["3.14.2", "4.1.1"]), []);
+  });
+
+  it("keeps a dependent that escapes every installed copy", () => {
+    // Declares ^2.0.0; neither the 3.x nor the 4.x copy is inside its range.
+    assert.equal(dependentsEscapingEveryCopy([esc("two-consumer", "^2.0.0")], ["3.14.2", "4.1.1"]).length, 1);
+  });
+
+  it("is a no-op for a single installed copy — the flat override case", () => {
+    const escaping = [esc("c", "^3.14.2")];
+    assert.deepEqual(dependentsEscapingEveryCopy(escaping, ["4.1.1"]), escaping);
+  });
+
+  it("returns the input unchanged when there are no installed copies to refine against", () => {
+    const escaping = [esc("c", "^2.0.0")];
+    assert.deepEqual(dependentsEscapingEveryCopy(escaping, []), escaping);
   });
 });
 
