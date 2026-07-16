@@ -263,11 +263,19 @@ The agent does not rewrite an override to match a direct dep, and it does not us
 
 ## After running
 
-If overrides were added or changed, run your package manager's install to regenerate the lockfile:
+If overrides were added or changed, run your package manager's install to apply them to the lockfile:
 
 ```bash
-pnpm install   # or: npm install
+pnpm install
 ```
+
+**On npm, a plain `npm install` is not enough.** npm resolves from the existing `node_modules` and `package-lock.json` and does not re-resolve just because `overrides` changed — the old versions stay in place (`--force` and `--package-lock-only` don't help either). Apply a newly written override with a clean install:
+
+```bash
+rm -rf node_modules package-lock.json && npm install
+```
+
+The agent prints the right command for your package manager after it writes the overrides.
 
 ## CI integration (GitHub Actions)
 

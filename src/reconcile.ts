@@ -645,6 +645,7 @@ export function applyOverrideChanges(
   currentOverrides: Record<string, string>,
   source: OverrideSource,
   dryRun: boolean,
+  pmId: PackageManagerId,
 ): void {
   if (changes.length === 0) {
     log("\n✅ No override changes needed.");
@@ -680,7 +681,16 @@ export function applyOverrideChanges(
 
   source.write(newOverrides);
   log(`\n✅ ${source.label} updated at ${source.filePath}`);
-  log("   Run your package manager's install to apply the new overrides to your lockfile.");
+  if (pmId === "npm") {
+    // npm resolves from an existing node_modules + package-lock.json and does not
+    // re-resolve just because `overrides` changed — a plain `npm install` (even
+    // --force or --package-lock-only) leaves the old versions in place. Applying
+    // a newly written override needs a clean resolve. Verified on npm 11.
+    log("   Then apply them with a clean install — npm won't re-resolve otherwise:");
+    log("      rm -rf node_modules package-lock.json && npm install");
+  } else {
+    log("   Run `pnpm install` to apply the new overrides to your lockfile.");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +953,7 @@ async function processManifestGroup(
   }
 
   const changes = computeOverrideChanges(source.overrides, stillVulnerable, allAlertedNames);
-  applyOverrideChanges(changes, source.overrides, source, cfg.dryRun);
+  applyOverrideChanges(changes, source.overrides, source, cfg.dryRun, pmId);
   const escapedChanges = changes.filter((c) => c.noInRangeFix);
   // The tree was read without an update pass, so it is whatever was already on
   // disk — escapes computed from it may not survive a real run.
