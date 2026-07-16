@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "./cli.js";
 import { resolveConfig } from "./config.js";
 import { run } from "./reconcile.js";
-import { normalizeChildEnv } from "./util.js";
+import { AgentError, normalizeChildEnv } from "./util.js";
 
 function readVersion(): string {
   try {
@@ -17,17 +17,24 @@ function readVersion(): string {
   }
 }
 
-const args = parseArgs(process.argv.slice(2), readVersion());
-
-// After parseArgs so --help/--version stay quiet, and before anything shells
-// out to a package manager. No-op off win32.
-normalizeChildEnv();
-
-const config = resolveConfig(args, process.env);
-
 try {
+  const args = parseArgs(process.argv.slice(2), readVersion());
+
+  // After parseArgs so --help/--version stay quiet, and before anything shells
+  // out to a package manager. No-op off win32.
+  normalizeChildEnv();
+
+  const config = resolveConfig(args, process.env);
   await run(config);
 } catch (err) {
-  console.error("\n💥 Unexpected error:", err);
-  process.exit(1);
+  // AgentError carries an already-formatted, user-facing message; anything else
+  // is an unexpected crash worth a full dump. Set exitCode rather than calling
+  // process.exit() so pending async handles (e.g. a failed fetch's undici
+  // sockets) close on their own — process.exit() mid-teardown aborts abnormally.
+  if (err instanceof AgentError) {
+    console.error(`\n❌ Error: ${err.message}`);
+  } else {
+    console.error("\n💥 Unexpected error:", err);
+  }
+  process.exitCode = 1;
 }

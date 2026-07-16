@@ -68,7 +68,22 @@ export function warn(msg: string): void {
   console.warn(`⚠️  ${msg}`);
 }
 
+/**
+ * A user-facing, already-formatted error — a wrong token, a missing manifest, a
+ * failed package-manager command. The top-level handler prints its message as-is
+ * (no stack) and exits non-zero. Distinguished from an unexpected crash, which
+ * still gets a full dump.
+ */
+export class AgentError extends Error {}
+
+/**
+ * Abort with a user-facing message. Throws rather than calling process.exit():
+ * exiting synchronously from inside async I/O (e.g. a failed `fetch`, whose
+ * undici handles are still open) trips a libuv assertion on Windows and aborts
+ * abnormally. Throwing lets the failure reach the top-level handler, which sets
+ * process.exitCode and lets the event loop drain cleanly. Return type stays
+ * `never` so existing control flow is unaffected.
+ */
 export function exitWithError(msg: string): never {
-  console.error(`\n❌ Error: ${msg}`);
-  process.exit(1);
+  throw new AgentError(msg);
 }
