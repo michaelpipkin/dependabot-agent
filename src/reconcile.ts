@@ -27,6 +27,7 @@ import {
   DeploymentRecommendation,
   DepScope,
   EscapingDependent,
+  HoldingDependent,
   InstalledTree,
   MultiLineAdvisory,
   OrphanEscape,
@@ -796,7 +797,7 @@ export function applyOverrideChanges(
 export type OrphanVerdict =
   | { action: "keep-no-data"; latestRanges: string[] }
   | { action: "remove"; latestRanges: string[] }
-  | { action: "keep-load-bearing"; latestRanges: string[] }
+  | { action: "keep-load-bearing"; latestRanges: string[]; holding: HoldingDependent[] }
   | { action: "escape"; latestRanges: string[]; escaping: EscapingDependent[] };
 
 /**
@@ -835,7 +836,27 @@ export function judgeOrphanedOverride(
   if (!stillNeeded) return { action: "remove", latestRanges };
   const escaping = findEscapingDependents(resolvedVersion ?? floor, dependents);
   if (escaping.length > 0) return { action: "escape", latestRanges, escaping };
-  return { action: "keep-load-bearing", latestRanges };
+  return { action: "keep-load-bearing", latestRanges, holding: holdingDependents(dependents, floor) };
+}
+
+/**
+ * The dependents whose declared range could still resolve below the floor — the
+ * concrete reason a load-bearing override is kept. Prefers the installed range
+ * (the copy in the tree now); falls back to the latest range when only that dips
+ * below. Lets the report say WHY an override is held rather than just listing the
+ * (often safe-looking) latest ranges — an override kept on the strength of an
+ * installed range would otherwise read as an unexplained keep.
+ */
+export function holdingDependents(dependents: DependentRange[], floor: string): HoldingDependent[] {
+  const holding: HoldingDependent[] = [];
+  for (const d of dependents) {
+    if (d.installedRange !== null && rangeCouldResolveVulnerable(d.installedRange, floor)) {
+      holding.push({ name: d.dependent, version: d.version, range: d.installedRange, source: "installed" });
+    } else if (d.latestRange !== null && rangeCouldResolveVulnerable(d.latestRange, floor)) {
+      holding.push({ name: d.dependent, version: d.version, range: d.latestRange, source: "latest" });
+    }
+  }
+  return holding;
 }
 
 /**
@@ -939,8 +960,12 @@ async function reconcileOrphanedOverride(
     case "keep-load-bearing":
       log(
         `   ℹ️  Override for ${name} (${overrideSpec}) has no open alert but is ` +
-          `still load-bearing — latest upstream versions request: ${verdict.latestRanges.join(", ")}`,
+          `still load-bearing — a dependent still declares a range that could resolve below the ${patchedVersion} floor:`,
       );
+      for (const h of verdict.holding) {
+        const via = h.source === "latest" ? " (its latest release; installed range unavailable)" : "";
+        log(`         ${h.name}@${h.version} declares ${h.range}${via}`);
+      }
       return null;
   }
 }

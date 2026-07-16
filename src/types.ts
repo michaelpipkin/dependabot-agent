@@ -155,6 +155,16 @@ export interface DependentRange {
   latestKnown: boolean;
 }
 
+/** A dependent whose declared range could still resolve below the override floor — the reason a load-bearing override is kept. */
+export interface HoldingDependent {
+  name: string;
+  version: string;
+  /** The range that dips below the floor. */
+  range: string;
+  /** Which range it came from — the installed version's, or its latest release's. */
+  source: "installed" | "latest";
+}
+
 /** A dependent an override forces past the range it declares. */
 export interface EscapingDependent {
   name: string;
