@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.0.1]
+
+### Fixed
+
+- **Corrected the token-permission docs for fine-grained PATs.** The Requirements and Options sections stated that the GitHub token needs the `security_events` permission — which is right for a **classic** PAT, but a **fine-grained** PAT needs the **Dependabot alerts** repository permission (Read) instead. A fine-grained token set up per the old wording would fail with a 403. Documentation only; no code change.
+
 ## [1.0.0]
 
 First stable release. The command-line interface — its flags, environment variables, config-file schema, exit codes, and the overrides the agent writes or removes for a given repository state — is now a stable contract under [Semantic Versioning](https://semver.org/); see [Versioning & stability](README.md#versioning--stability). Functionally a superset of 0.1.16, with the additions and fixes below. Reached after four independent adversarial reviews and live validation on every path (add and remove, pnpm and npm).

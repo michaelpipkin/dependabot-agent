@@ -21,7 +21,10 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
 
 - Node 22+
 - npm or pnpm
-- A GitHub Personal Access Token (classic or fine-grained) with **`security_events` read** permission, scoped to the repo.
+- A GitHub Personal Access Token that can read the repo's Dependabot alerts. **The required permission differs by token type:**
+  - **Classic** — the `security_events` scope (or the broader `repo` scope).
+  - **Fine-grained** — the **Dependabot alerts** repository permission, set to **Read**, on the target repo(s).
+
   **In CI, this must be a real PAT stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
   Actions injects cannot read the Dependabot alerts API under any circumstance. See
   [CI integration](#ci-integration-github-actions) below.
@@ -149,7 +152,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 
 | Flag | Env fallback | Default | Description |
 |---|---|---|---|
-| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT with `security_events` scope. **Required.** Never read from a config file. |
+| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT that can read Dependabot alerts (classic: `security_events` scope; fine-grained: **Dependabot alerts** read — see [Requirements](#requirements)). **Required.** Never read from a config file. |
 | `--repo <owner/repo>` | `GITHUB_REPO` | — | Target repository. **Required.** |
 | `--package-manager <pnpm\|npm>` | `PACKAGE_MANAGER` | auto-detect | Override lockfile-based detection. |
 | `--workspace-root <path>` | `WORKSPACE_ROOT` | cwd | Project root. |
@@ -444,7 +447,7 @@ To gate CI instead of opening PRs — fail the build when a repo's overrides fal
 ```yaml
 - name: Check for override drift
   env:
-    GITHUB_TOKEN: ${{ secrets.DEPENDABOT_PAT }} # PAT with security_events scope
+    GITHUB_TOKEN: ${{ secrets.DEPENDABOT_PAT }} # PAT that can read Dependabot alerts (see Requirements)
   run: npx dependabot-agent --repo ${{ github.repository }} --dry-run --exit-code
 ```
 
