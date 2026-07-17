@@ -6,9 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
-## [Unreleased]
+## [1.0.0]
 
-_Groundwork for a 1.0.0 release — intended to ship together with that version._
+First stable release. The command-line interface — its flags, environment variables, config-file schema, exit codes, and the overrides the agent writes or removes for a given repository state — is now a stable contract under [Semantic Versioning](https://semver.org/); see [Versioning & stability](README.md#versioning--stability). Functionally a superset of 0.1.16, with the additions and fixes below. Reached after four independent adversarial reviews and live validation on every path (add and remove, pnpm and npm).
 
 ### Added
 
@@ -22,6 +22,7 @@ _Groundwork for a 1.0.0 release — intended to ship together with that version.
 
 ### Fixed
 
+- **A hand-written override pin is never auto-removed, on any removal path.** The "only remove a bounded `>=…` the agent could have written" guard was applied when cleaning up a superseded key, but not when aging out an orphaned override — so a hand-written pin (an exact `2.3.1`, a caret, or a scoped `name@major`) for a package whose alert had since been *fixed* could be dropped by the orphan pass, against the documented guarantee. The shape guard now applies to both paths.
 - **An empty `--repo=` no longer masks `GITHUB_REPO` or the config file.** Repo resolution used `??`, so an empty inline value won over the environment and config; it now uses `||` (matching `--token`) and falls through.
 
 ## [0.1.16]

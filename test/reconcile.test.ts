@@ -140,6 +140,15 @@ describe("computeOverrideChanges", () => {
     );
   });
 
+  it("does not orphan-remove a hand-written non->= pin judged removable", () => {
+    // cookie was alerted, its alert is now fixed and its dependents moved on, so
+    // the orphan pass put it in orphanRemovedNames. But "0.6.0" is a hand-written
+    // exact pin, not an agent-authored ">=…" — the "never discard a pin we didn't
+    // write" guarantee applies on the orphan path too, not just the superseded one.
+    const changes = computeOverrideChanges({ cookie: "0.6.0" }, [], new Set(["cookie"]));
+    assert.deepEqual(changes, []);
+  });
+
   describe("no-in-range-fix flagging", () => {
     it("flags a major escape and says so in the reason", () => {
       const changes = computeOverrideChanges({}, [vuln("react", "18.2.0", "19.0.0")], new Set(["react"]));

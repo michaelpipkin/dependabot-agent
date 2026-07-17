@@ -464,17 +464,19 @@ export function computeOverrideChanges(
   // guarantee: open ⇒ keep the override; a load-bearing pin is never dropped
   // while its alert is unresolved).
   //
-  // The stale-variant cleanup only removes an AGENT-authored key. Every spec the
-  // agent writes is a bounded ">=…" from computeBoundedSpec, so a key whose spec
-  // isn't ">="-shaped is a user's hand-written pin (e.g. `foo@2: "2.3.1"`) — left
-  // untouched even when its base is alerted, so we don't discard a deliberate
-  // per-line pin the agent never wrote.
+  // Only ever remove an AGENT-authored key. Every spec the agent writes is a
+  // bounded ">=…" from computeBoundedSpec, so a key whose spec isn't ">="-shaped
+  // is a user's hand-written pin (e.g. `foo@2: "2.3.1"`) — left untouched even
+  // when its base is alerted, whether it would otherwise be dropped as a stale
+  // variant (superseded) or as an orphan whose alert is now fixed. The agent
+  // never discards a pin it didn't write.
   const handledBaseNames = new Set([...handledKeys].map(baseNameOfOverrideKey));
   for (const [key, existingSpec] of Object.entries(currentOverrides)) {
     if (handledKeys.has(key)) continue; // this exact key was written or kept above
+    if (!existingSpec.startsWith(">=")) continue; // hand-written pin — never auto-removed
 
     const base = baseNameOfOverrideKey(key);
-    const superseded = handledBaseNames.has(base) && existingSpec.startsWith(">=");
+    const superseded = handledBaseNames.has(base);
     if (superseded || orphanRemovedNames.has(base)) {
       changes.push({
         packageName: key,
