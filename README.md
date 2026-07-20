@@ -218,6 +218,25 @@ Bounded does **not** mean breaking-change-free. When the earliest patched versio
 
 Note the boundary follows npm's caret rules, so it is not always the major. `^1.2.3` is `>=1.2.3 <2.0.0`, but `^0.5.0` is `>=0.5.0 <0.6.0` and `^0.0.3` is `>=0.0.3 <0.0.4` — under `0.x`, the minor (or patch) is the breaking position. A `0.5.0 → 0.7.0` bump is every bit as breaking as `1.x → 2.x`, and is treated as such.
 
+### Excluding a package from the update
+
+Sometimes one dependency has to stay put while everything else moves — a major that breaks a framework you're on, a package that went ESM-only before your project did. This is mostly a `latest` concern; under `compatible` the update already stays inside your declared ranges.
+
+**pnpm** has a setting made for exactly this: `updateConfig.ignoreDependencies` in `pnpm-workspace.yaml`. Listed packages are skipped by `pnpm update --latest` (and hidden from `pnpm outdated`) while everything else updates normally:
+
+```yaml
+updateConfig:
+  ignoreDependencies:
+    - typescript
+    - '@babel/*' # patterns work too
+```
+
+Two things worth knowing. It lives in **`pnpm-workspace.yaml`**, not the `pnpm` field in `package.json` — a lot of older examples still show the latter, and current pnpm reads it from the workspace file. And it is not `overrides`: `overrides` force-pins a version tree-wide (for transitive deps you don't control), whereas `ignoreDependencies` just tells the update command to leave a **direct** dependency's declared range alone. For holding a direct dep back, `ignoreDependencies` is the right tool and no override is needed.
+
+**npm** has no equivalent. `npm update` offers no per-package exclusion, and `.ncurc.json`'s `reject` list belongs to [npm-check-updates](https://www.npmjs.com/package/npm-check-updates), which this agent does not invoke. On npm, hold a package back by tightening its declared range in `package.json` — an exact pin (`"typescript": "6.0.3"`) or a tilde (`"~6.0.3"`) — which `npm update --save` respects. The agent's `latest` path on npm is already narrow: it runs `npm install <pkg>@latest` only for **alerted** direct dependencies, so a package with no open Dependabot alert is never carried across a major regardless. A pinned package that *does* have an alert will still be bumped; use `--skip-update` and handle that repo by hand if you need it frozen.
+
+Either way, an exclusion only governs the **update** pass. If the package is still vulnerable afterward, the reconciler will report it — and, for a transitive copy, still write a bounded override. Excluding a package does not suppress its alert.
+
 ### No in-range fix
 
 Sometimes the only non-vulnerable version of a transitive dependency is outside the range its dependents ask for. The agent still writes the override — leaving a known vulnerability in place is not a better default — but reports it separately from routine changes:

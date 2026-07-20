@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.0.2]
+
+### Added
+
+- **Documented how to hold a single package back from the update pass.** A new "Excluding a package from the update" section under [Update strategy](README.md#update-strategy) covers pnpm's `updateConfig.ignoreDependencies` — the setting made for this, which lives in `pnpm-workspace.yaml` rather than the `pnpm` field in `package.json` that older examples show, and which is distinct from `overrides` (that force-pins tree-wide; this only tells the update command to leave a direct dependency's declared range alone). npm has no equivalent, so the section gives the range-tightening workaround, notes that npm-check-updates' `reject` list belongs to a tool this agent never invokes, and points out that the npm `latest` path is already narrow — it installs `@latest` only for *alerted* direct dependencies. Also states the limit that applies to every package manager: an exclusion governs only the update pass, so a still-vulnerable transitive copy still gets a bounded override and no alert is suppressed. Documentation only; no code change.
+
 ## [1.0.1]
 
 ### Fixed
