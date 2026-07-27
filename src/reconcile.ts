@@ -1145,7 +1145,7 @@ async function processManifestGroup(
   log("🗂️  Detecting override config location...");
   const source = selectOverrideSource(pmId, manifestDir, isRoot);
 
-  pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
+  await pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
 
   const tree = pm.getInstalledTree(manifestDir);
   const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
@@ -1233,12 +1233,13 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     );
   }
   log(`📦 Package manager: ${rootPmId}${cfg.packageManager ? " (explicit)" : " (auto-detected)"}`);
-  log(`🔧 Update strategy: ${cfg.updateStrategy}`);
+  log(`🔧 Update strategy: ${cfg.updateStrategy}${cfg.allowPrerelease ? " (pre-releases allowed)" : ""}`);
 
   const ctx: RunContext = {
     dryRun: cfg.dryRun,
     skipUpdate: cfg.skipUpdate,
     updateStrategy: cfg.updateStrategy,
+    allowPrerelease: cfg.allowPrerelease,
   };
 
   // Additional manifest roots to reconcile beyond the workspace root: isolated

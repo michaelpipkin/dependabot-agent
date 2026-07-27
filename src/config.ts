@@ -13,6 +13,7 @@ export interface ResolvedConfig {
   packageManager?: PackageManagerId; // undefined → auto-detect from lockfile later
   workspaceRoot: string; // absolute
   updateStrategy: UpdateStrategy;
+  allowPrerelease: boolean; // let the update pass settle on a pre-release version
   dryRun: boolean;
   skipUpdate: boolean;
   exitCode: boolean; // exit 2 when any override changes are found (CI drift gate)
@@ -25,6 +26,7 @@ interface ConfigFile {
   packageManager?: PackageManagerId;
   workspaceRoot?: string;
   updateStrategy?: UpdateStrategy;
+  allowPrerelease?: boolean;
   dryRun?: boolean;
   skipUpdate?: boolean;
   exitCode?: boolean;
@@ -130,6 +132,12 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   const updateStrategy: UpdateStrategy =
     args.updateStrategy ?? parseStrategyEnv(env.UPDATE_STRATEGY) ?? config.updateStrategy ?? "compatible";
 
+  // Default false: the update pass follows the `latest` dist-tag, and a
+  // maintainer publishing a release candidate without `--tag` moves that tag
+  // onto a pre-release. Following it is an accident of how the tag was set, not
+  // a choice anyone made, so opting in is the right way round.
+  const allowPrerelease = args.allowPrerelease ?? envBool(env.ALLOW_PRERELEASE) ?? config.allowPrerelease ?? false;
+
   const dryRun = args.dryRun ?? envBool(env.DRY_RUN) ?? config.dryRun ?? false;
   const skipUpdate = args.skipUpdate ?? envBool(env.SKIP_UPDATE) ?? config.skipUpdate ?? false;
   const exitCode = args.exitCode ?? envBool(env.EXIT_CODE) ?? config.exitCode ?? false;
@@ -156,6 +164,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     packageManager,
     workspaceRoot,
     updateStrategy,
+    allowPrerelease,
     dryRun,
     skipUpdate,
     exitCode,

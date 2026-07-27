@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.1.0]
+
+Both changes in this release are to the **update pass** — the dependency update the agent runs before reconciling — and both came out of a real scheduled run whose pull request contained a change nobody asked for.
+
+### Added
+
+- **`--allow-prerelease` / `ALLOW_PRERELEASE` / `"allowPrerelease"`.** Opt back in to letting the update pass settle on a release candidate, beta, or alpha. Off by default, which is a change in behavior — see below.
+
+### Changed
+
+- **The update pass no longer rewrites an exact pin.** A direct dependency declared at an exact version (`"firebase-functions": "7.3.0"`, or `"=7.3.0"` / `"v7.3.0"`) is now excluded from the update command: `pnpm update --latest "!firebase-functions"` on pnpm, and dropped from the `@latest` target list on npm. Previously `--update-strategy latest` overwrote pins along with everything else. A pin is a decision the manifest doesn't explain — a broken release, an unmigrated API, a native build that links against one version — and none of that is visible to a dependency tool, so an exact version is now read as deliberate. A tilde range is deliberately **not** treated as a pin; narrowing a range is a different intent from freezing one. Held pins are listed in the run output, and a pin that is *itself* alerted gets its own warning, since neither the update pass nor an override can fix a vulnerable direct dependency.
+- **The update pass no longer adopts a pre-release by default.** `update --latest` resolves through the `latest` dist-tag, not "the newest release", and that tag is only as correct as the last `npm publish` — a maintainer who ships an rc without `--tag next` moves `latest` onto it and every consumer's update follows. When a specifier becomes a pre-release, the agent now looks up the highest **stable** version published and rewrites the specifier to it, under the operator *originally declared* rather than the one the update wrote (`^7.2.5` → pnpm writes a bare `7.3.2-rc.0` → the agent writes `^7.3.0`). Taking the operator from the update's output would matter: a package manager normally carries the operator across an update, but not when the target is a pre-release — pnpm drops the caret and pins exactly — so a declared range would come back as an exact pin, and the pin guard above would then hold it there permanently. A project already tracking a pre-release line is left alone, and the rollback never downgrades: with nothing stable published at or above what was already declared, the pre-update specifier is restored instead. Pass `--allow-prerelease` for the old behavior.
+
+  Found in the wild: `firebase-functions` had `latest` pointing at `7.3.2-rc.0` while `7.3.2-rc.1` sat under `next`, so a scheduled run moved a production Firebase Functions package onto a release candidate.
+
+### Fixed
+
+- **The two config-file examples in the README no longer disagree.** The worked example in the config-driven walkthrough had fallen behind the full schema in the reference section, omitting `exitCode` (since 1.0.0) and `allowPrerelease` (this release), so a reader following the walkthrough couldn't tell whether those keys were unsupported or just unmentioned. The walkthrough now lists every documented key except `dryRun`, whose omission is deliberate and stated in the prose beneath it. A test compares the two blocks — key sets and shared values — so the next option can't be added to one and forgotten in the other.
+
+- **The lockfile can no longer disagree with a held pin.** `pnpm update --latest` applies its exclusion patterns to the manifest rewrite but not to resolution when it has no lockfile to work from, recording `specifier: 1.0.0, version: 3.0.1` — the pin honored in `package.json` and violated in the tree. Reachable through an explicitly-configured `packages` directory that has no lockfile of its own and inherits the root's package manager. The agent now re-resolves after holding pins, and likewise after a pre-release rollback (which otherwise leaves the lockfile holding the version just rejected). Both re-resolves are plain installs against the corrected manifest, and are cheap when nothing is wrong.
+
 ## [1.0.2]
 
 ### Added
