@@ -3,7 +3,12 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { listWorkspaceMemberDirs, localDeclaredRange, workspaceMemberDependents } from "../src/workspace.js";
+import {
+  listWorkspaceMemberDirs,
+  localDeclaredRange,
+  readPnpmIgnoredDependencies,
+  workspaceMemberDependents,
+} from "../src/workspace.js";
 import { judgeOrphanedOverride } from "../src/reconcile.js";
 import { DependentRange } from "../src/types.js";
 
@@ -142,5 +147,46 @@ describe("orphan removal uses workspace members' local ranges — issue #14", ()
       "packages/unrelated/package.json": pkg({ name: "unrelated", version: "1.0.0", dependencies: { debug: "^4" } }),
     });
     assert.equal(judgeOrphanedOverride(asDependents(root, "ms"), "2.0.0", undefined).action, "keep-no-data");
+  });
+});
+
+describe("readPnpmIgnoredDependencies", () => {
+  it("reads the list pnpm would apply", () => {
+    const root = scratchWorkspace({
+      "pnpm-workspace.yaml": "packages:\n  - .\nupdateConfig:\n  ignoreDependencies:\n    - typescript\n    - '@babel/*'\n",
+    });
+    assert.deepEqual(readPnpmIgnoredDependencies(root), ["typescript", "@babel/*"]);
+  });
+
+  it("prefers a sub-package's own config over the root's", () => {
+    // functions/ in a real repo: its own workspace file wins outright, exactly
+    // as pnpm resolves it — the root's list does not merge in.
+    const root = scratchWorkspace({
+      "pnpm-workspace.yaml": "packages:\n  - .\nupdateConfig:\n  ignoreDependencies:\n    - root-only\n",
+      "functions/pnpm-workspace.yaml": "updateConfig:\n  ignoreDependencies:\n    - typescript\n",
+    });
+    assert.deepEqual(readPnpmIgnoredDependencies(path.join(root, "functions")), ["typescript"]);
+  });
+
+  it("inherits the nearest config above a directory that has none", () => {
+    const root = scratchWorkspace({
+      "pnpm-workspace.yaml": "packages:\n  - .\nupdateConfig:\n  ignoreDependencies:\n    - typescript\n",
+      "sub/package.json": pkg({ name: "sub" }),
+    });
+    assert.deepEqual(readPnpmIgnoredDependencies(path.join(root, "sub")), ["typescript"]);
+  });
+
+  it("returns nothing when there is no config, no updateConfig, or an empty list", () => {
+    assert.deepEqual(readPnpmIgnoredDependencies(scratchWorkspace({ "package.json": pkg({ name: "solo" }) })), []);
+    assert.deepEqual(readPnpmIgnoredDependencies(scratchWorkspace({ "pnpm-workspace.yaml": "packages:\n  - .\n" })), []);
+    assert.deepEqual(
+      readPnpmIgnoredDependencies(scratchWorkspace({ "pnpm-workspace.yaml": "updateConfig: {}\n" })),
+      [],
+    );
+  });
+
+  it("survives a malformed workspace file rather than failing the run", () => {
+    const root = scratchWorkspace({ "pnpm-workspace.yaml": "updateConfig:\n  ignoreDependencies: not-a-list\n" });
+    assert.deepEqual(readPnpmIgnoredDependencies(root), []);
   });
 });

@@ -6,11 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.1.1]
+
+### Fixed
+
+- **The pin guard no longer disables pnpm's `updateConfig.ignoreDependencies`.** Passing any package pattern to `pnpm update` makes pnpm stop applying its own ignore list — an undocumented interaction, verified against pnpm 11: `pnpm update --latest` honors `ignoreDependencies`, `pnpm update --latest "!other"` does not. Since 1.1.0 emitted a `!name` pattern for every exact pin, a project that had both an exact pin and an ignore list silently lost the ignore list, and packages the user had deliberately held back were updated — across majors under `latest`. Caught on a real scheduled run: the root workspace (no pins, no patterns) held `typescript` at `^6.0.3` as configured, while the `functions/` package (one pin, so patterns) took it to `^7.0.2` from an identical config. The agent now reads `updateConfig.ignoreDependencies` from the nearest `pnpm-workspace.yaml` — the same upward search pnpm does, so a sub-package inherits the root's list — and re-supplies those entries as `!` patterns alongside the pins, restoring both behaviors at once. Glob entries (`@babel/*`) carry over unchanged. With nothing pinned the command stays bare, which is the only form pnpm applies the list to itself.
+
+  **Anyone on 1.1.0 using pnpm with both an exact pin and `updateConfig.ignoreDependencies` should upgrade and check whether an ignored package was moved.**
+
+## [1.1.0]
+
+Both changes in this release are to the **update pass** — the dependency update the agent runs before reconciling — and both came out of a real scheduled run whose pull request contained a change nobody asked for.
+
+### Added
+
+- **`--allow-prerelease` / `ALLOW_PRERELEASE` / `"allowPrerelease"`.** Opt back in to letting the update pass settle on a release candidate, beta, or alpha. Off by default, which is a change in behavior — see below.
+
+### Changed
+
+- **The update pass no longer rewrites an exact pin.** A direct dependency declared at an exact version (`"firebase-functions": "7.3.0"`, or `"=7.3.0"` / `"v7.3.0"`) is now excluded from the update command: `pnpm update --latest "!firebase-functions"` on pnpm, and dropped from the `@latest` target list on npm. Previously `--update-strategy latest` overwrote pins along with everything else. A pin is a decision the manifest doesn't explain — a broken release, an unmigrated API, a native build that links against one version — and none of that is visible to a dependency tool, so an exact version is now read as deliberate. A tilde range is deliberately **not** treated as a pin; narrowing a range is a different intent from freezing one. Held pins are listed in the run output, and a pin that is _itself_ alerted gets its own warning, since neither the update pass nor an override can fix a vulnerable direct dependency.
+- **The update pass no longer adopts a pre-release by default.** `update --latest` resolves through the `latest` dist-tag, not "the newest release", and that tag is only as correct as the last `npm publish` — a maintainer who ships an rc without `--tag next` moves `latest` onto it and every consumer's update follows. When a specifier becomes a pre-release, the agent now looks up the highest **stable** version published and rewrites the specifier to it, under the operator _originally declared_ rather than the one the update wrote (`^7.2.5` → pnpm writes a bare `7.3.2-rc.0` → the agent writes `^7.3.0`). Taking the operator from the update's output would matter: a package manager normally carries the operator across an update, but not when the target is a pre-release — pnpm drops the caret and pins exactly — so a declared range would come back as an exact pin, and the pin guard above would then hold it there permanently. A project already tracking a pre-release line is left alone, and the rollback never downgrades: with nothing stable published at or above what was already declared, the pre-update specifier is restored instead. Pass `--allow-prerelease` for the old behavior.
+
+  Found in the wild: `firebase-functions` had `latest` pointing at `7.3.2-rc.0` while `7.3.2-rc.1` sat under `next`, so a scheduled run moved a production Firebase Functions package onto a release candidate.
+
+### Fixed
+
+- **The two config-file examples in the README no longer disagree.** The worked example in the config-driven walkthrough had fallen behind the full schema in the reference section, omitting `exitCode` (since 1.0.0) and `allowPrerelease` (this release), so a reader following the walkthrough couldn't tell whether those keys were unsupported or just unmentioned. The walkthrough now lists every documented key except `dryRun`, whose omission is deliberate and stated in the prose beneath it. A test compares the two blocks — key sets and shared values — so the next option can't be added to one and forgotten in the other.
+
+- **The lockfile can no longer disagree with a held pin.** `pnpm update --latest` applies its exclusion patterns to the manifest rewrite but not to resolution when it has no lockfile to work from, recording `specifier: 1.0.0, version: 3.0.1` — the pin honored in `package.json` and violated in the tree. Reachable through an explicitly-configured `packages` directory that has no lockfile of its own and inherits the root's package manager. The agent now re-resolves after holding pins, and likewise after a pre-release rollback (which otherwise leaves the lockfile holding the version just rejected). Both re-resolves are plain installs against the corrected manifest, and are cheap when nothing is wrong.
+
 ## [1.0.2]
 
 ### Added
 
-- **Documented how to hold a single package back from the update pass.** A new "Excluding a package from the update" section under [Update strategy](README.md#update-strategy) covers pnpm's `updateConfig.ignoreDependencies` — the setting made for this, which lives in `pnpm-workspace.yaml` rather than the `pnpm` field in `package.json` that older examples show, and which is distinct from `overrides` (that force-pins tree-wide; this only tells the update command to leave a direct dependency's declared range alone). npm has no equivalent, so the section gives the range-tightening workaround, notes that npm-check-updates' `reject` list belongs to a tool this agent never invokes, and points out that the npm `latest` path is already narrow — it installs `@latest` only for *alerted* direct dependencies. Also states the limit that applies to every package manager: an exclusion governs only the update pass, so a still-vulnerable transitive copy still gets a bounded override and no alert is suppressed. Documentation only; no code change.
+- **Documented how to hold a single package back from the update pass.** A new "Excluding a package from the update" section under [Update strategy](README.md#update-strategy) covers pnpm's `updateConfig.ignoreDependencies` — the setting made for this, which lives in `pnpm-workspace.yaml` rather than the `pnpm` field in `package.json` that older examples show, and which is distinct from `overrides` (that force-pins tree-wide; this only tells the update command to leave a direct dependency's declared range alone). npm has no equivalent, so the section gives the range-tightening workaround, notes that npm-check-updates' `reject` list belongs to a tool this agent never invokes, and points out that the npm `latest` path is already narrow — it installs `@latest` only for _alerted_ direct dependencies. Also states the limit that applies to every package manager: an exclusion governs only the update pass, so a still-vulnerable transitive copy still gets a bounded override and no alert is suppressed. Documentation only; no code change.
 
 ## [1.0.1]
 
@@ -34,7 +63,7 @@ First stable release. The command-line interface — its flags, environment vari
 
 ### Fixed
 
-- **A hand-written override pin is never auto-removed, on any removal path.** The "only remove a bounded `>=…` the agent could have written" guard was applied when cleaning up a superseded key, but not when aging out an orphaned override — so a hand-written pin (an exact `2.3.1`, a caret, or a scoped `name@major`) for a package whose alert had since been *fixed* could be dropped by the orphan pass, against the documented guarantee. The shape guard now applies to both paths.
+- **A hand-written override pin is never auto-removed, on any removal path.** The "only remove a bounded `>=…` the agent could have written" guard was applied when cleaning up a superseded key, but not when aging out an orphaned override — so a hand-written pin (an exact `2.3.1`, a caret, or a scoped `name@major`) for a package whose alert had since been _fixed_ could be dropped by the orphan pass, against the documented guarantee. The shape guard now applies to both paths.
 - **An empty `--repo=` no longer masks `GITHUB_REPO` or the config file.** Repo resolution used `??`, so an empty inline value won over the environment and config; it now uses `||` (matching `--token`) and falls through.
 
 ## [0.1.16]

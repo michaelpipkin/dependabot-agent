@@ -1,7 +1,9 @@
 import { execSync } from "node:child_process";
+import { DirectDep, readDirectDependencies } from "../manifest.js";
+import { fetchDependentRanges } from "../registry.js";
 import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
-import { fetchDependentRanges } from "../registry.js";
+import { readPnpmIgnoredDependencies } from "../workspace.js";
 import { PackageManager, RunContext } from "./types.js";
 
 // Raw shape pnpm emits from `pnpm list --json` (we normalize away from this).
@@ -61,6 +63,37 @@ export function parsePnpmListOutput(raw: string): InstalledTree[] {
   }));
 }
 
+/**
+ * The pnpm update command for a strategy, excluding both the exactly-pinned
+ * dependencies and everything pnpm's own `updateConfig.ignoreDependencies`
+ * holds back.
+ *
+ * `pnpm update` takes package patterns, and a `!name` pattern means "update
+ * everything EXCEPT this". A pattern list made only of negations therefore still
+ * updates the rest of the manifest — which is what makes this usable as a pin
+ * guard, rather than an allow-list that would have to be kept exhaustive to
+ * avoid quietly freezing the whole project.
+ *
+ * `ignored` has to be folded in because passing ANY pattern makes pnpm stop
+ * applying ignoreDependencies. Re-supplying that list as patterns restores it;
+ * omitting it would mean a project that adds one exact pin silently loses every
+ * hold-back it had configured. Both lists are just patterns to pnpm, so globs
+ * (`@babel/*`) carry over unchanged.
+ *
+ * With nothing to exclude the command stays bare — which matters, since that is
+ * the only form under which pnpm applies ignoreDependencies itself.
+ *
+ * Patterns are quoted so every shell hands the `!` through untouched.
+ */
+export function pnpmUpdateCommand(strategy: UpdateStrategy, pinned: DirectDep[], ignored: string[] = []): string {
+  const base = strategy === "latest" ? "pnpm update --latest" : "pnpm update";
+  if (pinned.length === 0) return base;
+
+  const patterns = [...new Set([...pinned.map((p) => p.name), ...ignored])];
+  const quoted = patterns.map((p) => '"!' + p + '"').join(" ");
+  return `${base} ${quoted}`;
+}
+
 export class PnpmPackageManager implements PackageManager {
   readonly id = "pnpm" as const;
 
@@ -76,7 +109,15 @@ export class PnpmPackageManager implements PackageManager {
       return;
     }
 
-    const cmd = this.ctx.updateStrategy === "latest" ? "pnpm update --latest" : "pnpm update";
+    const before = readDirectDependencies(cwd);
+    const pinned = exactlyPinnedDeps(before);
+    logHeldPins(pinned, alertedPackages);
+
+    const ignored = pinned.length > 0 ? readPnpmIgnoredDependencies(cwd) : [];
+    if (ignored.length > 0) {
+      log(`   🔁 Carrying pnpm's updateConfig.ignoreDependencies through as patterns: ${ignored.join(", ")}`);
+    }
+    const cmd = pnpmUpdateCommand(this.ctx.updateStrategy, pinned, ignored);
     log(`📦 Running ${cmd} in ${cwd}...`);
     try {
       // stdio: "inherit" streams pnpm output to the terminal.
