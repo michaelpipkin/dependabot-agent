@@ -40,6 +40,47 @@ function readPnpmPackages(root: string): string[] {
   }
 }
 
+/**
+ * The `updateConfig.ignoreDependencies` list governing a directory — the
+ * packages pnpm's own config says to hold back from `pnpm update`.
+ *
+ * The agent has to read this because of how `pnpm update` treats patterns:
+ * given ANY package pattern on the command line, pnpm stops applying
+ * ignoreDependencies entirely. The pin guard passes `!name` patterns, so
+ * without re-supplying the ignore list as patterns of its own, adding a single
+ * exact pin to a project would silently un-ignore everything the user had
+ * deliberately held back. Verified against pnpm 11: `pnpm update --latest`
+ * honors the list, `pnpm update --latest "!other"` does not.
+ *
+ * Searches upward from `dir`, matching how pnpm locates its workspace file — a
+ * sub-package with no config of its own inherits the root's. Entries are
+ * returned verbatim: they may be globs (`@babel/*`), which are equally valid as
+ * `!` patterns.
+ */
+export function readPnpmIgnoredDependencies(dir: string): string[] {
+  const file = findPnpmWorkspaceFile(dir);
+  if (!file) return [];
+  try {
+    const doc = (yaml.load(fs.readFileSync(file, "utf-8")) ?? {}) as Record<string, unknown>;
+    const updateConfig = doc.updateConfig as { ignoreDependencies?: unknown } | undefined;
+    const list = updateConfig?.ignoreDependencies;
+    return Array.isArray(list) ? list.filter((p): p is string => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The nearest pnpm-workspace.yaml at or above `dir`, or null if there is none. */
+function findPnpmWorkspaceFile(dir: string): string | null {
+  let current = path.resolve(dir);
+  // Stop when parent === current, which is the filesystem root.
+  for (let parent = path.dirname(current); ; current = parent, parent = path.dirname(current)) {
+    const candidate = path.join(current, "pnpm-workspace.yaml");
+    if (fs.existsSync(candidate)) return candidate;
+    if (parent === current) return null;
+  }
+}
+
 function readNpmWorkspaces(root: string): string[] {
   const file = path.join(root, "package.json");
   if (!fs.existsSync(file)) return [];
