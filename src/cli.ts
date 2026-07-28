@@ -11,6 +11,7 @@ export interface CliArgs {
   packageManager?: PackageManagerId;
   workspaceRoot?: string;
   updateStrategy?: UpdateStrategy;
+  allowPrerelease?: boolean;
   dryRun?: boolean;
   skipUpdate?: boolean;
   exitCode?: boolean;
@@ -30,6 +31,10 @@ Options:
   --update-strategy <compatible|latest>
                                    Pre-check update mode (or env UPDATE_STRATEGY).
                                    Default: compatible (does not cross majors).
+  --allow-prerelease               Let the update pass settle on a pre-release version
+                                   (or ALLOW_PRERELEASE=true). Off by default: a package
+                                   whose "latest" dist-tag points at an rc is otherwise
+                                   rolled back to its highest stable release.
   --dry-run                        Print planned changes without writing (or DRY_RUN=true).
   --skip-update                    Skip the dependency update step (or SKIP_UPDATE=true).
   --exit-code                      Exit 2 if any override changes are found (or EXIT_CODE=true).
@@ -102,6 +107,9 @@ export function parseArgs(argv: string[], version: string): CliArgs {
         break;
       case "--config":
         args.config = takeValue();
+        break;
+      case "--allow-prerelease":
+        args.allowPrerelease = true;
         break;
       case "--dry-run":
         args.dryRun = true;
