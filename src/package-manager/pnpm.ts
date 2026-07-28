@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { DirectDep, readDirectDependencies } from "../manifest.js";
 import { fetchDependentRanges } from "../registry.js";
-import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
+import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode, UpdateStrategy } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
 import { readPnpmIgnoredDependencies } from "../workspace.js";
 import { PackageManager, RunContext } from "./types.js";
