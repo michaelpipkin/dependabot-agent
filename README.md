@@ -116,13 +116,17 @@ Commit this file at the workspace root. It's auto-discovered — no `--config` f
   "packageManager": "pnpm",      // omit to auto-detect from the lockfile
   "workspaceRoot": ".",          // resolved relative to this file
   "updateStrategy": "compatible",
+  "allowPrerelease": false,      // let the update pass settle on an rc/beta/alpha
   "skipUpdate": false,
+  "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages
   "packages": []                 // extra manifest dirs to always process
 }
 ```
 
-Leave `dryRun` out of the config (or set `false`) so the same config serves both the preview and the apply script — the dry-run script adds `--dry-run` on the command line.
+`repo` is the only value you must supply somewhere — flag, env var, or here. Every other key is optional and can be deleted; see [Config file reference](#config-file-reference) for each one's default and meaning.
+
+`dryRun` is the one key deliberately left out. Omit it (or set `false`) so the same config serves both the preview and the apply script — the dry-run script adds `--dry-run` on the command line.
 
 ### Step 3 — package.json scripts
 
@@ -157,6 +161,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--package-manager <pnpm\|npm>` | `PACKAGE_MANAGER` | auto-detect | Override lockfile-based detection. |
 | `--workspace-root <path>` | `WORKSPACE_ROOT` | cwd | Project root. |
 | `--update-strategy <compatible\|latest>` | `UPDATE_STRATEGY` | `compatible` | See [Update strategy](#update-strategy). |
+| `--allow-prerelease` | `ALLOW_PRERELEASE=true` | `false` | Let the update pass settle on a pre-release version. See [Pre-releases](#pre-releases). |
 | `--dry-run` | `DRY_RUN=true` | `false` | Print planned changes without writing. |
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
@@ -186,6 +191,7 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "packageManager": "pnpm",      // omit to auto-detect from the lockfile
   "workspaceRoot": ".",          // resolved relative to the config file
   "updateStrategy": "compatible",
+  "allowPrerelease": false,      // let the update pass settle on an rc/beta/alpha
   "dryRun": false,               // prefer leaving this out; pass --dry-run instead
   "skipUpdate": false,
   "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
@@ -212,15 +218,63 @@ The agent runs a dependency update before reconciling, so legitimately-fixed pac
 - **`compatible`** (default) — stay within existing semver ranges; does not cross majors automatically. pnpm: `pnpm update`; npm: `npm update --save`.
 - **`latest`** — allow crossing majors. pnpm: `pnpm update --latest`; npm: `npm install <alerted-pkg>@latest` for the alerted direct dependencies.
 
+Under either strategy the update pass leaves two things alone: [exact pins](#exact-pins-are-never-rewritten) and, unless you opt in, [pre-releases](#pre-releases).
+
 Either way, the **overrides themselves are always bounded** at the first breaking version above the patch, so a fixed transitive dependency never travels further than the fix requires. Transitive-only vulnerabilities are handled by overrides regardless of strategy.
 
 Bounded does **not** mean breaking-change-free. When the earliest patched version already sits outside the range the installed version's dependents accept, there is no in-range version that would close the alert, and the override necessarily crosses that boundary. The agent flags these rather than applying them quietly; see [No in-range fix](#no-in-range-fix) below.
 
 Note the boundary follows npm's caret rules, so it is not always the major. `^1.2.3` is `>=1.2.3 <2.0.0`, but `^0.5.0` is `>=0.5.0 <0.6.0` and `^0.0.3` is `>=0.0.3 <0.0.4` — under `0.x`, the minor (or patch) is the breaking position. A `0.5.0 → 0.7.0` bump is every bit as breaking as `1.x → 2.x`, and is treated as such.
 
+### Exact pins are never rewritten
+
+A direct dependency declared at an exact version — `"firebase-functions": "7.3.0"`, or the equivalent `"=7.3.0"` / `"v7.3.0"` — is left exactly as it is. The update pass reads the manifest first, and every pinned name is excluded from the command it runs (`pnpm update --latest "!firebase-functions"`; on npm, dropped from the `@latest` target list).
+
+A pin is a decision, and the manifest doesn't record why it was made — a broken release, an unmigrated API, a native build that only links against one version. None of that is visible to a dependency tool, so the only safe reading of an exact version is that someone meant it.
+
+`~1.2.3` is **not** a pin. It's a range, and narrowing a range is a different intent from freezing one — under `latest`, a tilde is meant to move. To hold a *range* back, see [Excluding a package from the update](#excluding-a-package-from-the-update) below.
+
+The run reports what it held:
+
+```
+   📌 Holding 2 exact pin(s) — the update pass will not rewrite them: @types/semver, firebase-functions
+```
+
+**A held pin can keep an alert open**, and this is the one case worth watching. If a pinned package is itself alerted, the update pass can't fix it and an override won't either — overrides address *transitive* copies, and a direct dependency isn't one. That combination gets called out on its own:
+
+```
+   ⚠️  Pinned AND alerted — the update pass cannot fix these; raise the pin by hand:
+         firebase-functions pinned at 7.3.0 (dependencies)
+```
+
+### Pre-releases
+
+By default the update pass will not leave a project on a release candidate, beta, or alpha. Pass `--allow-prerelease` (or `"allowPrerelease": true`) if you want the old behavior.
+
+The reason this needs a guard at all is that `update --latest` doesn't resolve to "the newest release" — it resolves through the **`latest` dist-tag**, which is just whatever the last `npm publish` set. A maintainer who ships an rc without `--tag next` moves `latest` onto the pre-release, and every consumer's update follows it. That is exactly how `firebase-functions@7.3.2-rc.0` reached the `latest` tag while `7.3.2-rc.1` sat under `next`:
+
+```
+$ npm view firebase-functions dist-tags
+{ "next": "7.3.2-rc.1", "latest": "7.3.2-rc.0" }
+```
+
+When the agent sees a specifier that has become a pre-release, it looks up the highest **stable** version published and rewrites the specifier to that:
+
+```
+   ⏮️  firebase-functions: the update pass chose the pre-release "7.3.2-rc.0" — using the highest stable release "^7.3.0" instead.
+```
+
+The operator comes from **what you declared**, not from what the update wrote. Package managers normally carry the operator across an update (`^0.1.0` → `^1.0.0`), but not when the target is a pre-release — pnpm drops the caret and pins exactly, because a caret over a pre-release has semantics nobody wants. That's why the `from` above is a bare `7.3.2-rc.0` while the replacement is `^7.3.0`: reading the operator back off the update's output would silently convert your range into a pin, and [the pin guard](#exact-pins-are-never-rewritten) would then hold it there for good — one bad dist-tag would stop the package updating permanently.
+
+Two limits worth knowing. A project **already** tracking a pre-release line is left alone — if the specifier was a pre-release before the update, staying on one is deliberate. And this never downgrades: if nothing stable has been published at or above what you already declared, the pre-update specifier is restored instead.
+
+Rolling a specifier back leaves the lockfile holding the version that was just rejected, so the agent re-runs `install` to re-resolve before it reads the tree. This is also why exact pins trigger a re-resolve on pnpm: `pnpm update --latest` applies its exclusion patterns to the *manifest rewrite* but not to *resolution* when it has no lockfile to start from, which would otherwise leave `specifier: 1.0.0, version: 3.0.1` recorded — the pin honored on paper and violated in the tree.
+
 ### Excluding a package from the update
 
-Sometimes one dependency has to stay put while everything else moves — a major that breaks a framework you're on, a package that went ESM-only before your project did. This is mostly a `latest` concern; under `compatible` the update already stays inside your declared ranges.
+Sometimes one dependency has to stay put while everything else moves — a major that breaks a framework you're on, a package that went ESM-only before your project did. If an exact pin is acceptable, [the section above](#exact-pins-are-never-rewritten) already covers you and needs no configuration. What follows is for holding back a package you want to keep on a *range*.
+
+This is mostly a `latest` concern; under `compatible` the update already stays inside your declared ranges.
 
 **pnpm** has a setting made for exactly this: `updateConfig.ignoreDependencies` in `pnpm-workspace.yaml`. Listed packages are skipped by `pnpm update --latest` (and hidden from `pnpm outdated`) while everything else updates normally:
 
@@ -235,7 +289,7 @@ The agent reads this list and re-supplies it to pnpm as exclusion patterns whene
 
 Two more things worth knowing. It lives in **`pnpm-workspace.yaml`**, not the `pnpm` field in `package.json` — a lot of older examples still show the latter, and current pnpm reads it from the workspace file. And it is not `overrides`: `overrides` force-pins a version tree-wide (for transitive deps you don't control), whereas `ignoreDependencies` just tells the update command to leave a **direct** dependency's declared range alone. For holding a direct dep back, `ignoreDependencies` is the right tool and no override is needed.
 
-**npm** has no equivalent. `npm update` offers no per-package exclusion, and `.ncurc.json`'s `reject` list belongs to [npm-check-updates](https://www.npmjs.com/package/npm-check-updates), which this agent does not invoke. On npm, hold a package back by tightening its declared range in `package.json` — an exact pin (`"typescript": "6.0.3"`) or a tilde (`"~6.0.3"`) — which `npm update --save` respects. The agent's `latest` path on npm is already narrow: it runs `npm install <pkg>@latest` only for **alerted** direct dependencies, so a package with no open Dependabot alert is never carried across a major regardless. A pinned package that *does* have an alert will still be bumped; use `--skip-update` and handle that repo by hand if you need it frozen.
+**npm** has no equivalent. `npm update` offers no per-package exclusion, and `.ncurc.json`'s `reject` list belongs to [npm-check-updates](https://www.npmjs.com/package/npm-check-updates), which this agent does not invoke. On npm, hold a package back by tightening its declared range in `package.json` — an exact pin (`"typescript": "6.0.3"`) or a tilde (`"~6.0.3"`) — which `npm update --save` respects. The agent's `latest` path on npm is already narrow: it runs `npm install <pkg>@latest` only for **alerted** direct dependencies, so a package with no open Dependabot alert is never carried across a major regardless. A pinned package that *does* have an alert is dropped from that target list too, and reported as [pinned AND alerted](#exact-pins-are-never-rewritten).
 
 Either way, an exclusion only governs the **update** pass. If the package is still vulnerable afterward, the reconciler will report it — and, for a transitive copy, still write a bounded override. Excluding a package does not suppress its alert.
 
@@ -290,7 +344,7 @@ npm forbids an `overrides` entry for a package you **also depend on directly** u
 
 The agent does not rewrite an override to match a direct dep, and it does not use the `"$name"` self-reference form.
 
-**Edge case:** if a *direct* dependency is still vulnerable after the update — e.g. the only patched version is a major bump and you're on the default `compatible` strategy, so the update can't cross the major — the agent will write an override for a package that is also a direct dep, and `npm install` will then reject it with the conflict error. Fix it by re-running with `--update-strategy latest` (bumps the direct dep across the major and rewrites its declared range, so the alert closes without an override), or bump that dependency by hand.
+**Edge case:** if a *direct* dependency is still vulnerable after the update — e.g. the only patched version is a major bump and you're on the default `compatible` strategy, so the update can't cross the major — the agent will write an override for a package that is also a direct dep, and `npm install` will then reject it with the conflict error. Fix it by re-running with `--update-strategy latest` (bumps the direct dep across the major and rewrites its declared range, so the alert closes without an override), or bump that dependency by hand. If the package is an [exact pin](#exact-pins-are-never-rewritten), `latest` will not move it either — the run says so explicitly ("Pinned AND alerted"), and raising the pin by hand is the only fix.
 
 ## After running
 

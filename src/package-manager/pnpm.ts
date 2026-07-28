@@ -5,6 +5,7 @@ import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } fro
 import { addUnique, exitWithError, log, shell } from "../util.js";
 import { readPnpmIgnoredDependencies } from "../workspace.js";
 import { PackageManager, RunContext } from "./types.js";
+import { exactlyPinnedDeps, logHeldPins, logPrereleaseRollback, rejectAdoptedPrereleases } from "./update-guards.js";
 
 // Raw shape pnpm emits from `pnpm list --json` (we normalize away from this).
 interface PnpmListEntry {
@@ -99,7 +100,7 @@ export class PnpmPackageManager implements PackageManager {
 
   constructor(private readonly ctx: RunContext) {}
 
-  update(cwd: string): void {
+  async update(cwd: string, alertedPackages: string[]): Promise<void> {
     if (this.ctx.dryRun) {
       log("⏭️  Skipping pnpm update (dry run).");
       return;
@@ -125,6 +126,40 @@ export class PnpmPackageManager implements PackageManager {
       log("   pnpm update complete.");
     } catch (e) {
       exitWithError(`pnpm update failed: ${(e as Error).message}`);
+    }
+
+    const rollback = this.ctx.allowPrerelease ? null : await rejectAdoptedPrereleases(cwd, before);
+    if (rollback) logPrereleaseRollback(rollback);
+
+    // A rollback is the stronger reason but the same repair, so it wins the
+    // message and only one install runs either way.
+    if (rollback && rollback.applied.length > 0) this.resyncLockfile(cwd, "the pre-release rollback");
+    else if (pinned.length > 0) this.resyncLockfile(cwd, "the held pins");
+  }
+
+  /**
+   * Re-resolve so the lockfile agrees with the manifest the run is leaving
+   * behind. Needed on two paths, both of which end with a manifest the previous
+   * command's resolution no longer matches:
+   *
+   *   - a pre-release rollback, where the update wrote the pre-release into the
+   *     lockfile and only the manifest has been corrected since;
+   *   - held exact pins, because `pnpm update --latest` applies its exclusion
+   *     patterns to the manifest rewrite but not to resolution when it has no
+   *     lockfile to start from. A directory reached with no lockfile of its own —
+   *     an explicitly-configured `packages` entry inheriting the root's package
+   *     manager — otherwise ends up recording `specifier: 1.0.0, version: 3.0.1`,
+   *     with the pin honored on paper and violated in the tree.
+   *
+   * A plain install is the repair in both cases: it resolves from the manifest,
+   * which is the copy that is now correct. Cheap when nothing is wrong.
+   */
+  private resyncLockfile(cwd: string, reason: string): void {
+    log(`📦 Re-resolving the lockfile against ${reason} in ${cwd}...`);
+    try {
+      execSync("pnpm install --no-frozen-lockfile", { cwd, stdio: "inherit" });
+    } catch (e) {
+      exitWithError(`pnpm install failed while re-resolving against ${reason}: ${(e as Error).message}`);
     }
   }
 

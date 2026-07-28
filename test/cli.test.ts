@@ -18,3 +18,19 @@ describe("parseArgs — --exit-code", () => {
     assert.equal(args.repo, "o/r");
   });
 });
+
+describe("parseArgs — --allow-prerelease", () => {
+  it("sets allowPrerelease true when the flag is present", () => {
+    assert.equal(parseArgs(["--allow-prerelease"], "0.0.0").allowPrerelease, true);
+  });
+
+  it("leaves allowPrerelease undefined when absent, so config/env can supply it", () => {
+    assert.equal(parseArgs(["--dry-run"], "0.0.0").allowPrerelease, undefined);
+  });
+
+  it("combines with the update strategy it modifies", () => {
+    const args = parseArgs(["--update-strategy", "latest", "--allow-prerelease"], "0.0.0");
+    assert.equal(args.updateStrategy, "latest");
+    assert.equal(args.allowPrerelease, true);
+  });
+});

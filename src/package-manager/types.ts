@@ -14,6 +14,13 @@ export interface RunContext {
   dryRun: boolean;
   skipUpdate: boolean;
   updateStrategy: UpdateStrategy;
+  /**
+   * Whether the update pass may leave a project on a pre-release. Off by
+   * default: `update --latest` follows the `latest` dist-tag, and a maintainer
+   * who publishes a release candidate without `--tag` points that tag at the
+   * pre-release, so following it is not evidence anyone intended to.
+   */
+  allowPrerelease: boolean;
 }
 
 /**
@@ -26,11 +33,18 @@ export interface PackageManager {
 
   /**
    * Run the pre-check dependency update for a directory. Honors dryRun/skipUpdate
-   * and the configured update strategy. `alertedPackages` is the set of package
-   * names with open alerts in this group — used by the npm "latest" strategy to
-   * target only the relevant direct deps; pnpm ignores it.
+   * and the configured update strategy, leaves exactly-pinned direct dependencies
+   * alone, and (unless allowPrerelease is set) rolls back any pre-release the
+   * update adopted.
+   *
+   * `alertedPackages` is the set of package names with open alerts in this group.
+   * The npm "latest" strategy uses it to target only the relevant direct deps;
+   * both package managers use it to warn when a held pin is itself alerted.
+   *
+   * Async because the pre-release rollback resolves replacement versions from
+   * the registry.
    */
-  update(cwd: string, alertedPackages: string[]): void;
+  update(cwd: string, alertedPackages: string[]): Promise<void>;
 
   /** Read the installed dependency tree, normalized to InstalledTree[]. */
   getInstalledTree(cwd: string): InstalledTree[];

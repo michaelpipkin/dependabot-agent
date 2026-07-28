@@ -1,10 +1,10 @@
 import { execSync } from "node:child_process";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
+import { DirectDep, readDirectDependencies } from "../manifest.js";
 import { fetchDependentRanges } from "../registry.js";
 import { PackageManager, RunContext } from "./types.js";
+import { exactlyPinnedDeps, logHeldPins, logPrereleaseRollback, rejectAdoptedPrereleases } from "./update-guards.js";
 
 // Raw shape npm emits from `npm ls --all --json`. All deps (prod + dev) appear
 // together under `dependencies` at the root; there is no separate dev section.
@@ -91,25 +91,12 @@ function npmJson(cmd: string, cwd: string): string {
   }
 }
 
-function readDirectDeps(cwd: string): Set<string> {
-  const pkgPath = path.join(cwd, "package.json");
-  if (!fs.existsSync(pkgPath)) return new Set();
-  try {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as Record<string, unknown>;
-    const deps = (pkg.dependencies ?? {}) as Record<string, string>;
-    const devDeps = (pkg.devDependencies ?? {}) as Record<string, string>;
-    return new Set([...Object.keys(deps), ...Object.keys(devDeps)]);
-  } catch {
-    return new Set();
-  }
-}
-
 export class NpmPackageManager implements PackageManager {
   readonly id = "npm" as const;
 
   constructor(private readonly ctx: RunContext) {}
 
-  update(cwd: string, alertedPackages: string[]): void {
+  async update(cwd: string, alertedPackages: string[]): Promise<void> {
     if (this.ctx.dryRun) {
       log("⏭️  Skipping npm update (dry run).");
       return;
@@ -119,15 +106,39 @@ export class NpmPackageManager implements PackageManager {
       return;
     }
 
+    const before = readDirectDependencies(cwd);
+    const pinned = exactlyPinnedDeps(before);
+    logHeldPins(pinned, alertedPackages);
+
+    if (!this.runUpdate(cwd, alertedPackages, before, pinned)) return;
+
+    if (this.ctx.allowPrerelease) return;
+    const rollback = await rejectAdoptedPrereleases(cwd, before);
+    logPrereleaseRollback(rollback);
+    if (rollback.applied.length > 0) this.resyncLockfile(cwd);
+  }
+
+  /**
+   * Run the update itself. Returns false when there was nothing to do, so the
+   * caller can skip the pre-release check rather than re-reading a manifest
+   * no command touched.
+   *
+   * npm has no per-package exclusion for `npm update`, but it doesn't need one:
+   * an exact specifier is a range of one, so `npm update --save` cannot move it.
+   * The `latest` path installs named packages outright and *would* overwrite a
+   * pin, so pinned names are filtered out of its target list.
+   */
+  private runUpdate(cwd: string, alertedPackages: string[], before: DirectDep[], pinned: DirectDep[]): boolean {
     try {
       if (this.ctx.updateStrategy === "latest") {
         // npm has no `update --latest`; install the alerted *direct* deps at
         // @latest so we cross majors only for packages that actually have alerts.
-        const direct = readDirectDeps(cwd);
-        const targets = alertedPackages.filter((name) => direct.has(name));
+        const direct = new Set(before.map((d) => d.name));
+        const pinnedNames = new Set(pinned.map((p) => p.name));
+        const targets = alertedPackages.filter((name) => direct.has(name) && !pinnedNames.has(name));
         if (targets.length === 0) {
           log(`📦 No alerted direct dependencies to update at @latest in ${cwd}.`);
-          return;
+          return false;
         }
         const specs = targets.map((n) => `${n}@latest`).join(" ");
         log(`📦 Running npm install ${specs} in ${cwd}...`);
@@ -137,8 +148,24 @@ export class NpmPackageManager implements PackageManager {
         execSync("npm update --save", { cwd, stdio: "inherit" });
       }
       log("   npm update complete.");
+      return true;
     } catch (e) {
       exitWithError(`npm update failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Re-resolve after a pre-release rollback. The update already wrote the
+   * pre-release into package-lock.json; correcting the manifest alone would
+   * leave the two disagreeing, and the tree read next would still be the one we
+   * rejected.
+   */
+  private resyncLockfile(cwd: string): void {
+    log(`📦 Re-resolving package-lock.json after the pre-release rollback in ${cwd}...`);
+    try {
+      execSync("npm install", { cwd, stdio: "inherit" });
+    } catch (e) {
+      exitWithError(`npm install failed after the pre-release rollback: ${(e as Error).message}`);
     }
   }
 
