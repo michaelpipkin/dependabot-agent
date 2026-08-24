@@ -22,6 +22,47 @@ export function exactlyPinnedDeps(deps: DirectDep[]): DirectDep[] {
 }
 
 /**
+ * One manifest the update pass will rewrite, and therefore one the guards have
+ * to read first.
+ *
+ * A single-project run has exactly one of these. A workspace run has the root
+ * plus every member, because `pnpm update -r` rewrites all of them — and a
+ * guard that reads only the root would enforce its guarantee on the one
+ * manifest in a monorepo least likely to declare anything.
+ */
+export interface ManifestScope {
+  /** Directory containing the package.json. */
+  dir: string;
+  /** How the directory is named in reports — "." for the run's root. */
+  label: string;
+}
+
+/** A specifier held back from the update pass, and where it was declared. */
+export interface PinnedSpec {
+  name: string;
+  spec: string;
+  /** Human-readable source, e.g. `packages/app/package.json (devDependencies)`. */
+  origin: string;
+}
+
+/** The manifest path as it should read in a report. */
+function manifestLabel(scope: ManifestScope): string {
+  return scope.label === "." ? "package.json" : `${scope.label}/package.json`;
+}
+
+/** The manifest-declared exact pins across every scope the update pass will touch. */
+export function collectPinnedSpecs(scopes: ManifestScope[]): PinnedSpec[] {
+  const pins: PinnedSpec[] = [];
+  for (const scope of scopes) {
+    const manifest = manifestLabel(scope);
+    for (const dep of exactlyPinnedDeps(readDirectDependencies(scope.dir))) {
+      pins.push({ name: dep.name, spec: dep.spec, origin: `${manifest} (${dep.field})` });
+    }
+  }
+  return pins;
+}
+
+/**
  * Report the pins being held, and call out any that have an open alert.
  *
  * The second half matters more than the first. Holding a pin means the update
@@ -30,7 +71,7 @@ export function exactlyPinnedDeps(deps: DirectDep[]): DirectDep[] {
  * and a direct dependency is not one. Without this line the alert would simply
  * stay open every week with no explanation.
  */
-export function logHeldPins(pinned: DirectDep[], alertedPackages: string[]): void {
+export function logHeldPins(pinned: PinnedSpec[], alertedPackages: string[]): void {
   if (pinned.length === 0) return;
 
   const names = [...new Set(pinned.map((p) => p.name))].sort((a, b) => a.localeCompare(b));
@@ -42,7 +83,7 @@ export function logHeldPins(pinned: DirectDep[], alertedPackages: string[]): voi
 
   log("   ⚠️  Pinned AND alerted — the update pass cannot fix these; raise the pin by hand:");
   for (const p of pinnedAndAlerted) {
-    log(`         ${p.name} pinned at ${p.spec} (${p.field})`);
+    log(`         ${p.name} pinned at ${p.spec} in ${p.origin}`);
   }
 }
 
@@ -54,6 +95,11 @@ export interface PrereleaseFix extends SpecEdit {
    * or lists nothing stable above what the project already declared.
    */
   source: "highest-stable" | "restored";
+  /**
+   * Which manifest this was corrected in, when the run covers more than one.
+   * Absent for a single-scope run, where naming the file would add nothing.
+   */
+  origin?: string;
 }
 
 export interface PrereleaseRollback {
@@ -116,6 +162,35 @@ export async function rejectAdoptedPrereleases(cwd: string, before: DirectDep[])
   };
 }
 
+/** A manifest scope paired with its pre-update state, for the rollback sweep. */
+export interface PrereleaseScope extends ManifestScope {
+  before: DirectDep[];
+}
+
+/**
+ * Run the pre-release rollback over every manifest the update pass rewrote.
+ *
+ * The correction is per-manifest and completely independent between them, so
+ * this is a plain sweep — but it has to cover all of them. `pnpm update -r`
+ * follows the `latest` dist-tag in a member exactly as readily as in the root,
+ * and a rollback that only ever looked at the root would leave a member sitting
+ * on the release candidate it was never meant to adopt.
+ */
+export async function rejectAdoptedPrereleasesAcross(scopes: PrereleaseScope[]): Promise<PrereleaseRollback> {
+  const applied: PrereleaseFix[] = [];
+  const skipped: PrereleaseFix[] = [];
+
+  for (const scope of scopes) {
+    const rollback = await rejectAdoptedPrereleases(scope.dir, scope.before);
+    // Only name the file when there is more than one it could have been.
+    const origin = scopes.length > 1 ? manifestLabel(scope) : undefined;
+    applied.push(...rollback.applied.map((f) => ({ ...f, origin })));
+    skipped.push(...rollback.skipped.map((f) => ({ ...f, origin })));
+  }
+
+  return { applied, skipped };
+}
+
 /**
  * The specifier to write in place of an adopted pre-release: the same operator
  * over the highest stable version.
@@ -143,14 +218,20 @@ async function stableReplacement(
 
 /** Print what the rollback changed, so a reviewer can see why a bump stopped short. */
 export function logPrereleaseRollback(rollback: PrereleaseRollback): void {
+  // Naming the manifest matters once a run spans several: "firebase-functions
+  // was rolled back" is ambiguous in a monorepo that declares it three times.
+  const where = (fix: PrereleaseFix): string => (fix.origin ? ` in ${fix.origin}` : "");
+
   for (const fix of rollback.applied) {
     const tail =
       fix.source === "highest-stable"
         ? `using the highest stable release "${fix.to}" instead.`
         : `no newer stable release found — restored "${fix.to}".`;
-    log(`   ⏮️  ${fix.name}: the update pass chose the pre-release "${fix.from}" — ${tail}`);
+    log(`   ⏮️  ${fix.name}${where(fix)}: the update pass chose the pre-release "${fix.from}" — ${tail}`);
   }
   for (const fix of rollback.skipped) {
-    log(`   ⚠️  ${fix.name} is at the pre-release "${fix.from}" and its entry could not be edited — left as-is.`);
+    log(
+      `   ⚠️  ${fix.name}${where(fix)} is at the pre-release "${fix.from}" and its entry could not be edited — left as-is.`,
+    );
   }
 }

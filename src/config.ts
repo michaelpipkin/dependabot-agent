@@ -19,6 +19,7 @@ export interface ResolvedConfig {
   exitCode: boolean; // exit 2 when any override changes are found (CI drift gate)
   discoverPackages: boolean; // auto-discover isolated sub-packages (own lockfile)
   packages: string[]; // extra manifest dirs to always process (relative to root)
+  updateWorkspaceMembers: boolean; // let the update pass rewrite workspace members' manifests
 }
 
 interface ConfigFile {
@@ -32,6 +33,7 @@ interface ConfigFile {
   exitCode?: boolean;
   discoverPackages?: boolean;
   packages?: string[];
+  updateWorkspaceMembers?: boolean;
   token?: string; // not allowed — warned and ignored
 }
 
@@ -146,6 +148,13 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   const discoverPackages = config.discoverPackages ?? true;
   const packages = config.packages ?? [];
 
+  // Default true: a workspace member's manifest is a manifest like any other,
+  // and leaving it out means a fixable direct dependency there can only ever be
+  // patched with an override — the blunter of the two repairs, and one that
+  // then contradicts what the member says it wants. Off is for the rare project
+  // that wants members' versions moved by hand only.
+  const updateWorkspaceMembers = config.updateWorkspaceMembers ?? true;
+
   // Validate required fields with friendly, actionable messages.
   if (!token) {
     exitWithError("GitHub token is required. Pass --token or set GITHUB_TOKEN.");
@@ -170,6 +179,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     exitCode,
     discoverPackages,
     packages,
+    updateWorkspaceMembers,
   };
 }
 

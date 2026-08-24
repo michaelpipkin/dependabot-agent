@@ -4,7 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DirectDep, readDirectDependencies } from "../src/manifest.js";
-import { exactlyPinnedDeps, rejectAdoptedPrereleases } from "../src/package-manager/update-guards.js";
+import {
+  collectPinnedSpecs,
+  exactlyPinnedDeps,
+  rejectAdoptedPrereleases,
+  rejectAdoptedPrereleasesAcross,
+} from "../src/package-manager/update-guards.js";
 
 function dep(name: string, spec: string, field: DirectDep["field"] = "dependencies"): DirectDep {
   return { name, spec, field };
@@ -157,5 +162,86 @@ describe("rejectAdoptedPrereleases", () => {
 
     assert.deepEqual(rollback.applied, []);
     assert.deepEqual(rollback.skipped, []);
+  });
+});
+
+/** A workspace root with members, seeded from path → package.json contents. */
+function scratchScopes(manifests: Record<string, unknown>): { dir: string; label: string }[] {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dep-agent-scopes-"));
+  const scopes: { dir: string; label: string }[] = [];
+  for (const [label, contents] of Object.entries(manifests)) {
+    const dir = label === "." ? root : path.join(root, label);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(contents, null, 2), "utf-8");
+    scopes.push({ dir, label });
+  }
+  return scopes;
+}
+
+describe("collectPinnedSpecs", () => {
+  it("finds pins in every scope, not just the root", () => {
+    // The gap that made `-r` unsafe: a member's deliberate pin was invisible to
+    // a guard that only ever read the root manifest.
+    const scopes = scratchScopes({
+      ".": { name: "root", dependencies: { ms: "^2.1.3" } },
+      "packages/app": { name: "app", dependencies: { rimraf: "3.0.2" } },
+      "packages/lib": { name: "lib", devDependencies: { semver: "6.3.0" } },
+    });
+
+    assert.deepEqual(collectPinnedSpecs(scopes), [
+      { name: "rimraf", spec: "3.0.2", origin: "packages/app/package.json (dependencies)" },
+      { name: "semver", spec: "6.3.0", origin: "packages/lib/package.json (devDependencies)" },
+    ]);
+  });
+
+  it("names the root manifest plainly", () => {
+    const scopes = scratchScopes({ ".": { name: "root", dependencies: { rimraf: "3.0.2" } } });
+    assert.deepEqual(collectPinnedSpecs(scopes), [
+      { name: "rimraf", spec: "3.0.2", origin: "package.json (dependencies)" },
+    ]);
+  });
+
+  it("reports nothing when no scope pins anything", () => {
+    const scopes = scratchScopes({
+      ".": { name: "root", dependencies: { ms: "^2.1.3" } },
+      "packages/app": { name: "app", dependencies: { rimraf: "~3.0.2" } },
+    });
+    assert.deepEqual(collectPinnedSpecs(scopes), []);
+  });
+});
+
+describe("rejectAdoptedPrereleasesAcross", () => {
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("rolls back a pre-release adopted in a member, not only in the root", () => {
+    // `pnpm update -r` follows the `latest` dist-tag in a member exactly as
+    // readily as at the root; a root-only rollback would leave it there.
+    stubRegistry({ pkg: ["1.0.0", "2.0.0", "2.1.0-rc.0"] });
+    const scopes = scratchScopes({
+      ".": { name: "root", dependencies: { pkg: "^2.0.0" } },
+      "packages/app": { name: "app", dependencies: { pkg: "^2.1.0-rc.0" } },
+    });
+    const snapshots = scopes.map((s, i) => ({ ...s, before: [dep("pkg", i === 0 ? "^2.0.0" : "^1.0.0")] }));
+
+    return rejectAdoptedPrereleasesAcross(snapshots).then((rollback) => {
+      assert.deepEqual(
+        rollback.applied.map((f) => ({ name: f.name, to: f.to, origin: f.origin })),
+        [{ name: "pkg", to: "^2.0.0", origin: "packages/app/package.json" }],
+      );
+      assert.equal(readDirectDependencies(scopes[1].dir)[0].spec, "^2.0.0");
+    });
+  });
+
+  it("leaves the origin off a single-scope run, where naming the file adds nothing", async () => {
+    stubRegistry({ pkg: ["1.0.0", "2.0.0", "2.1.0-rc.0"] });
+    const scopes = scratchScopes({ ".": { name: "root", dependencies: { pkg: "^2.1.0-rc.0" } } });
+    const snapshots = scopes.map((s) => ({ ...s, before: [dep("pkg", "^1.0.0")] }));
+
+    const rollback = await rejectAdoptedPrereleasesAcross(snapshots);
+
+    assert.equal(rollback.applied.length, 1);
+    assert.equal(rollback.applied[0].origin, undefined);
   });
 });

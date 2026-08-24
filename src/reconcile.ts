@@ -1240,6 +1240,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     skipUpdate: cfg.skipUpdate,
     updateStrategy: cfg.updateStrategy,
     allowPrerelease: cfg.allowPrerelease,
+    updateWorkspaceMembers: cfg.updateWorkspaceMembers,
   };
 
   // Additional manifest roots to reconcile beyond the workspace root: isolated

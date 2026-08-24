@@ -49,3 +49,31 @@ describe("pnpmUpdateCommand", () => {
     );
   });
 });
+
+describe("pnpmUpdateCommand — workspace members (-r)", () => {
+  it("adds -r before the strategy flag", () => {
+    assert.equal(pnpmUpdateCommand("compatible", [], [], true), "pnpm update -r");
+    assert.equal(pnpmUpdateCommand("latest", [], [], true), "pnpm update -r --latest");
+  });
+
+  it("stays root-only when recursion is off — the pre-existing command, unchanged", () => {
+    assert.equal(pnpmUpdateCommand("latest", [], [], false), "pnpm update --latest");
+    assert.equal(pnpmUpdateCommand("latest", []), "pnpm update --latest");
+  });
+
+  it("keeps exclusion patterns alongside -r", () => {
+    // Verified against pnpm 11: `!name` still applies under -r, and reaches
+    // catalog entries in pnpm-workspace.yaml as well as member manifests.
+    assert.equal(
+      pnpmUpdateCommand("latest", [pin("rimraf")], ["typescript"], true),
+      'pnpm update -r --latest "!rimraf" "!typescript"',
+    );
+  });
+
+  it("accepts pins from any source, not just a member manifest", () => {
+    // catalogPins() yields { name, spec, origin } rather than a DirectDep; the
+    // command only ever needs the name.
+    const catalogPin = { name: "semver", spec: "6.3.0", origin: "pnpm-workspace.yaml (catalog)" };
+    assert.equal(pnpmUpdateCommand("latest", [catalogPin], [], true), 'pnpm update -r --latest "!semver"');
+  });
+});

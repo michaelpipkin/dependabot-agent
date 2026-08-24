@@ -1,10 +1,21 @@
 import { execSync } from "node:child_process";
+import * as path from "node:path";
 import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
-import { DirectDep, readDirectDependencies } from "../manifest.js";
+import { readDirectDependencies } from "../manifest.js";
 import { fetchDependentRanges } from "../registry.js";
+import { listWorkspaceMemberDirs } from "../workspace.js";
 import { PackageManager, RunContext } from "./types.js";
-import { exactlyPinnedDeps, logHeldPins, logPrereleaseRollback, rejectAdoptedPrereleases } from "./update-guards.js";
+import {
+  ManifestScope,
+  PinnedSpec,
+  PrereleaseScope,
+  collectPinnedSpecs,
+  exactlyPinnedDeps,
+  logHeldPins,
+  logPrereleaseRollback,
+  rejectAdoptedPrereleasesAcross,
+} from "./update-guards.js";
 
 // Raw shape npm emits from `npm ls --all --json`. All deps (prod + dev) appear
 // together under `dependencies` at the root; there is no separate dev section.
@@ -106,16 +117,38 @@ export class NpmPackageManager implements PackageManager {
       return;
     }
 
-    const before = readDirectDependencies(cwd);
-    const pinned = exactlyPinnedDeps(before);
+    const scopes = this.manifestScopes(cwd);
+    if (scopes.length > 1) {
+      log(`   🗂️  Including ${scopes.length - 1} workspace member(s) in the update pass.`);
+    }
+
+    // Snapshot every manifest the command is about to rewrite, before it runs.
+    const snapshots: PrereleaseScope[] = scopes.map((s) => ({ ...s, before: readDirectDependencies(s.dir) }));
+    const pinned: PinnedSpec[] = collectPinnedSpecs(scopes);
     logHeldPins(pinned, alertedPackages);
 
-    if (!this.runUpdate(cwd, alertedPackages, before, pinned)) return;
+    if (!this.runUpdate(cwd, alertedPackages, snapshots)) return;
 
     if (this.ctx.allowPrerelease) return;
-    const rollback = await rejectAdoptedPrereleases(cwd, before);
+    const rollback = await rejectAdoptedPrereleasesAcross(snapshots);
     logPrereleaseRollback(rollback);
     if (rollback.applied.length > 0) this.resyncLockfile(cwd);
+  }
+
+  /**
+   * Every manifest this run's update pass will rewrite — the root, plus each
+   * workspace member when members are in scope. npm has no catalogs, so unlike
+   * pnpm this is the complete list of places a version can be declared.
+   */
+  private manifestScopes(cwd: string): ManifestScope[] {
+    const root: ManifestScope = { dir: cwd, label: "." };
+    if (!this.ctx.updateWorkspaceMembers) return [root];
+
+    const members = listWorkspaceMemberDirs(cwd, "npm").map((dir) => ({
+      dir,
+      label: path.relative(cwd, dir).replace(/\\/g, "/") || ".",
+    }));
+    return [root, ...members];
   }
 
   /**
@@ -125,27 +158,44 @@ export class NpmPackageManager implements PackageManager {
    *
    * npm has no per-package exclusion for `npm update`, but it doesn't need one:
    * an exact specifier is a range of one, so `npm update --save` cannot move it.
-   * The `latest` path installs named packages outright and *would* overwrite a
-   * pin, so pinned names are filtered out of its target list.
+   * That holds in a workspace member exactly as it does at the root, which is
+   * why the recursive form needs no extra pin handling. The `latest` path
+   * installs named packages outright and *would* overwrite a pin, so pins are
+   * filtered out of its target list — per scope, since a package frozen in one
+   * member says nothing about what another member wants.
    */
-  private runUpdate(cwd: string, alertedPackages: string[], before: DirectDep[], pinned: DirectDep[]): boolean {
+  private runUpdate(cwd: string, alertedPackages: string[], snapshots: PrereleaseScope[]): boolean {
+    const recursive = snapshots.length > 1;
     try {
       if (this.ctx.updateStrategy === "latest") {
         // npm has no `update --latest`; install the alerted *direct* deps at
         // @latest so we cross majors only for packages that actually have alerts.
-        const direct = new Set(before.map((d) => d.name));
-        const pinnedNames = new Set(pinned.map((p) => p.name));
-        const targets = alertedPackages.filter((name) => direct.has(name) && !pinnedNames.has(name));
-        if (targets.length === 0) {
+        // One command per manifest: `-w <path>` scopes the install to a single
+        // member, and passing --workspaces instead would ADD the package to
+        // members that never declared it.
+        let ran = false;
+        for (const scope of snapshots) {
+          const direct = new Set(scope.before.map((d) => d.name));
+          const pinnedHere = new Set(exactlyPinnedDeps(scope.before).map((d) => d.name));
+          const targets = alertedPackages.filter((name) => direct.has(name) && !pinnedHere.has(name));
+          if (targets.length === 0) continue;
+
+          const specs = targets.map((n) => `${n}@latest`).join(" ");
+          const where = scope.label === "." ? "" : ` -w ${scope.label}`;
+          log(`📦 Running npm install ${specs}${where} in ${cwd}...`);
+          execSync(`npm install ${specs}${where}`, { cwd, stdio: "inherit" });
+          ran = true;
+        }
+        if (!ran) {
           log(`📦 No alerted direct dependencies to update at @latest in ${cwd}.`);
           return false;
         }
-        const specs = targets.map((n) => `${n}@latest`).join(" ");
-        log(`📦 Running npm install ${specs} in ${cwd}...`);
-        execSync(`npm install ${specs}`, { cwd, stdio: "inherit" });
       } else {
-        log(`📦 Running npm update --save in ${cwd}...`);
-        execSync("npm update --save", { cwd, stdio: "inherit" });
+        // --workspaces alone would skip the root, which is a manifest like any
+        // other here, so the root is opted back in explicitly.
+        const across = recursive ? " --workspaces --include-workspace-root" : "";
+        log(`📦 Running npm update --save${across} in ${cwd}...`);
+        execSync(`npm update --save${across}`, { cwd, stdio: "inherit" });
       }
       log("   npm update complete.");
       return true;
