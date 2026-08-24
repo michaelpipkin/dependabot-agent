@@ -1,11 +1,20 @@
 import { execSync } from "node:child_process";
-import { DirectDep, readDirectDependencies } from "../manifest.js";
+import * as path from "node:path";
+import { readDirectDependencies } from "../manifest.js";
 import { fetchDependentRanges } from "../registry.js";
 import { DependentRange, DeploymentRecommendation, InstalledTree, TreeNode, UpdateStrategy } from "../types.js";
 import { addUnique, exitWithError, log, shell } from "../util.js";
-import { readPnpmIgnoredDependencies } from "../workspace.js";
+import { catalogPins, listWorkspaceMemberDirs, readPnpmIgnoredDependencies } from "../workspace.js";
 import { PackageManager, RunContext } from "./types.js";
-import { exactlyPinnedDeps, logHeldPins, logPrereleaseRollback, rejectAdoptedPrereleases } from "./update-guards.js";
+import {
+  ManifestScope,
+  PinnedSpec,
+  PrereleaseScope,
+  collectPinnedSpecs,
+  logHeldPins,
+  logPrereleaseRollback,
+  rejectAdoptedPrereleasesAcross,
+} from "./update-guards.js";
 
 // Raw shape pnpm emits from `pnpm list --json` (we normalize away from this).
 interface PnpmListEntry {
@@ -81,13 +90,27 @@ export function parsePnpmListOutput(raw: string): InstalledTree[] {
  * hold-back it had configured. Both lists are just patterns to pnpm, so globs
  * (`@babel/*`) carry over unchanged.
  *
+ * `recursive` adds `-r`, which extends the pass to every workspace member and,
+ * with it, to the catalog entries members reference. Verified against pnpm 11:
+ * exclusion patterns keep applying under `-r`, and they reach catalog entries in
+ * pnpm-workspace.yaml as well as manifests — so the pin guard holds across the
+ * whole workspace as long as it is handed every pin (see collectPinnedSpecs and
+ * catalogPins).
+ *
  * With nothing to exclude the command stays bare — which matters, since that is
  * the only form under which pnpm applies ignoreDependencies itself.
  *
  * Patterns are quoted so every shell hands the `!` through untouched.
  */
-export function pnpmUpdateCommand(strategy: UpdateStrategy, pinned: DirectDep[], ignored: string[] = []): string {
-  const base = strategy === "latest" ? "pnpm update --latest" : "pnpm update";
+export function pnpmUpdateCommand(
+  strategy: UpdateStrategy,
+  pinned: Array<{ name: string }>,
+  ignored: string[] = [],
+  recursive = false,
+): string {
+  const base = ["pnpm update", recursive ? "-r" : "", strategy === "latest" ? "--latest" : ""]
+    .filter(Boolean)
+    .join(" ");
   if (pinned.length === 0) return base;
 
   const patterns = [...new Set([...pinned.map((p) => p.name), ...ignored])];
@@ -110,15 +133,25 @@ export class PnpmPackageManager implements PackageManager {
       return;
     }
 
-    const before = readDirectDependencies(cwd);
-    const pinned = exactlyPinnedDeps(before);
+    const scopes = this.manifestScopes(cwd);
+    const recursive = scopes.length > 1;
+    if (recursive) {
+      log(`   🗂️  Including ${scopes.length - 1} workspace member(s) in the update pass.`);
+    }
+
+    // Snapshot every manifest the command is about to rewrite, before it runs.
+    const snapshots: PrereleaseScope[] = scopes.map((s) => ({ ...s, before: readDirectDependencies(s.dir) }));
+
+    // Catalog pins only matter when the pass is recursive: without -r, pnpm
+    // never touches pnpm-workspace.yaml, so there is nothing there to protect.
+    const pinned: PinnedSpec[] = [...collectPinnedSpecs(scopes), ...(recursive ? catalogPins(cwd) : [])];
     logHeldPins(pinned, alertedPackages);
 
     const ignored = pinned.length > 0 ? readPnpmIgnoredDependencies(cwd) : [];
     if (ignored.length > 0) {
       log(`   🔁 Carrying pnpm's updateConfig.ignoreDependencies through as patterns: ${ignored.join(", ")}`);
     }
-    const cmd = pnpmUpdateCommand(this.ctx.updateStrategy, pinned, ignored);
+    const cmd = pnpmUpdateCommand(this.ctx.updateStrategy, pinned, ignored, recursive);
     log(`📦 Running ${cmd} in ${cwd}...`);
     try {
       // stdio: "inherit" streams pnpm output to the terminal.
@@ -128,13 +161,32 @@ export class PnpmPackageManager implements PackageManager {
       exitWithError(`pnpm update failed: ${(e as Error).message}`);
     }
 
-    const rollback = this.ctx.allowPrerelease ? null : await rejectAdoptedPrereleases(cwd, before);
+    const rollback = this.ctx.allowPrerelease ? null : await rejectAdoptedPrereleasesAcross(snapshots);
     if (rollback) logPrereleaseRollback(rollback);
 
     // A rollback is the stronger reason but the same repair, so it wins the
     // message and only one install runs either way.
     if (rollback && rollback.applied.length > 0) this.resyncLockfile(cwd, "the pre-release rollback");
     else if (pinned.length > 0) this.resyncLockfile(cwd, "the held pins");
+  }
+
+  /**
+   * Every manifest this run's update pass will rewrite.
+   *
+   * The root alone, unless workspace members are in scope — in which case each
+   * member is its own manifest with its own pins to protect. `-r` is derived
+   * from this rather than configured separately, so a workspace with no members
+   * (or a plain single-package project) runs the exact command it always did.
+   */
+  private manifestScopes(cwd: string): ManifestScope[] {
+    const root: ManifestScope = { dir: cwd, label: "." };
+    if (!this.ctx.updateWorkspaceMembers) return [root];
+
+    const members = listWorkspaceMemberDirs(cwd, "pnpm").map((dir) => ({
+      dir,
+      label: path.relative(cwd, dir).replace(/\\/g, "/") || ".",
+    }));
+    return [root, ...members];
   }
 
   /**

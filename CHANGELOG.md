@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.2.0]
+
+Both changes here concern **workspace members** — the `packages/*` projects that share the root's install and override file. The agent could already see them when reading the dependency tree, but not when updating or when deciding an override could be dropped.
+
+### Added
+
+- **`"updateWorkspaceMembers"`.** Config-file only (like `discoverPackages` and `packages`), default `true`. Set to `false` to leave workspace members' manifests untouched by the update pass.
+- **pnpm catalogs are understood.** A `catalog:` / `catalog:default` / `catalog:<name>` specifier is resolved against the workspace root's `catalog:` and `catalogs:` sections before the agent reasons about it. Both spellings of the default catalog (top-level `catalog:` and `catalogs.default`) are read, with the top-level key winning where they overlap. Catalogs are read, never written: they solve version drift, not vulnerabilities, so an alert is still answered by raising a declared range or writing an override.
+
+### Changed
+
+- **The update pass now covers workspace members, not just the root.** Previously it ran only in the directory it was pointed at, so in a monorepo a member's direct dependencies were never bumped and every fixable alert inside them fell through to the override path instead — accumulating overrides that were never needed, each silently forcing a member past the range its own `package.json` declares. Verified on npm: a root override resolved `rimraf@6.1.3` for a member declaring `^3.0.2`, with no error and no warning. On pnpm the pass now runs `pnpm update -r`; on npm, `npm update --save --workspaces --include-workspace-root`, or one scoped `npm install <pkg>@latest -w <member>` per member under `latest` (never `--workspaces`, which would _add_ the package to members that never declared it). This changes which overrides are produced for an existing input, hence a minor bump rather than a patch. Set `"updateWorkspaceMembers": false` for the previous behavior, which then emits the byte-identical command it always did.
+
+  **This is not the same switch as `discoverPackages`.** Turning it off does not make the agent ignore members: their trees are still read and their vulnerabilities still found — only the version bumps stop, so more of their alerts get resolved by an override instead.
+
+- **Both update-pass guards are now workspace-aware**, which is what makes the above safe. The pin guard reads every manifest the command will rewrite, so an exact pin in `packages/app/package.json` is protected exactly as a root pin is; on pnpm it also reads exact-pinned **catalog** entries, since `pnpm update -r` rewrites `pnpm-workspace.yaml`. The pre-release rollback likewise runs per manifest. Confirmed against pnpm 11 that `!name` exclusion patterns keep applying under `-r` and reach catalog entries as well as manifests. Without this the recursive pass would have trampled deliberate pins — reproduced before the fix: a member's `rimraf: "3.0.2"` was rewritten to `"6.1.3"` and a catalog's `semver: ^6.0.0` jumped to `^7.8.5`. Held pins now name their source in the report (`rimraf pinned at 3.0.2 in pnpm-workspace.yaml (catalog)`), and a pre-release rollback names the manifest it corrected when a run spans several.
+
+### Fixed
+
+- **An override reachable only through a catalog-managed member can age out again.** The orphan check reads what each member requires, and a raw `catalog:` specifier is not a semver range — so it was read as "might still be vulnerable" on every run, the override was held forever, and the run reported `app requires catalog:` as its justification. The reference is now resolved to the range the catalog declares, so the override is dropped once that entry is safe, and a member whose catalog range is genuinely too low is reported as a real escape with a real range instead of an opaque token. A reference that no catalog entry backs is still held conservatively — dropping the member from the dependent set would turn a broken workspace into silence, and silence is the one signal the removal check must never read as "safe to remove" — and now says so explicitly in the output.
+
 ## [1.1.1]
 
 ### Fixed

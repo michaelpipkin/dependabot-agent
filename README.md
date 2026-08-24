@@ -9,7 +9,7 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
    - **npm** → top-level `overrides` in `package.json`.
    - **pnpm** → `pnpm-workspace.yaml` (workspace projects) if present, otherwise `pnpm.overrides` in `package.json`.
 3. **Fetches** your repo's npm Dependabot alerts (all states) via the GitHub API; open alerts drive the override decisions, while every package that was *ever* alerted is remembered so a resolved override can be aged out without touching a never-alerted hand-pin.
-4. **Updates** dependencies (range-bound by default — see [Update strategy](#update-strategy)).
+4. **Updates** dependencies (range-bound by default — see [Update strategy](#update-strategy)), across the root manifest and every workspace member, so a fixable direct dependency is repaired by raising its range rather than by an override.
 5. **Walks** the full installed dependency tree and confirms each alerted package is actually present.
 6. **Adds or updates** override entries for packages that remain vulnerable, writing a spec bounded at the first breaking version above the patch (`>=0.7.0 <0.8`, `>=4.17.21 <5`) so a fix never drags the tree further than it has to. When one advisory spans **disjoint release lines** — a package vulnerable on, say, both 3.x and 4.x at once — it writes one bounded override *per line* (`js-yaml@3`, `js-yaml@4`) so each consumer stays on its own major instead of being forced up. See [Multi-line advisory](#multi-line-advisory).
 7. **Flags** the cases where no in-range fix exists — the earliest patched version sits outside what's installed can accept — separately from routine changes. See [No in-range fix](#no-in-range-fix).
@@ -120,7 +120,8 @@ Commit this file at the workspace root. It's auto-discovered — no `--config` f
   "skipUpdate": false,
   "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages
-  "packages": []                 // extra manifest dirs to always process
+  "packages": [],                // extra manifest dirs to always process
+  "updateWorkspaceMembers": true // let the update pass bump workspace members too
 }
 ```
 
@@ -196,9 +197,12 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "skipUpdate": false,
   "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
-  "packages": []                 // extra manifest dirs to always process
+  "packages": [],                // extra manifest dirs to always process
+  "updateWorkspaceMembers": true // bump workspace members' manifests too (default true)
 }
 ```
+
+`discoverPackages`, `packages`, and `updateWorkspaceMembers` are config-file only — they have no flag or environment variable. See [Monorepos & isolated packages](#monorepos--isolated-packages) for what each one governs; they are three different kinds of subdirectory and are easy to mix up.
 
 > **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `.env` / `GITHUB_TOKEN` / CI secrets so they don't get committed.
 
@@ -206,10 +210,28 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
 
 The agent always processes the workspace root, and additionally each **isolated sub-package** — a directory with both its own `package.json` **and** its own lockfile (`pnpm-lock.yaml` / `package-lock.json`), e.g. a Firebase `functions/` folder. These have a separate install and separate overrides, so each is reconciled as its own group (auto-detecting its package manager from its lockfile).
 
-Plain **workspace members** (listed under `pnpm-workspace.yaml`'s `packages:` or a `package.json` `workspaces` field) share the root install and the root override file, so they are intentionally **not** processed separately.
+Plain **workspace members** (listed under `pnpm-workspace.yaml`'s `packages:` or a `package.json` `workspaces` field) share the root install and the root override file, so they are intentionally **not** reconciled as separate groups. Their manifests *are* updated, though — see [Workspace members and the update pass](#workspace-members-and-the-update-pass).
 
 - `discoverPackages` (default `true`) — set to `false` to process only the root.
 - `packages` — explicitly list extra manifest directories (relative to the workspace root) to process, e.g. for an isolated package that doesn't have its own lockfile.
+- `updateWorkspaceMembers` (default `true`) — set to `false` to leave workspace members' manifests untouched by the update pass.
+
+### Workspace members and the update pass
+
+The update pass rewrites **every** manifest in the workspace: the root and each member. This matters more than it sounds, because it decides which of the two repairs a vulnerability gets.
+
+A fixable direct dependency should be fixed by **raising its declared range** — the change lands in the manifest that asked for it, and the alert closes. An **override** is the fallback for transitive copies you don't declare and can't otherwise reach. If members were skipped by the update pass, every fixable alert inside them would fall through to the override path instead: overrides would accumulate for packages that never needed one, and each would silently force a member past the range its own `package.json` states.
+
+So this is on by default. Set `updateWorkspaceMembers` to `false` only if you want members' versions moved by hand:
+
+```jsonc
+// dependabot-agent.config.json — just this key; the rest of your config is unaffected
+{ "updateWorkspaceMembers": false }
+```
+
+**It is not the same switch as `discoverPackages`.** Turning this off does not make the agent ignore your members — their dependency trees are still read, their vulnerabilities are still found, and overrides are still written for them. It only stops the agent from bumping the versions they declare, which means more of their alerts get resolved with an override rather than a version bump.
+
+Every guarantee the update pass makes at the root holds in a member too: [exact pins](#exact-pins-are-never-rewritten) are never rewritten wherever they are declared, and [pre-releases](#pre-releases) are rolled back per manifest. On pnpm this extends to [catalogs](#pnpm-catalogs).
 
 ## Update strategy
 
@@ -228,7 +250,9 @@ Note the boundary follows npm's caret rules, so it is not always the major. `^1.
 
 ### Exact pins are never rewritten
 
-A direct dependency declared at an exact version — `"firebase-functions": "7.3.0"`, or the equivalent `"=7.3.0"` / `"v7.3.0"` — is left exactly as it is. The update pass reads the manifest first, and every pinned name is excluded from the command it runs (`pnpm update --latest "!firebase-functions"`; on npm, dropped from the `@latest` target list).
+A direct dependency declared at an exact version — `"firebase-functions": "7.3.0"`, or the equivalent `"=7.3.0"` / `"v7.3.0"` — is left exactly as it is. The update pass reads every manifest first, and every pinned name is excluded from the command it runs (`pnpm update --latest "!firebase-functions"`; on npm, dropped from the `@latest` target list).
+
+In a workspace this covers **every** manifest the pass will touch, not just the root: a pin in `packages/app/package.json` is protected exactly as a pin at the root is, and on pnpm so is a pinned [catalog entry](#pnpm-catalogs).
 
 A pin is a decision, and the manifest doesn't record why it was made — a broken release, an unmigrated API, a native build that only links against one version. None of that is visible to a dependency tool, so the only safe reading of an exact version is that someone meant it.
 
@@ -244,7 +268,7 @@ The run reports what it held:
 
 ```
    ⚠️  Pinned AND alerted — the update pass cannot fix these; raise the pin by hand:
-         firebase-functions pinned at 7.3.0 (dependencies)
+         firebase-functions pinned at 7.3.0 in functions/package.json (dependencies)
 ```
 
 ### Pre-releases
@@ -289,9 +313,45 @@ The agent reads this list and re-supplies it to pnpm as exclusion patterns whene
 
 Two more things worth knowing. It lives in **`pnpm-workspace.yaml`**, not the `pnpm` field in `package.json` — a lot of older examples still show the latter, and current pnpm reads it from the workspace file. And it is not `overrides`: `overrides` force-pins a version tree-wide (for transitive deps you don't control), whereas `ignoreDependencies` just tells the update command to leave a **direct** dependency's declared range alone. For holding a direct dep back, `ignoreDependencies` is the right tool and no override is needed.
 
+A pinned **catalog** entry works as a hold-back too — see [pnpm catalogs](#pnpm-catalogs) below.
+
 **npm** has no equivalent. `npm update` offers no per-package exclusion, and `.ncurc.json`'s `reject` list belongs to [npm-check-updates](https://www.npmjs.com/package/npm-check-updates), which this agent does not invoke. On npm, hold a package back by tightening its declared range in `package.json` — an exact pin (`"typescript": "6.0.3"`) or a tilde (`"~6.0.3"`) — which `npm update --save` respects. The agent's `latest` path on npm is already narrow: it runs `npm install <pkg>@latest` only for **alerted** direct dependencies, so a package with no open Dependabot alert is never carried across a major regardless. A pinned package that *does* have an alert is dropped from that target list too, and reported as [pinned AND alerted](#exact-pins-are-never-rewritten).
 
 Either way, an exclusion only governs the **update** pass. If the package is still vulnerable afterward, the reconciler will report it — and, for a transitive copy, still write a bounded override. Excluding a package does not suppress its alert.
+
+### pnpm catalogs
+
+A [catalog](https://pnpm.io/catalogs) lets every manifest in a workspace name one version once, in `pnpm-workspace.yaml`, and reference it from each member:
+
+```yaml
+catalog:
+  '@angular/core': ^20.1.0
+catalogs:
+  legacy:
+    rxjs: ^6.6.7
+```
+
+```jsonc
+// packages/app/package.json
+{ "dependencies": { "@angular/core": "catalog:", "rxjs": "catalog:legacy" } }
+```
+
+The agent understands both forms (`catalog:` / `catalog:default` for the default catalog, `catalog:<name>` for a named one) and resolves a reference to the range the catalog declares before reasoning about it. That matters in two places:
+
+- **Deciding whether an override can be removed.** The [orphan check](#orphaned-overrides) reads what each workspace member requires. A `catalog:` reference is not a semver range, so without resolution it reads as "might still be vulnerable" forever — the override could never age out, and the run would report `app requires catalog:` as its justification, which tells you nothing. Resolved, the member states a real range and the override ages out when the catalog entry becomes safe.
+- **Protecting a pinned version.** `pnpm update -r` rewrites catalog entries, so a catalog is a place a version can be frozen. An exact-pinned entry (`rimraf: 3.0.2`) is excluded from the update command exactly as a pinned manifest entry is, and is reported alongside the others:
+
+  ```
+     📌 Holding 1 exact pin(s) — the update pass will not rewrite them: rimraf
+  ```
+
+A reference that no catalog entry backs is treated as still-vulnerable and the override is kept, with the reason stated plainly rather than left implicit:
+
+```
+   ⚠️  app declares rimraf as "catalog:", but no catalog entry backs it — treating it as still-vulnerable and keeping the override.
+```
+
+Catalogs solve version *drift*, not vulnerabilities, so the agent reads them but never writes to them: a Dependabot alert is still answered by bumping a declared range or by writing an [override](#override-safety), both of which apply to catalog-managed packages as they do to any other. npm has no catalogs, so none of this applies there.
 
 ### No in-range fix
 
@@ -339,7 +399,7 @@ The condition is rarer than it sounds — most packages accumulate several advis
 
 npm forbids an `overrides` entry for a package you **also depend on directly** unless the override spec matches the direct dependency's declared range (or references it via the `"$name"` syntax); otherwise `npm install` fails with a *"conflicts with direct dependency"* error. The agent sidesteps this by fixing the two cases through different mechanisms:
 
-- **Direct dependencies** are fixed by the update pass above, which rewrites the declared range in `dependencies`/`devDependencies` in place. Once the package resolves to a patched version in-range, its alert closes and **no override is written** for it.
+- **Direct dependencies** are fixed by the update pass above, which rewrites the declared range in `dependencies`/`devDependencies` in place — in the root manifest and in [every workspace member](#workspace-members-and-the-update-pass). Once the package resolves to a patched version in-range, its alert closes and **no override is written** for it.
 - **Transitive dependencies** — whatever is still vulnerable after the update — are the only things that get overrides. Since they aren't direct deps, npm's spec-match rule doesn't apply.
 
 The agent does not rewrite an override to match a direct dep, and it does not use the `"$name"` self-reference form.
@@ -542,7 +602,7 @@ A `PackageManager` interface encapsulates every PM-specific operation (update co
 - Override specs are bounded at the first breaking version above the patch, per npm's caret rules (`>=4.17.21 <5`, `>=0.7.0 <0.8`, `>=0.0.5 <0.0.6`) — compatible with both npm and pnpm. The bound can never exclude its own floor, so a bounded spec can't produce an `ETARGET` at install.
 - Specs that escape the installed version's compatible range are reported as [no in-range fix](#no-in-range-fix) rather than applied silently.
 - The agent trusts the **alert state** (any state except `fixed` ⇒ keep the override), not the installed version, since the installed tree already reflects applied overrides. A `dismissed` or `auto_dismissed` alert is acknowledged but still vulnerable, so it keeps the override too — only a `fixed` alert frees one to be removed.
-- Overrides are only written for packages that remain vulnerable **after** the update pass — in practice transitive deps. Direct dependencies are fixed by bumping their declared range, so the agent doesn't collide with npm's rule that an override for a direct dep must match its spec. See [Direct dependencies vs. overrides](#direct-dependencies-vs-overrides-npms-spec-match-rule).
+- Overrides are only written for packages that remain vulnerable **after** the update pass — in practice transitive deps. Direct dependencies are fixed by bumping their declared range, wherever in the workspace it is declared, so the agent doesn't collide with npm's rule that an override for a direct dep must match its spec. (Setting [`updateWorkspaceMembers`](#workspace-members-and-the-update-pass) to `false` gives that up deliberately: a member's direct dependency then gets an override like any other.) See [Direct dependencies vs. overrides](#direct-dependencies-vs-overrides-npms-spec-match-rule).
 
 ### Orphaned overrides
 
@@ -553,7 +613,7 @@ For a **published** dependent it asks the npm registry what range that dependent
 - **"Can this override be removed?"** reads **both** the range the **installed** version declares and the range the **latest published** version declares, and keeps the override if *either* could still resolve below the safe floor. The override is removed only when every dependent — at the version you have *and* at its latest — requests a safe range. This does not depend on `--update-strategy`: a dependent pinned by a parent can't move to its safe latest no matter the strategy, so trusting latest alone would drop an override that stuck copy still needs. A dependent that *can* update already shows a safe installed range once the run's update pass has moved it, so it still ages out — just from evidence rather than assumption.
 - **"Is this override forcing a dependent past its range?"** reads the range the **installed** version declares, because that's a question about the tree you actually have. A hit is reported as [no in-range fix](#no-in-range-fix), naming the dependent and version.
 
-For a **workspace-internal** dependent — a `packages/*` member with no registry entry — there's no published version to look up. Its committed `package.json` *is* its authoritative current requirement, so the agent reads the declared range straight from disk and folds it in as both the installed and latest range. Without this, an override reachable only through workspace members could never age out, even after those members raised their own ranges to safe versions. The read stays strictly conservative: a member contributes only what it explicitly declares, and workspace globs the agent can't confidently parse are skipped rather than guessed — silence never counts as "safe to remove."
+For a **workspace-internal** dependent — a `packages/*` member with no registry entry — there's no published version to look up. Its committed `package.json` *is* its authoritative current requirement, so the agent reads the declared range straight from disk — resolving a [`catalog:`](#pnpm-catalogs) reference to the range the catalog declares — and folds it in as both the installed and latest range. Without this, an override reachable only through workspace members could never age out, even after those members raised their own ranges to safe versions. The read stays strictly conservative: a member contributes only what it explicitly declares, and workspace globs the agent can't confidently parse are skipped rather than guessed — silence never counts as "safe to remove."
 
 The distinction between installed and latest matters. An override can look routine against latest and be forcing a major bump on the copy you have: if the newest release of a dependent asks for `^7.5.3` but the version installed asks for `^6.1.11`, an override at `>=7.5.16` is dragging your installed copy across a major, and only the installed range shows it. Where a published dependent's installed manifest can't be resolved from the registry, the escape check falls back to its latest range and the report says so.
 

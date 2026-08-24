@@ -21,6 +21,11 @@ export interface RunContext {
    * pre-release, so following it is not evidence anyone intended to.
    */
   allowPrerelease: boolean;
+  /**
+   * Whether the update pass may rewrite workspace members' manifests (and, on
+   * pnpm, the catalog entries they reference) rather than only the root's.
+   */
+  updateWorkspaceMembers: boolean;
 }
 
 /**
