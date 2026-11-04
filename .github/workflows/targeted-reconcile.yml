@@ -24,16 +24,25 @@ on:
         description: "Print the plan to the job summary. Writes nothing: no pull request, no issue."
         type: boolean
         default: false
+      app-client-id:
+        description: "A GitHub App's Client ID, to use the App instead of alerts-token and pr-token. Pass with app-private-key. The App needs Dependabot alerts read, and contents and pull requests write."
+        type: string
+        required: false
+        default: ""
+    # Pass an App (app-client-id and app-private-key), or both tokens. The first step checks.
     secrets:
+      app-private-key:
+        description: "The private key of the App named by app-client-id."
+        required: false
       alerts-token:
-        description: "Can read Dependabot alerts: a classic PAT with security_events, or a fine-grained token or GitHub App with Dependabot alerts: read. The built-in GITHUB_TOKEN can't."
-        required: true
+        description: "Can read Dependabot alerts: a classic PAT with security_events, or a fine-grained token with Dependabot alerts: read. The built-in GITHUB_TOKEN can't."
+        required: false
       pr-token:
         description: "Opens the pull request. Not GITHUB_TOKEN: PRs it opens don't trigger your CI. Needs contents and pull requests write."
-        required: true
+        required: false
 
 # GITHUB_TOKEN only checks out the repository and manages the issue. The pull request
-# is opened with pr-token, which carries its own permissions.
+# is opened with its own token, which carries its own permissions.
 permissions:
   contents: read
   issues: write
@@ -42,11 +51,38 @@ jobs:
   reconcile:
     runs-on: ubuntu-latest
     steps:
+      # Only whether each was passed: no value reaches this step.
+      - name: Check the credentials
+        id: credentials
+        env:
+          HAS_APP_CLIENT_ID: ${{ inputs.app-client-id != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.app-private-key != '' }}
+          HAS_ALERTS_TOKEN: ${{ secrets.alerts-token != '' }}
+          HAS_PR_TOKEN: ${{ secrets.pr-token != '' }}
+        run: |
+          fail() {
+            echo "::error title=dependabot-agent credentials::$1"
+            exit 1
+          }
+          if [ "$HAS_APP_CLIENT_ID" = "true" ] || [ "$HAS_APP_PRIVATE_KEY" = "true" ]; then
+            if [ "$HAS_ALERTS_TOKEN" = "true" ] || [ "$HAS_PR_TOKEN" = "true" ]; then
+              fail "Pass a GitHub App or tokens, not both."
+            fi
+            [ "$HAS_APP_CLIENT_ID" = "true" ] || fail "app-private-key was passed without app-client-id."
+            [ "$HAS_APP_PRIVATE_KEY" = "true" ] || fail "app-client-id was passed without app-private-key. If it's set from a secret, check that the secret reaches this workflow."
+          else
+            if [ "$HAS_ALERTS_TOKEN" != "true" ] && [ "$HAS_PR_TOKEN" != "true" ]; then
+              fail "No credentials. Pass app-client-id and app-private-key, or alerts-token and pr-token."
+            fi
+            [ "$HAS_ALERTS_TOKEN" = "true" ] || fail "pr-token was passed without alerts-token."
+            [ "$HAS_PR_TOKEN" = "true" ] || fail "alerts-token was passed without pr-token."
+          fi
+
       - name: Check out the base branch
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.base-branch }}
-          # create-pull-request pushes with pr-token, so no credential needs to stay in .git.
+          # create-pull-request pushes with its own token, so no credential needs to stay in .git.
           persist-credentials: false
 
       - name: Setup Node.js
@@ -54,20 +90,31 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
+      # The agent's code runs with this token, so it can only read alerts. The token
+      # that can write is made just before the step that uses it, and never reaches the agent.
+      - name: Create a token to read alerts
+        id: app-alerts
+        if: ${{ inputs.app-client-id != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-vulnerability-alerts: read
+
       # The agent needs no node_modules: every npm command it runs is --package-lock-only.
       # It exits 1 when the run fails, and the report is still read below, so don't stop here.
       - name: Run dependabot-agent (targeted)
         id: agent
         continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.alerts-token }}
+          GITHUB_TOKEN: ${{ steps.app-alerts.outputs.token || secrets.alerts-token }}
           AGENT_VERSION: ${{ inputs.agent-version }}
           # From the input either way, so a repository's "dryRun": true can't quietly stop a real run from opening its PR.
           DRY_RUN: ${{ inputs.dry-run }}
           AGENT_REPOSITORY: ${{ github.repository }}
           # Outside the checkout, so create-pull-request can't commit the report.
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
-          # npx runs no install scripts of the package or its dependencies while alerts-token is in the environment.
+          # npx runs no install scripts of the package or its dependencies while the alerts token is in the environment.
           NPM_CONFIG_IGNORE_SCRIPTS: "true"
           # A caller's exitCode setting would make a run with changes exit 2, which would read as failed.
           EXIT_CODE: "false"
@@ -135,13 +182,23 @@ jobs:
             echo "restore-error=$restore"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Create a token to open the pull request
+        id: app-pr
+        if: ${{ inputs.app-client-id != '' && steps.report.outputs.outcome != 'failed' && steps.report.outputs.restore-error != 'true' && !inputs.dry-run }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
       # Runs for clean and blocked-only too: with no diff, create-pull-request closes
       # a stale PR from an earlier run instead of leaving it open.
       - name: Open or update the pull request
         if: ${{ steps.report.outputs.outcome != 'failed' && steps.report.outputs.restore-error != 'true' && !inputs.dry-run }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.pr-token }}
+          token: ${{ steps.app-pr.outputs.token || secrets.pr-token }}
           base: ${{ inputs.base-branch }}
           branch: dependabot-agent/targeted
           # Only the fix: nothing else in the checkout may be committed. Git's default pathspec

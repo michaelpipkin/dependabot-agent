@@ -581,12 +581,25 @@ jobs:
       pr-token: ${{ secrets.DEPENDABOT_PR_TOKEN }}
 ```
 
+To use a GitHub App instead of tokens, replace the two tokens with the App's Client ID and private key:
+
+```yaml
+    with:
+      base-branch: main
+      agent-version: "X.Y.Z"
+      app-client-id: ${{ vars.DEPENDABOT_APP_CLIENT_ID }}
+      dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+    secrets:
+      app-private-key: ${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}
+```
+
 | Input | Default | |
 |---|---|---|
 | `base-branch` | required | The branch the run starts from and the pull request targets. |
 | `agent-version` | required | The `dependabot-agent` version to run. Required so every caller pins what it trusts. |
 | `node-version` | `"24"` | Node version for the run, and so the npm that resolves the lockfile: Node 24 ships npm 11. See [Supported npm versions](#supported-npm-versions). |
 | `dry-run` | `false` | Sets `DRY_RUN`. The plan goes to the job summary and nothing is written: no pull request, no issue. This input decides on its own: a `"dryRun"` in your config file doesn't count in this workflow, so it can't stop a real run from opening its pull request. |
+| `app-client-id` | none | A GitHub App's Client ID, used with the `app-private-key` secret instead of `alerts-token` and `pr-token`. See [Credentials](#credentials). |
 
 Put `limits` in `dependabot-agent.config.json` in the repository: the workflow checks out `base-branch` and the agent reads that file.
 
@@ -600,23 +613,35 @@ Put `limits` in `dependabot-agent.config.json` in the repository: the workflow c
 | `failed` | None. | Created or updated with the failure, and the job fails. |
 | no report written | None. | Treated as `failed`: the issue and job summary say no report was produced and link to the run. This is what a config error, a crash at startup, or npx failing to fetch the package looks like. |
 
-Every outcome writes the report to the job summary (the full one, when the pull request text was cut). If the report records that restoring the files failed, no pull request is created. The pull request commits only `package.json` and `package-lock.json` files, never anything else in the checkout. Closing a stale pull request on a run with no changes is how `create-pull-request` is meant to behave, but it has not been confirmed end to end yet.
+Every outcome writes the report to the job summary (the full one, when the pull request text was cut). If the report records that restoring the files failed, no pull request is created. The pull request commits only `package.json` and `package-lock.json` files, never anything else in the checkout.
+#### Credentials
 
-**Two tokens, and why not `GITHUB_TOKEN`**
+The built-in `GITHUB_TOKEN` can't do either job this workflow needs a credential for. It can't read Dependabot alerts, under any `permissions:` setting. And a pull request it creates doesn't trigger `pull_request` workflows, so your CI would never run on it, and this mode relies on CI for all build and test verification.
 
-- **`alerts-token`** reads the Dependabot alerts. The built-in `GITHUB_TOKEN` can't, under any `permissions:` setting. Use a classic personal access token with `security_events`, or a fine-grained token or GitHub App with **Dependabot alerts: read**. It is given to the agent step only.
-- **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. It must not be `GITHUB_TOKEN`, for two reasons:
-  1. A pull request created with `GITHUB_TOKEN` does not trigger `pull_request` workflows, so your CI would never run on it. This mode relies on CI for all build and test verification.
-  2. A pull request's author can't approve it. If the token belongs to a person, that person can't be a reviewer. Use a **GitHub App** or a **service account** that no reviewer is signed in as. The tool doesn't prefer one: pick whichever your organisation already approves. One credential can serve both inputs if it holds both sets of permissions.
+Pass **a GitHub App or two tokens**. If it gets anything else, the workflow's first step fails the job with a message saying what's missing, before anything else runs, so no report or issue is written.
+
+**A GitHub App** suits a team, since it doesn't belong to a person. A pull request's author can't approve it, so a token that belongs to a person also stops that person from reviewing the agent's pull requests.
+
+1. [Create an App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) with webhooks turned off and these repository permissions: **Dependabot alerts: read**, **Contents: write**, **Pull requests: write**.
+2. Generate a private key, and install the App on the repository.
+3. Store the Client ID as a variable and the private key as a secret, then pass them as `app-client-id` and `app-private-key`, as in the example above.
+
+The workflow makes two short-lived tokens from these on each run: one that can only read alerts, for the agent step, and one that can write, made just before the pull request step. The agent's code never holds the one that can write.
+
+**Two tokens:**
+
+- **`alerts-token`** reads the Dependabot alerts. Use a classic personal access token with `security_events`, or a fine-grained token with **Dependabot alerts: read**. It is given to the agent step only.
+- **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. If it belongs to a person, that person can't approve the pull requests, so a service account no reviewer signs in as is better.
 
 The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents: read`) and to manage the blocked-alerts issue (`issues: write`).
 
 **What your organisation may need to approve**
 
 - The third-party action `peter-evans/create-pull-request`, which opens the pull request. The workflow pins it to a full commit SHA (v8.1.1).
+- `actions/create-github-app-token`, from GitHub, pinned the same way (v3.3.0). It runs only if you use a GitHub App, and is the only step given the App's private key.
 - `actions/checkout` and `actions/setup-node`, from GitHub, which it refers to by tag. If your policy requires commit SHAs for these too, copy the workflow and pin them.
 - The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin and runs with `alerts-token` in its environment. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies while the token is present. Pinning the version still matters: the agent's own code runs with the token.
-- The two tokens above.
+- The GitHub App or the two tokens above.
 
 The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.
 
@@ -662,11 +687,22 @@ The agent prints the right command for your package manager after it writes the 
 > ```
 > ❌ Error: GitHub API error 403: {"message":"Resource not accessible by integration", ...}
 > ```
-> You need a real credential — a classic PAT with `security_events` scope (or a fine-grained PAT /
-> GitHub App token with the "Dependabot alerts: read" permission) — stored as a **repository secret**
-> and passed to the agent's own steps. Other steps (checkout, opening a PR) can keep using the
-> default `GITHUB_TOKEN` — least-privilege still applies everywhere except the one operation that
-> structurally requires a PAT.
+> You need a real credential — a classic PAT with `security_events` scope, or a fine-grained PAT with
+> the "Dependabot alerts: read" permission — stored as a **repository secret** and passed to the
+> agent's own steps. Other steps (checkout, opening a PR) can keep using the default `GITHUB_TOKEN` —
+> least-privilege still applies everywhere except the one operation that structurally requires one.
+>
+> A GitHub App works too, but its tokens are short-lived, so create one in a step instead of storing
+> it. Its App needs "Dependabot alerts: read":
+> ```yaml
+> - uses: actions/create-github-app-token@v3
+>   id: app
+>   with:
+>     client-id: ${{ vars.DEPENDABOT_APP_CLIENT_ID }}
+>     private-key: ${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}
+>     permission-vulnerability-alerts: read
+> ```
+> Then pass `${{ steps.app.outputs.token }}` to the agent as `GITHUB_TOKEN`.
 
 ### Minimal example (manual trigger, commits directly)
 

@@ -50,11 +50,20 @@ const findStep = (needle: string): Step => {
 };
 const condition = (step: Step): string => String(step.if ?? "");
 
+/** The ids of the steps handed a secret's value. Asking only whether one was passed hands over a true or false. */
+const holdersOf = (secret: string): string[] =>
+  steps
+    .filter((s) => [...Object.values(s.env ?? {}), ...Object.values(s.with ?? {})].some((v) => String(v).includes(secret) && !String(v).includes("!= ''")))
+    .map((s) => s.id ?? s.name ?? "?");
+
 describe("targeted workflow: shape", () => {
-  it("is a reusable workflow with required tokens", () => {
+  it("is a reusable workflow whose credentials are optional, because a step checks that one kind was passed", () => {
     assert.ok(wf.on.workflow_call);
-    assert.equal(wf.on.workflow_call.secrets["pr-token"].required, true);
-    assert.equal(wf.on.workflow_call.secrets["alerts-token"].required, true);
+    for (const secret of ["pr-token", "alerts-token", "app-private-key"]) {
+      assert.equal(wf.on.workflow_call.secrets[secret].required, false, secret);
+    }
+    assert.equal(wf.on.workflow_call.inputs["app-client-id"].required, false);
+    assert.equal(steps[0].id, "credentials");
   });
 
   it("takes the base branch and the agent version as required inputs, so callers pin both", () => {
@@ -86,7 +95,7 @@ describe("targeted workflow: shape", () => {
 describe("targeted workflow: tokens", () => {
   it("never creates the PR with GITHUB_TOKEN", () => {
     const step = findStep("peter-evans/create-pull-request");
-    assert.equal(step.with?.token, "${{ secrets.pr-token }}");
+    assert.equal(step.with?.token, "${{ steps.app-pr.outputs.token || secrets.pr-token }}");
     assert.equal(step.with?.["body-path"]?.endsWith("report.md"), true);
     assert.ok(!text.includes("secrets.GITHUB_TOKEN"));
   });
@@ -97,8 +106,13 @@ describe("targeted workflow: tokens", () => {
   });
 
   it("gives the alerts token to the agent step and nowhere else", () => {
-    assert.equal(text.split("secrets.alerts-token").length - 1, 1);
-    assert.equal(findStep("agent").env?.GITHUB_TOKEN, "${{ secrets.alerts-token }}");
+    assert.deepEqual(holdersOf("secrets.alerts-token"), ["agent"]);
+    assert.equal(findStep("agent").env?.GITHUB_TOKEN, "${{ steps.app-alerts.outputs.token || secrets.alerts-token }}");
+  });
+
+  it("never gives the agent step a token that can write", () => {
+    const agent = JSON.stringify(findStep("agent"));
+    for (const secret of ["pr-token", "app-private-key", "app-pr"]) assert.ok(!agent.includes(secret), secret);
   });
 
   it("names the PR branch and base", () => {
@@ -120,6 +134,78 @@ const git = (cwd: string, ...args: string[]): string => {
   assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
   return result.stdout;
 };
+
+describe("targeted workflow: a GitHub App", () => {
+  const indexOf = (id: string): number => steps.findIndex((s) => s.id === id);
+
+  it("pins the token action to a full commit, with the version in a comment", () => {
+    const uses = findStep("app-alerts").uses ?? "";
+    assert.match(uses, /^actions\/create-github-app-token@[0-9a-f]{40}$/);
+    assert.equal(findStep("app-pr").uses, uses);
+    assert.match(text, /uses: actions\/create-github-app-token@[0-9a-f]{40} # v\d+\.\d+\.\d+\r?\n/);
+  });
+
+  it("makes a token for the agent that can only read alerts", () => {
+    const step = findStep("app-alerts");
+    assert.match(condition(step), /inputs\.app-client-id != ''/);
+    assert.equal(step.with?.["client-id"], "${{ inputs.app-client-id }}");
+    assert.equal(step.with?.["private-key"], "${{ secrets.app-private-key }}");
+    const permissions = Object.entries(step.with ?? {}).filter(([key]) => key.startsWith("permission-"));
+    assert.deepEqual(permissions, [["permission-vulnerability-alerts", "read"]]);
+    assert.ok(indexOf("app-alerts") < indexOf("agent"));
+  });
+
+  it("makes the token that can write only for the pull request step, and only when that step will run", () => {
+    const step = findStep("app-pr");
+    const permissions = Object.entries(step.with ?? {}).filter(([key]) => key.startsWith("permission-")).sort();
+    assert.deepEqual(permissions, [["permission-contents", "write"], ["permission-pull-requests", "write"]]);
+    assert.match(condition(step), /inputs\.app-client-id != ''/);
+    const pr = findStep("peter-evans/create-pull-request");
+    const gate = condition(pr).replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+    assert.ok(condition(step).includes(gate), `${condition(step)} should include ${gate}`);
+    assert.ok(indexOf("report") < indexOf("app-pr"));
+    assert.equal(indexOf("app-pr"), steps.indexOf(pr) - 1);
+  });
+
+  it("hands the private key to the two token steps and nowhere else", () => {
+    assert.deepEqual(holdersOf("secrets.app-private-key"), ["app-alerts", "app-pr"]);
+  });
+});
+
+describe("targeted workflow: which credentials were passed", { skip: !have("bash") && "needs bash" }, () => {
+  const check = (vars: Partial<Record<"HAS_APP_CLIENT_ID" | "HAS_APP_PRIVATE_KEY" | "HAS_ALERTS_TOKEN" | "HAS_PR_TOKEN", boolean>>) => {
+    const names = ["HAS_APP_CLIENT_ID", "HAS_APP_PRIVATE_KEY", "HAS_ALERTS_TOKEN", "HAS_PR_TOKEN"] as const;
+    const exports = names.map((name) => `export ${name}=${vars[name] === true}`).join("; ");
+    const run = spawnSync("bash", ["-c", `${exports}\n${findStep("credentials").run}`], { encoding: "utf-8" });
+    return { status: run.status, out: `${run.stdout}${run.stderr}` };
+  };
+  const APP = { HAS_APP_CLIENT_ID: true, HAS_APP_PRIVATE_KEY: true };
+  const TOKENS = { HAS_ALERTS_TOKEN: true, HAS_PR_TOKEN: true };
+
+  it("takes step env as booleans, so no step sees a value just to check it", () => {
+    for (const value of Object.values(findStep("credentials").env ?? {})) assert.match(String(value), /!= ''/);
+  });
+
+  it("accepts an App", () => assert.equal(check(APP).status, 0));
+  it("accepts both tokens", () => assert.equal(check(TOKENS).status, 0));
+
+  const refused: Array<[string, Parameters<typeof check>[0], RegExp]> = [
+    ["nothing", {}, /app-client-id.*alerts-token/],
+    ["a client ID with no key", { HAS_APP_CLIENT_ID: true }, /app-private-key/],
+    ["a key with no client ID", { HAS_APP_PRIVATE_KEY: true }, /app-client-id/],
+    ["only the alerts token", { HAS_ALERTS_TOKEN: true }, /pr-token/],
+    ["only the PR token", { HAS_PR_TOKEN: true }, /alerts-token/],
+    ["an App and a token", { ...APP, HAS_PR_TOKEN: true }, /not both/],
+  ];
+  for (const [label, vars, message] of refused) {
+    it(`refuses ${label}`, () => {
+      const { status, out } = check(vars);
+      assert.equal(status, 1);
+      assert.match(out, /::error/);
+      assert.match(out, message);
+    });
+  }
+});
 
 describe("targeted workflow: what gets committed", { skip: !have("git") && "needs git" }, () => {
   it("stages every package file, at the root and below, and nothing else", () => {
