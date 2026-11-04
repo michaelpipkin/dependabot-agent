@@ -37,9 +37,39 @@ const SCOPE_LABEL: Record<DepScope, string> = {
   unknown: "undetermined",
 };
 
-/** A table cell: no pipes or line breaks that would split the row. */
+// Spans left exactly as written: code, and the destination of a markdown link.
+const PROTECTED = /`[^`]*`|\]\([^)\s]*\)/g;
+// An @name outside those spans. Not preceded by a word character, so a@b.com stays an email.
+const MENTION = /(?<![\w`])@\w[^\s`]*/g;
+// Punctuation that ends a sentence, not a name.
+const TRAILING = ".,;:!?)]}'\"";
+
+/**
+ * Free text made safe for a bullet or table cell. Line breaks become spaces, so text
+ * can't start a heading or a new row. A bare @name, which GitHub treats as a mention
+ * and notifies, goes in backticks, so it stays copyable and tells nobody anything.
+ */
+export function inline(text: string): string {
+  const flat = text.replace(/\r?\n|\r/g, " ");
+  const wrap = (plain: string): string =>
+    plain.replace(MENTION, (token) => {
+      let end = token.length;
+      while (end > 1 && TRAILING.includes(token[end - 1])) end--;
+      const name = token.slice(0, end);
+      return `\`${name}\`${token.slice(name.length)}`;
+    });
+  let out = "";
+  let last = 0;
+  for (const m of flat.matchAll(PROTECTED)) {
+    out += wrap(flat.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + wrap(flat.slice(last));
+}
+
+/** A table cell: safe free text, and no pipes that would split the row. */
 function cell(text: string): string {
-  return text.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
+  return inline(text).replace(/\|/g, "\\|");
 }
 
 function alertLink(alert: AlertOutcome): string {
@@ -98,7 +128,7 @@ function changeTable(alerts: AlertOutcome[], extraHeader?: string, extra?: (aler
   };
 }
 
-function summaryLine(alerts: AlertOutcome[]): string {
+function summaryLine(alerts: AlertOutcome[], planned: boolean): string {
   const count = (...statuses: string[]): number => alerts.filter((a) => statuses.includes(a.status)).length;
   const parts = [
     [count("fixed"), "fixed"],
@@ -108,7 +138,7 @@ function summaryLine(alerts: AlertOutcome[]): string {
   ] as const;
   const shown = parts.filter(([n]) => n > 0).map(([n, label]) => `**${n}** ${label}`);
   if (shown.length === 0) return "No open alerts needed attention.";
-  return `Alerts: ${shown.join(", ")}.`;
+  return `${planned ? "Alerts in the plan, not applied" : "Alerts"}: ${shown.join(", ")}.`;
 }
 
 function failureItem(failure: VerificationFailure): string {
@@ -161,18 +191,26 @@ function awaitingItems(alerts: AlertOutcome[]): string[] {
 
 function buildSections(report: RunReport): Section[] {
   const withStatus = (...statuses: string[]): AlertOutcome[] => report.alerts.filter((a) => statuses.includes(a.status));
+  const planned = report.outcome === "failed" || report.dryRun;
+  const plannedNote =
+    report.outcome === "failed"
+      ? "Planned, not applied: the run failed, so none of these changes were kept."
+      : "Planned, not applied: this is a dry run.";
   const sections: Section[] = [];
 
   sections.push({
     heading: "Failures",
-    intro: ["The run failed verification, so no changes were kept. Each line names the check that failed and where."],
+    intro: ["The run failed verification, so no changes were kept. Each line names the check that failed and where.", ""],
     items: report.failures.map(failureItem),
   });
 
   sections.push({
     heading: "Fixed",
     intro: [
-      "These alerts are resolved in the lockfile. A range bump raised a direct dependency's declared range; an override pins the copy a package pulls in indirectly.",
+      (planned
+        ? `${plannedNote} `
+        : "These alerts are resolved in the lockfile. ") +
+        "A range bump raises a direct dependency's declared range; an override pins the copy a package pulls in indirectly.",
       "",
       ...changeTable(withStatus("fixed")).intro,
     ],
@@ -187,7 +225,8 @@ function buildSections(report: RunReport): Section[] {
   sections.push({
     heading: "Partly fixed",
     intro: [
-      "The copies below were fixed. Another copy of the same package is blocked, so the alert stays open until that is resolved. The blocked copies are listed under Blocked.",
+      (planned ? `${plannedNote} The copies below would be fixed. ` : "The copies below were fixed. ") +
+        "Another copy of the same package is blocked, so the alert stays open until that is resolved. The blocked copies are listed under Blocked.",
       "",
       ...partlyTable.intro,
     ],
@@ -197,7 +236,8 @@ function buildSections(report: RunReport): Section[] {
   sections.push({
     heading: "Applied past a declared range — review these",
     intro: [
-      "Each fix below installs a version outside the range a dependent declares. npm applies it anyway, but that dependent was not written against it, so check that CI passes and that the dependent still behaves.",
+      (planned ? "Each fix below would install" : "Each fix below installs") +
+        " a version outside the range a dependent declares. npm applies it anyway, but that dependent was not written against it, so check that CI passes and that the dependent still behaves.",
       "",
     ],
     items: pastDeclaredItems(report.alerts),
@@ -220,7 +260,7 @@ function buildSections(report: RunReport): Section[] {
 
   sections.push({
     heading: "Other changes",
-    intro: ["These packages moved only because a fixed package needs them.", ""],
+    intro: [`These packages ${planned ? "would move" : "moved"} only because a fixed package needs them.`, ""],
     items: report.otherChanges.map((c) => `- \`${c.path}\`: ${c.from && c.to ? arrow(c.from, c.to) : `added at ${c.to ?? "?"}`}`),
   });
 
@@ -230,7 +270,9 @@ function buildSections(report: RunReport): Section[] {
     items: report.keptOverrides.map((o) => `- \`${o.key}\`: ${o.reason}`),
   });
 
-  return sections.filter((s) => s.items.length > 0);
+  return sections
+    .filter((s) => s.items.length > 0)
+    .map((s) => ({ ...s, items: s.items.map(inline) }));
 }
 
 function headerBlock(report: RunReport): string {
@@ -241,7 +283,7 @@ function headerBlock(report: RunReport): string {
   if (report.outcome === "failed") {
     lines.push("> **The run failed.** No changes were kept.", "");
   }
-  lines.push(summaryLine(report.alerts));
+  lines.push(summaryLine(report.alerts, report.outcome === "failed" || report.dryRun));
   return lines.join("\n");
 }
 

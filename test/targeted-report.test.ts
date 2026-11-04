@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { AlertOutcome, CopyDecision } from "../src/targeted/plan.js";
-import { computeOutcome, MAX_BODY_CHARS, renderMarkdown, writeReport, type RunReport } from "../src/targeted/report.js";
+import { computeOutcome, inline, MAX_BODY_CHARS, renderMarkdown, writeReport, type RunReport } from "../src/targeted/report.js";
 
 function copy(over: Partial<CopyDecision> = {}): CopyDecision {
   return { path: "node_modules/lodash", version: "4.17.20", action: "bump", target: "4.17.21", pastDeclared: [], ...over };
@@ -277,5 +277,94 @@ describe("writeReport", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("inline", () => {
+  it("wraps a bare @name in backticks so it can't mention anyone", () => {
+    assert.equal(inline("@babel/core@7.1.0 isn't published."), "`@babel/core@7.1.0` isn't published.");
+    assert.equal(inline("see @types/node, then stop"), "see `@types/node`, then stop");
+    assert.equal(inline('the "@scope/pkg" copy.'), 'the "`@scope/pkg`" copy.');
+  });
+
+  it("doesn't double-wrap text already in a code span", () => {
+    assert.equal(inline("`@types/node` is pinned"), "`@types/node` is pinned");
+    assert.equal(inline("`@a/b` and @c/d"), "`@a/b` and `@c/d`");
+    assert.equal(inline(inline("@c/d")), "`@c/d`");
+  });
+
+  it("leaves an @ inside a word, such as an email address, alone", () => {
+    assert.equal(inline("write to a@b.com about qs@6.0.0"), "write to a@b.com about qs@6.0.0");
+  });
+
+  it("leaves a link destination alone", () => {
+    assert.equal(inline("[#1](https://example.com/@user/x)"), "[#1](https://example.com/@user/x)");
+  });
+
+  it("turns line breaks into spaces", () => {
+    assert.equal(inline("a\n## evil\r\nb"), "a ## evil b");
+  });
+
+  it("is applied to details, reasons, and table cells in the report", () => {
+    const md = renderMarkdown(
+      report({
+        outcome: "blocked-only",
+        blockedCount: 1,
+        alerts: [
+          alert({ packageName: "@types/node", copies: [copy({ version: "1.0.0", target: "1.0.1" })] }),
+          blockedAlert({
+            copies: [copy({ action: "blocked", reason: "target-unavailable", target: undefined, detail: "@babel/core@7.1.0 isn't published.\n## evil" })],
+          }),
+        ],
+        keptOverrides: [{ key: "qs@>=6.0.0 <6.7.3", reason: "needed by @nestjs/core\n# also evil" }],
+        otherChanges: [{ path: "node_modules/@scope/x\n## evil", from: "1.0.0", to: "1.1.0" }],
+        failures: [{ check: "fixed", path: "node_modules/@types/node", detail: "@types/node missing\n## evil" }],
+      }),
+    );
+    assert.ok(md.includes("| `@types/node` |"), "table cell");
+    assert.ok(md.includes("`@babel/core@7.1.0` isn't published."));
+    assert.ok(md.includes("needed by `@nestjs/core`"));
+    assert.ok(md.includes("`@types/node` missing"));
+    assert.deepEqual(headings(md), ["Failures", "Fixed", "Blocked", "Other changes", "Overrides kept"]);
+    const outsideCode = md.replace(/`[^`]*`/g, "").replace(/\]\([^)]*\)/g, "");
+    assert.doesNotMatch(outsideCode, /@\w/);
+  });
+});
+
+describe("a failed report", () => {
+  it("presents the fixed sections as planned, not applied", () => {
+    const md = renderMarkdown(
+      report({
+        outcome: "failed",
+        alerts: [
+          alert(),
+          alert({
+            number: 13,
+            status: "partly-fixed",
+            copies: [copy(), copy({ action: "blocked", reason: "pin", detail: "Pinned.", target: undefined })],
+          }),
+          alert({ number: 14, copies: [copy({ pastDeclared: [{ dependent: "old-tool", range: "^6.0.0" }] })] }),
+        ],
+        failures: [{ check: "fixed", detail: "lodash is not at 4.17.21." }],
+      }),
+    );
+    assert.doesNotMatch(md, /resolved in the lockfile/);
+    assert.doesNotMatch(md, /copies below were fixed/);
+    assert.doesNotMatch(md, /Each fix below installs/);
+    assert.doesNotMatch(md, /Alerts: /);
+    assert.equal((md.match(/Planned, not applied/g) ?? []).length, 2); // Fixed and Partly fixed
+    assert.ok(md.includes("Alerts in the plan, not applied:"));
+    assert.ok(md.includes("none of these changes were kept"));
+    assert.ok(md.includes("would install"));
+  });
+
+  it("a dry run is worded as planned too", () => {
+    const md = renderMarkdown(report({ dryRun: true }));
+    assert.doesNotMatch(md, /resolved in the lockfile/);
+    assert.match(md, /Planned, not applied/);
+  });
+
+  it("a normal run still says resolved", () => {
+    assert.match(renderMarkdown(report()), /resolved in the lockfile/);
   });
 });
