@@ -1,27 +1,43 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { Plan } from "../src/targeted/plan.js";
+import type { DirectBump, Plan } from "../src/targeted/plan.js";
 import { treeProblems, verify, type VerifyInput } from "../src/targeted/verify.js";
 import { makeLock } from "./helpers/lock.js";
 
 type Packages = Record<string, object>;
 
-function planOf(targets: Record<string, string>): Plan {
-  return { alerts: [], bumps: [], addOverrides: {}, removeOverrideKeys: [], targets: new Map(Object.entries(targets)) };
+function planOf(targets: Record<string, string>, bumps: DirectBump[] = []): Plan {
+  return { alerts: [], bumps, addOverrides: {}, removeOverrideKeys: [], targets: new Map(Object.entries(targets)) };
 }
 
-function run(before: Packages, after: Packages, targets: Record<string, string>, extra: Partial<VerifyInput> = {}) {
+function bump(
+  name: string,
+  field: DirectBump["field"],
+  target: string,
+  operator: "^" | "~" = "^",
+  memberPath: string | null = null,
+): DirectBump {
+  return { manifestDir: memberPath ?? ".", memberPath, name, field, from: "", operator, target };
+}
+
+function run(
+  before: Packages,
+  after: Packages,
+  targets: Record<string, string>,
+  extra: Partial<VerifyInput> & { bumps?: DirectBump[] } = {},
+) {
+  const { bumps, ...rest } = extra;
   return verify({
     before: makeLock(before),
     after: makeLock(after),
-    plan: planOf(targets),
+    plan: planOf(targets, bumps),
     limits: {},
     overrides: {},
     pins: [],
     changedManifests: ["package.json"],
     expectedManifests: ["package.json"],
     stable: true,
-    ...extra,
+    ...rest,
   });
 }
 
@@ -45,7 +61,8 @@ describe("verify", () => {
       "": { dependencies: { minimatch: "^10.1.2" } },
       "node_modules/minimatch": { version: "10.1.2" },
     };
-    assert.deepEqual(run(before, after, { "node_modules/minimatch": "10.1.2" }), []);
+    const bumps = [bump("minimatch", "dependencies", "10.1.2")];
+    assert.deepEqual(run(before, after, { "node_modules/minimatch": "10.1.2" }, { bumps }), []);
   });
 
   it("fails fixed when a planned copy is not at its target", () => {
@@ -298,7 +315,9 @@ describe("verify", () => {
       "": { devDependencies: { minimatch: range } },
       "node_modules/minimatch": { version: v },
     });
-    assert.deepEqual(run(lock("10.1.1", "^10.1.1"), lock("10.1.2", "^10.1.2"), { "node_modules/minimatch": "10.1.2" }), []);
+    const bumps = [bump("minimatch", "devDependencies", "10.1.2")];
+    const targets = { "node_modules/minimatch": "10.1.2" };
+    assert.deepEqual(run(lock("10.1.1", "^10.1.1"), lock("10.1.2", "^10.1.2"), targets, { bumps }), []);
   });
 
   it("fails stable when a second install changes the lockfile", () => {
@@ -319,6 +338,262 @@ describe("verify", () => {
       "node_modules/b/node_modules/qs": { version: "6.2.0" }, // blocked: not in plan.targets
     });
     assert.deepEqual(run(lock("6.5.0"), lock("6.5.3"), { "node_modules/a/node_modules/qs": "6.5.3" }), []);
+  });
+});
+
+describe("verify: review findings", () => {
+  it("1a. fails fixed when a planned copy vanishes and its dependent lands on an untouched vulnerable copy", () => {
+    const before: Packages = {
+      "": { dependencies: { a: "^1.0.0", qs: "6.5.0" } },
+      "node_modules/qs": { version: "6.5.0" },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.4.0" } },
+      "node_modules/a/node_modules/qs": { version: "6.4.0" },
+    };
+    const after: Packages = { ...before };
+    delete after["node_modules/a/node_modules/qs"];
+    const failures = run(before, after, { "node_modules/a/node_modules/qs": "6.5.3" });
+    assert.deepEqual(checks(failures), ["fixed"]);
+    assert.equal(failures[0].path, "node_modules/a/node_modules/qs");
+  });
+
+  it("1b. fails fixed when a planned copy relocates unfixed, even beside a sibling target", () => {
+    const before: Packages = {
+      "": { dependencies: { a: "^1.0.0", m: "^1.0.0" } },
+      "node_modules/m": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/m/node_modules/qs": { version: "6.0.0" },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/a/node_modules/qs": { version: "6.5.0" },
+    };
+    const after: Packages = {
+      "": { dependencies: { a: "^1.0.0", m: "^1.0.1" } },
+      "node_modules/m": { version: "1.0.1", dependencies: { qs: "^6.5.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/qs": { version: "6.5.0" },
+    };
+    const targets = { "node_modules/a/node_modules/qs": "6.5.3", "node_modules/m": "1.0.1" };
+    const failures = run(before, after, targets, { bumps: [bump("m", "dependencies", "1.0.1")] });
+    assert.ok(checks(failures).includes("fixed"));
+    assert.equal(failures.find((f) => f.check === "fixed")!.path, "node_modules/a/node_modules/qs");
+  });
+
+  it("1c. passes when a planned copy is deduped onto an untouched safe copy on its line", () => {
+    const before: Packages = {
+      "": { dependencies: { a: "^1.0.0", qs: "6.5.3" } },
+      "node_modules/qs": { version: "6.5.3" },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.4.0" } },
+      "node_modules/a/node_modules/qs": { version: "6.4.0" },
+    };
+    const after: Packages = { ...before };
+    delete after["node_modules/a/node_modules/qs"];
+    assert.deepEqual(run(before, after, { "node_modules/a/node_modules/qs": "6.5.3" }), []);
+  });
+
+  it("2a. rejects a safe copy that moved onto another copy's target version", () => {
+    const lock = (top: string, nested: string): Packages => ({
+      "": { dependencies: { express: "^4.0.0", a: "^1.0.0" } },
+      "node_modules/express": { version: "4.18.0", dependencies: { qs: "^6.9.0" } },
+      "node_modules/qs": { version: top },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.10.0" } },
+      "node_modules/a/node_modules/qs": { version: nested },
+    });
+    const targets = { "node_modules/a/node_modules/qs": "6.11.0" };
+    for (const [from, label] of [
+      ["6.9.4", "safe"],
+      ["6.12.0", "downgraded"],
+    ]) {
+      const failures = run(lock(from, "6.10.0"), lock("6.11.0", "6.11.0"), targets);
+      assert.deepEqual(checks(failures), ["nothing-else-moved"], label);
+      assert.equal(failures[0].path, "node_modules/qs", label);
+    }
+  });
+
+  it("2b. rejects a blocked copy that moved onto the target version", () => {
+    const lock = (blocked: string, planned: string): Packages => ({
+      "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/a/node_modules/qs": { version: planned },
+      "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/b/node_modules/qs": { version: blocked },
+    });
+    const failures = run(lock("6.2.0", "6.5.0"), lock("6.5.3", "6.5.3"), { "node_modules/a/node_modules/qs": "6.5.3" });
+    assert.deepEqual(checks(failures), ["nothing-else-moved"]);
+    assert.equal(failures[0].path, "node_modules/b/node_modules/qs");
+  });
+
+  it("2c. does not let an untouched copy at a target version widen the closure", () => {
+    const lock = (extra: Packages, n: string): Packages => ({
+      "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/a/node_modules/qs": { version: n },
+      "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+      "node_modules/b/node_modules/qs": { version: "6.5.3", dependencies: { side: "^1.0.0" } },
+      "node_modules/side": { version: "1.0.0" },
+      ...extra,
+    });
+    const stray = { "node_modules/b/node_modules/qs/node_modules/side": { version: "1.9.9" } };
+    const failures = run(lock({}, "6.5.0"), lock(stray, "6.5.3"), { "node_modules/a/node_modules/qs": "6.5.3" });
+    assert.deepEqual(checks(failures), ["nothing-else-moved"]);
+  });
+
+  it("3a. fails tree-complete when a package vanishes although its edge was already out of range", () => {
+    const before: Packages = {
+      "": { devDependencies: { "@angular/build": "^21.0.0" } },
+      "node_modules/@angular/build": { version: "21.0.0", dependencies: { picomatch: "4.0.3" } },
+      "node_modules/picomatch": { version: "4.0.4" },
+    };
+    const after: Packages = {
+      "": { devDependencies: { "@angular/build": "^21.0.0" } },
+      "node_modules/@angular/build": { version: "21.0.0", dependencies: { picomatch: "4.0.3" } },
+    };
+    for (const overrides of [{}, { "picomatch@4": ">=4.0.4" }] as Array<Record<string, string>>) {
+      const failures = run(before, after, { "node_modules/picomatch": "4.0.5" }, { overrides });
+      assert.deepEqual(checks(failures), ["tree-complete"]);
+    }
+  });
+
+  it("3b. rejects a move excused by a range the new version does not meet either", () => {
+    const lock = (y: string): Packages => ({
+      "": { dependencies: { m: "^1.0.0" } },
+      "node_modules/m": { version: y === "1.0.0" ? "1.0.0" : "1.0.1", dependencies: { y: "^2.0.0" } },
+      "node_modules/y": { version: y },
+    });
+    const failures = run(lock("1.0.0"), lock("3.0.0"), { "node_modules/m": "1.0.1" });
+    assert.ok(checks(failures).includes("nothing-else-moved"));
+    assert.equal(failures.find((f) => f.check === "nothing-else-moved")!.path, "node_modules/y");
+  });
+
+  it("4a. allows a redundant safe copy that npm pruned when the target moved onto its version", () => {
+    const before: Packages = {
+      "": { dependencies: { express: "^4.0.0", qs: "^6.5.0" } },
+      "node_modules/express": { version: "4.18.0", dependencies: { qs: "~6.5.3" } },
+      "node_modules/express/node_modules/qs": { version: "6.5.3" },
+      "node_modules/qs": { version: "6.5.0" },
+    };
+    const after: Packages = {
+      "": { dependencies: { express: "^4.0.0", qs: "^6.5.3" } },
+      "node_modules/express": { version: "4.18.0", dependencies: { qs: "~6.5.3" } },
+      "node_modules/qs": { version: "6.5.3" },
+    };
+    const bumps = [bump("qs", "dependencies", "6.5.3")];
+    assert.deepEqual(run(before, after, { "node_modules/qs": "6.5.3" }, { bumps }), []);
+  });
+
+  it("4b. still rejects a removal whose dependents resolve to a different version", () => {
+    const before: Packages = {
+      "": { dependencies: { express: "^4.0.0", qs: "^6.5.0" } },
+      "node_modules/express": { version: "4.18.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/express/node_modules/qs": { version: "6.3.0" },
+      "node_modules/qs": { version: "6.5.0" },
+    };
+    const after: Packages = {
+      "": { dependencies: { express: "^4.0.0", qs: "^6.5.3" } },
+      "node_modules/express": { version: "4.18.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/qs": { version: "6.5.3" },
+    };
+    const bumps = [bump("qs", "dependencies", "6.5.3")];
+    const failures = run(before, after, { "node_modules/qs": "6.5.3" }, { bumps });
+    assert.deepEqual(checks(failures), ["nothing-else-moved"]);
+    assert.equal(failures[0].path, "node_modules/express/node_modules/qs");
+  });
+
+  it("5a. accepts a floating range override as the explanation of an edge", () => {
+    const before: Packages = {
+      "": { dependencies: { m: "^1.0.0" } },
+      "node_modules/m": { version: "1.0.0", dependencies: { x: "1.2.3" } },
+      "node_modules/x": { version: "1.2.5" },
+    };
+    const after: Packages = {
+      ...before,
+      "node_modules/m": { version: "1.0.1", dependencies: { x: "1.2.4" } },
+    };
+    const targets = { "node_modules/m": "1.0.1" };
+    assert.deepEqual(run(before, after, targets, { overrides: { "x@1": ">=1.2.5" } }), []);
+    assert.deepEqual(checks(run(before, after, targets)), ["tree-complete"]);
+  });
+
+  it("5b. resolves a $ref override against the root's declared spec, and explains nothing when it cannot", () => {
+    const lock = makeLock({
+      "": { dependencies: { picomatch: "^4.0.4", a: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { picomatch: "4.0.3" } },
+      "node_modules/picomatch": { version: "4.0.4" },
+    });
+    assert.equal(treeProblems(lock, { picomatch: "$picomatch" }).size, 0);
+    assert.equal(treeProblems(lock, { picomatch: "$nothing" }).size, 1);
+  });
+
+  it("5c. an override selector semver cannot read explains nothing instead of throwing", () => {
+    const lock = makeLock({
+      "": { dependencies: { q: "^6.0.0" } },
+      "node_modules/q": { version: "7.0.0" },
+    });
+    assert.equal(treeProblems(lock, { "q@latest": "7.0.0" }).size, 1);
+  });
+
+  it("6a. rejects an exact pin rewritten to a range at the same resolved version", () => {
+    const lock = (spec: string, m: string): Packages => ({
+      "": { dependencies: { lodash: spec, m: "^1.0.0" } },
+      "node_modules/lodash": { version: "4.17.20" },
+      "node_modules/m": { version: m },
+    });
+    const failures = run(lock("4.17.20", "1.0.0"), lock("^4.17.20", "1.0.1"), { "node_modules/m": "1.0.1" }, {
+      pins: [{ lockPath: "", name: "lodash", version: "4.17.20" }],
+      bumps: [bump("m", "dependencies", "1.0.1")],
+    });
+    assert.deepEqual(checks(failures), ["manifests"]);
+    assert.match(failures[0].detail, /lodash/);
+  });
+
+  it("6b. rejects an unplanned root devDependency range change", () => {
+    const lock = (dev: string, m: string): Packages => ({
+      "": { devDependencies: { jest: dev }, dependencies: { m: "^1.0.0" } },
+      "node_modules/jest": { version: "29.7.0" },
+      "node_modules/m": { version: m },
+    });
+    const failures = run(lock("^29.0.0", "1.0.0"), lock("^29.7.0", "1.0.1"), { "node_modules/m": "1.0.1" });
+    assert.deepEqual(checks(failures), ["manifests"]);
+    assert.match(failures[0].detail, /jest/);
+  });
+
+  it("6c. rejects a bump written with the wrong operator, and accepts the right one on a member", () => {
+    const lock = (spec: string, v: string): Packages => ({
+      "": {},
+      "packages/a": { version: "1.0.0", dependencies: { minimatch: spec } },
+      "node_modules/minimatch": { version: v },
+    });
+    const targets = { "node_modules/minimatch": "10.1.2" };
+    const extra = {
+      bumps: [bump("minimatch", "dependencies", "10.1.2", "~", "packages/a")],
+      expectedManifests: ["packages/a/package.json"],
+      changedManifests: ["packages/a/package.json"],
+    };
+    const wrong = run(lock("~10.1.1", "10.1.1"), lock("^10.1.2", "10.1.2"), targets, extra);
+    assert.deepEqual(checks(wrong), ["manifests"]);
+    assert.equal(wrong[0].path, "packages/a/package.json");
+    assert.deepEqual(run(lock("~10.1.1", "10.1.1"), lock("~10.1.2", "10.1.2"), targets, extra), []);
+  });
+
+  it("6d. rejects a temporary entry left in the root dependencies", () => {
+    const lock = (deps: Record<string, string>, m: string): Packages => ({
+      "": { dependencies: deps },
+      "node_modules/jest": { version: "29.7.0" },
+      "node_modules/m": { version: m },
+    });
+    const failures = run(lock({ m: "^1.0.0" }, "1.0.0"), lock({ m: "^1.0.0", jest: "^29.0.0" }, "1.0.1"), {
+      "node_modules/m": "1.0.1",
+    });
+    assert.deepEqual(checks(failures), ["manifests"]);
+  });
+
+  it("7. does not fail a pin that resolves in neither lockfile", () => {
+    const lock = (v: string): Packages => ({
+      "": { peerDependencies: { ghost: "1.0.0" }, dependencies: { m: "^1.0.0" } },
+      "node_modules/m": { version: v },
+    });
+    const failures = run(lock("1.0.0"), lock("1.0.1"), { "node_modules/m": "1.0.1" }, {
+      pins: [{ lockPath: "", name: "ghost", version: "1.0.0" }],
+      bumps: [bump("m", "dependencies", "1.0.1")],
+    });
+    assert.deepEqual(failures, []);
   });
 });
 
