@@ -82,6 +82,27 @@ function buildNpmPackageJsonSource(filePath: string): OverrideSource {
   };
 }
 
+/**
+ * A root package.json's overrides for reading only, split the same way: the
+ * targeted strategy reconciles the flat keys but must also see the nested ones,
+ * since a nested override a person wrote blocks the package it names.
+ */
+export function readNpmOverrides(dir: string): { flat: Record<string, string>; nested: Record<string, unknown> } {
+  const filePath = path.join(dir, "package.json");
+  if (!fs.existsSync(filePath)) {
+    exitWithError(`No package.json found at ${filePath}`);
+  }
+  const raw = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
+
+  const flat: Record<string, string> = {};
+  const nested: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries((raw.overrides ?? {}) as Record<string, unknown>)) {
+    if (typeof value === "string") flat[key] = value;
+    else nested[key] = value;
+  }
+  return { flat, nested };
+}
+
 // ---------------------------------------------------------------------------
 // pnpm — pnpm-workspace.yaml or pnpm.overrides in package.json
 // ---------------------------------------------------------------------------
