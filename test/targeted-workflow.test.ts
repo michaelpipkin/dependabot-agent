@@ -532,7 +532,11 @@ function runStep(step: Step, box: Sandbox, env: Record<string, string>): { statu
 const reportJson = (extra: Record<string, unknown>): string =>
   JSON.stringify({ outcome: "changes", dryRun: false, blockedCount: 0, alerts: [], ...extra });
 
-describe("targeted workflow: making the read token", { skip: !(canRun && have("openssl") && have("curl")) && "needs bash, jq, openssl and curl" }, () => {
+// Not on Windows: the job only ever runs on ubuntu-latest, and the key reaches openssl
+// through bash's process substitution, a path a native Windows openssl can't open.
+const canMint = canRun && have("openssl") && have("curl") && process.platform !== "win32";
+
+describe("targeted workflow: making the read token", { skip: !canMint && "needs Linux or macOS, with bash, jq, openssl and curl" }, () => {
   const toBash = (p: string): string => p.replace(/\\/g, "/");
   const CLIENT_ID = "Iv23liTEST";
   const { publicKey, privateKey } = generateKeyPairSync("rsa", {
