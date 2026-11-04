@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { generateKeyPairSync, verify } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -31,15 +32,20 @@ interface Input {
   default?: unknown;
   type?: string;
 }
+interface Job {
+  needs?: string;
+  if?: string;
+  permissions: Record<string, string>;
+  steps: Step[];
+}
 interface Workflow {
   on: { workflow_call: { inputs: Record<string, Input>; secrets: Record<string, { required?: boolean }> } };
-  permissions: Record<string, string>;
-  jobs: Record<string, { steps: Step[] }>;
+  jobs: { plan: Job; publish: Job };
 }
 
 const text = readFileSync(WORKFLOW, "utf-8");
 const wf = yaml.load(text) as Workflow;
-const steps = Object.values(wf.jobs)[0].steps;
+const steps = [...wf.jobs.plan.steps, ...wf.jobs.publish.steps];
 
 const have = (tool: string): boolean => spawnSync("bash", ["-c", `command -v ${tool}`]).status === 0;
 
@@ -51,14 +57,13 @@ const findStep = (needle: string): Step => {
 const condition = (step: Step): string => String(step.if ?? "");
 
 /**
- * The ids of the steps that mention a value anywhere, run scripts included. A whole
- * expression asking only whether a secret was passed hands over true or false, so it
- * doesn't count, but anything more in that expression does.
+ * A step as text, run scripts included. A whole expression asking only whether a secret
+ * was passed hands over true or false, so it's left out, but anything more in it stays.
  */
-const holdersOf = (value: string): string[] =>
-  steps
-    .filter((s) => JSON.stringify(s).replace(/\$\{\{ secrets\.[a-z-]+ != '' \}\}/g, "").includes(value))
-    .map((s) => s.id ?? s.name ?? "?");
+const withoutPresenceChecks = (value: unknown): string => JSON.stringify(value).replace(/\$\{\{ secrets\.[a-z-]+ != '' \}\}/g, "");
+
+/** The ids of the steps that mention a value anywhere. */
+const holdersOf = (value: string): string[] => steps.filter((s) => withoutPresenceChecks(s).includes(value)).map((s) => s.id ?? s.name ?? "?");
 
 describe("targeted workflow: shape", () => {
   it("is a reusable workflow whose credentials are optional, because a step checks that one kind was passed", () => {
@@ -80,13 +85,18 @@ describe("targeted workflow: shape", () => {
   });
 
   it("asks for only the permissions it uses", () => {
-    // The PR is opened with pr-token, so GITHUB_TOKEN only checks out and manages the issue.
-    assert.deepEqual(wf.permissions, { contents: "read", issues: "write" });
+    // The PR is opened with its own token, so GITHUB_TOKEN only checks out and manages the issue.
+    assert.deepEqual(wf.jobs.plan.permissions, { contents: "read" });
+    assert.deepEqual(wf.jobs.publish.permissions, { contents: "read", issues: "write" });
   });
 
-  it("checks out the branch the PR will target", () => {
-    const checkout = findStep("actions/checkout");
-    assert.equal(checkout.with?.ref, "${{ inputs.base-branch }}");
+  it("checks out the branch the PR will target, in both jobs, and keeps no credential in .git", () => {
+    const checkouts = steps.filter((s) => s.uses?.startsWith("actions/checkout"));
+    assert.equal(checkouts.length, 2);
+    for (const checkout of checkouts) {
+      assert.equal(checkout.with?.ref, "${{ inputs.base-branch }}");
+      assert.equal(String(checkout.with?.["persist-credentials"]), "false");
+    }
   });
 
   it("never interpolates an expression into a shell script", () => {
@@ -149,23 +159,144 @@ const git = (cwd: string, ...args: string[]): string => {
   return result.stdout;
 };
 
+describe("targeted workflow: two jobs, so nothing that can write shares a machine with the agent", () => {
+  const { plan, publish } = wf.jobs;
+  const inPlan = withoutPresenceChecks(plan.steps);
+  const inPublish = withoutPresenceChecks(publish.steps);
+
+  it("runs the agent in plan, and none of its code in publish", () => {
+    assert.ok(plan.steps.some((s) => s.id === "agent"));
+    assert.ok(!/dependabot-agent@|npx|setup-node/.test(inPublish));
+  });
+
+  it("keeps every credential that can write out of plan", () => {
+    for (const value of ["secrets.pr-token", "steps.app-pr", "create-pull-request", "create-github-app-token", "github.token"]) assert.ok(!inPlan.includes(value), value);
+  });
+
+  it("gives plan's only use of the private key to a step with no post step, finished before the agent starts", () => {
+    assert.deepEqual(plan.steps.filter((s) => withoutPresenceChecks(s).includes("secrets.app-private-key")).map((s) => s.id), ["app-alerts"]);
+    const step = findStep("app-alerts");
+    assert.equal(step.uses, undefined, "an action's post step would get the key back after the agent has run");
+    assert.ok(plan.steps.indexOf(step) < plan.steps.indexOf(findStep("agent")));
+  });
+
+  it("passes no credential to any action in plan", () => {
+    for (const step of plan.steps.filter((s) => s.uses)) assert.ok(!JSON.stringify(step).includes("secrets."), step.name ?? "");
+  });
+
+  it("runs publish after plan, on a failed plan too, but not on a dry run or when plan never read a report", () => {
+    assert.equal(publish.needs, "plan");
+    assert.match(publish.if ?? "", /!cancelled\(\)/);
+    assert.match(publish.if ?? "", /!inputs\.dry-run/);
+    assert.match(publish.if ?? "", /needs\.plan\.outputs\.outcome != ''/);
+  });
+
+  it("passes on only the report and the patch", () => {
+    const upload = findStep("actions/upload-artifact");
+    const paths = String(upload.with?.path).split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
+    assert.deepEqual(paths, ["${{ runner.temp }}/agent-report/report.md", "${{ runner.temp }}/agent-report/fixes.patch"]);
+    assert.equal(upload.with?.name, findStep("actions/download-artifact").with?.name);
+    assert.equal(String(upload.with?.["retention-days"]), "1");
+  });
+
+  it("pins the actions that carry the results or a credential", () => {
+    for (const action of ["actions/upload-artifact", "actions/download-artifact", "actions/create-github-app-token"]) {
+      assert.match(findStep(action).uses ?? "", new RegExp(`^${action}@[0-9a-f]{40}$`));
+      assert.match(text, new RegExp(`uses: ${action}@[0-9a-f]{40} # v\\d+\\.\\d+\\.\\d+\\r?\\n`));
+    }
+  });
+});
+
+describe("targeted workflow: the patch between the jobs", { skip: !(have("git") && have("bash")) && "needs git and bash" }, () => {
+  const toBash = (p: string): string => p.replace(/\\/g, "/");
+  const FILES = ["package.json", "package-lock.json", "functions/package-lock.json", ".github/actions/x/package.json", "packages/a/package.json", "src/index.js", "docs/package.json.md"];
+  const PACKAGE_FILES = FILES.filter((f) => /(^|\/)package(-lock)?\.json$/.test(f)).sort();
+
+  /** A repository with FILES, and a copy of it standing in for publish's fresh checkout. */
+  const repos = (): { plan: string; publish: string; report: string; done: () => void } => {
+    const root = mkdtempSync(join(tmpdir(), "targeted-patch-"));
+    const plan = join(root, "plan");
+    const publish = join(root, "publish");
+    const report = join(root, "report");
+    mkdirSync(plan);
+    mkdirSync(report);
+    git(plan, "init", "-q");
+    git(plan, "config", "core.autocrlf", "false");
+    git(plan, "config", "user.email", "test@example.com");
+    git(plan, "config", "user.name", "test");
+    for (const file of FILES) {
+      mkdirSync(join(plan, path.dirname(file)), { recursive: true });
+      writeFileSync(join(plan, file), "before\n");
+    }
+    git(plan, "add", "--", ".");
+    git(plan, "commit", "-q", "-m", "initial");
+    git(root, "clone", "-q", "-c", "core.autocrlf=false", plan, publish);
+    return { plan, publish, report, done: () => rmSync(root, { recursive: true, force: true }) };
+  };
+  const inRepo = (step: string, cwd: string, report: string) =>
+    spawnSync("bash", ["-e", "-c", `export AGENT_REPORT_DIR='${toBash(report)}'\n${findStep(step).run}`], { cwd, encoding: "utf-8" });
+  const changed = (cwd: string): string[] => git(cwd, "diff", "--name-only").split("\n").filter(Boolean).sort();
+
+  it("carries every package file, and nothing else, to a fresh checkout", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      for (const file of FILES) writeFileSync(join(plan, file), "after\n");
+      assert.equal(inRepo("patch", plan, report).status, 0);
+      assert.equal(inRepo("apply", publish, report).status, 0);
+      assert.deepEqual(changed(publish), PACKAGE_FILES);
+      for (const file of PACKAGE_FILES) assert.equal(readFileSync(join(publish, file), "utf-8"), "after\n");
+    } finally {
+      done();
+    }
+  });
+
+  it("takes only package files from a patch that names others, as a compromised agent could write", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      writeFileSync(join(plan, "package.json"), "after\n");
+      writeFileSync(join(plan, "src/index.js"), "after\n");
+      writeFileSync(join(report, "fixes.patch"), git(plan, "diff", "--binary"));
+      assert.equal(inRepo("apply", publish, report).status, 0);
+      assert.deepEqual(changed(publish), ["package.json"]);
+    } finally {
+      done();
+    }
+  });
+
+  it("does nothing when there are no changes, so a stale PR is still closed", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      assert.equal(inRepo("patch", plan, report).status, 0);
+      assert.equal(readFileSync(join(report, "fixes.patch"), "utf-8"), "");
+      assert.equal(inRepo("apply", publish, report).status, 0);
+      assert.deepEqual(changed(publish), []);
+    } finally {
+      done();
+    }
+  });
+
+  it("fails if the patch doesn't apply, rather than opening a PR without it", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      writeFileSync(join(plan, "package.json"), "after\n");
+      assert.equal(inRepo("patch", plan, report).status, 0);
+      writeFileSync(join(publish, "package.json"), "moved on\n");
+      assert.notEqual(inRepo("apply", publish, report).status, 0);
+    } finally {
+      done();
+    }
+  });
+});
+
 describe("targeted workflow: a GitHub App", () => {
   const indexOf = (id: string): number => steps.findIndex((s) => s.id === id);
 
-  it("pins the token action to a full commit, with the version in a comment", () => {
-    const uses = findStep("app-alerts").uses ?? "";
-    assert.match(uses, /^actions\/create-github-app-token@[0-9a-f]{40}$/);
-    assert.equal(findStep("app-pr").uses, uses);
-    assert.match(text, /uses: actions\/create-github-app-token@[0-9a-f]{40} # v\d+\.\d+\.\d+\r?\n/);
-  });
-
-  it("makes a token for the agent that can only read alerts", () => {
+  it("asks for a token for the agent that can only read alerts", () => {
     const step = findStep("app-alerts");
     assert.match(condition(step), /inputs\.app-client-id != ''/);
-    assert.equal(step.with?.["client-id"], "${{ inputs.app-client-id }}");
-    assert.equal(step.with?.["private-key"], "${{ secrets.app-private-key }}");
-    const permissions = Object.entries(step.with ?? {}).filter(([key]) => key.startsWith("permission-"));
-    assert.deepEqual(permissions, [["permission-vulnerability-alerts", "read"]]);
+    assert.equal(step.env?.APP_CLIENT_ID, "${{ inputs.app-client-id }}");
+    assert.equal(step.env?.APP_PRIVATE_KEY, "${{ secrets.app-private-key }}");
+    assert.match(step.run ?? "", /permissions: \{vulnerability_alerts: "read"\}/);
     assert.ok(indexOf("app-alerts") < indexOf("agent"));
   });
 
@@ -308,21 +439,25 @@ describe("targeted workflow: the agent step", () => {
 });
 
 describe("targeted workflow: gates", () => {
-  it("skips the PR step on failure, on a restore error, and on a dry run", () => {
+  it("skips the PR step on failure and on a restore error, and its whole job on a dry run", () => {
     const gate = condition(findStep("peter-evans/create-pull-request"));
     assert.match(gate, /outputs\.outcome != 'failed'/);
     assert.match(gate, /outputs\.restore-error != 'true'/);
-    assert.match(gate, /!inputs\.dry-run/);
+    assert.equal(condition(findStep("apply")), gate);
+    assert.match(wf.jobs.publish.if ?? "", /!inputs\.dry-run/);
   });
 
   it("runs the PR step for clean and blocked-only too, so a stale PR is closed", () => {
     assert.ok(!/clean|blocked-only|changes/.test(condition(findStep("peter-evans/create-pull-request"))));
   });
 
-  it("fails the job when the outcome is failed, even after the other steps", () => {
-    const last = steps[steps.length - 1];
+  it("fails plan when the outcome is failed, after saving the results, and publish still reports it", () => {
+    const { steps: planSteps } = wf.jobs.plan;
+    const last = planSteps[planSteps.length - 1];
     assert.match(condition(last), /outputs\.outcome == 'failed'/);
     assert.match(last.run ?? "", /exit 1/);
+    assert.ok(planSteps.indexOf(findStep("actions/upload-artifact")) < planSteps.length - 1);
+    assert.equal(condition(findStep("issue")), "");
   });
 });
 
@@ -396,6 +531,88 @@ function runStep(step: Step, box: Sandbox, env: Record<string, string>): { statu
 
 const reportJson = (extra: Record<string, unknown>): string =>
   JSON.stringify({ outcome: "changes", dryRun: false, blockedCount: 0, alerts: [], ...extra });
+
+describe("targeted workflow: making the read token", { skip: !(canRun && have("openssl") && have("curl")) && "needs bash, jq, openssl and curl" }, () => {
+  const toBash = (p: string): string => p.replace(/\\/g, "/");
+  const CLIENT_ID = "Iv23liTEST";
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+
+  /** Runs the step with a stand-in curl that answers by URL, and records what it was asked. */
+  const mint = (answers: { installation: [number, string]; token: [number, string] }, key = privateKey) => {
+    const box = sandbox();
+    try {
+      const calls = toBash(join(box.dir, "curl.log"));
+      const curl = [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> '${calls}'`,
+        'case "$*" in',
+        `  *access_tokens*) printf '%s\\n%s' '${answers.token[1]}' '${answers.token[0]}' ;;`,
+        `  *) printf '%s\\n%s' '${answers.installation[1]}' '${answers.installation[0]}' ;;`,
+        "esac",
+        "",
+      ].join("\n");
+      writeFileSync(join(box.dir, "bin", "curl"), curl);
+      chmodSync(join(box.dir, "bin", "curl"), 0o755);
+      const got = runStep(findStep("app-alerts"), box, { APP_CLIENT_ID: CLIENT_ID, APP_PRIVATE_KEY: key, GITHUB_API_URL: "https://api.github.example" });
+      return { ...got, calls: existsSync(join(box.dir, "curl.log")) ? readFileSync(join(box.dir, "curl.log"), "utf-8") : "" };
+    } finally {
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  };
+  const GOOD = { installation: [200, '{"id":77}'] as [number, string], token: [201, '{"token":"ghs_made"}'] as [number, string] };
+
+  it("signs a token GitHub would accept, naming the App by its Client ID", () => {
+    const { calls, status } = mint(GOOD);
+    assert.equal(status, 0);
+    const jwt = /Authorization: Bearer (\S+)/.exec(calls)?.[1] ?? "";
+    const [header, claims, signature] = jwt.split(".");
+    const decode = (part: string): Record<string, unknown> => JSON.parse(Buffer.from(part, "base64url").toString());
+    assert.deepEqual(decode(header), { alg: "RS256", typ: "JWT" });
+    const body = decode(claims) as { iss: string; iat: number; exp: number };
+    assert.equal(body.iss, CLIENT_ID);
+    assert.ok(body.exp - body.iat <= 600, "GitHub refuses more than ten minutes");
+    assert.ok(body.iat < Date.now() / 1000 && body.exp > Date.now() / 1000);
+    assert.ok(verify("RSA-SHA256", Buffer.from(`${header}.${claims}`), publicKey, Buffer.from(signature, "base64url")));
+  });
+
+  it("asks for read access to alerts on this repository, and nothing more", () => {
+    const { calls, output } = mint(GOOD);
+    assert.match(calls, /repos\/acme\/app\/installation/);
+    assert.match(calls, /app\/installations\/77\/access_tokens/);
+    assert.ok(calls.includes('{"repositories":["app"],"permissions":{"vulnerability_alerts":"read"}}'), calls);
+    assert.equal(output.token, "ghs_made");
+  });
+
+  it("never writes the private key or the signature's input to its output", () => {
+    const { output, summary } = mint(GOOD);
+    assert.ok(!JSON.stringify(output).includes("PRIVATE KEY"));
+    assert.ok(!summary.includes("PRIVATE KEY"));
+  });
+
+  const failures: Array<[string, Partial<typeof GOOD>]> = [
+    ["the App isn't installed", { installation: [404, '{"message":"Not Found"}'] }],
+    ["GitHub refuses the key", { installation: [401, '{"message":"A JSON web token could not be decoded"}'] }],
+    ["GitHub refuses the token", { token: [422, '{"message":"The permissions requested are not granted to this installation."}'] }],
+  ];
+  for (const [label, answers] of failures) {
+    it(`fails, with no token, when ${label}`, () => {
+      const got = mint({ ...GOOD, ...answers });
+      assert.equal(got.status, 1);
+      assert.equal(got.output.token, undefined);
+    });
+  }
+
+  it("fails, with no token, on a key that can't sign", () => {
+    const got = mint(GOOD, "not a key");
+    assert.equal(got.status, 1);
+    assert.equal(got.output.token, undefined);
+    assert.equal(got.calls, "");
+  });
+});
 
 describe("targeted workflow: reading the report", { skip: !canRun && "needs bash and jq" }, () => {
   const step = findStep("report");
