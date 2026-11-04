@@ -623,7 +623,7 @@ Pass **a GitHub App or two tokens**. If it gets anything else, the workflow's fi
 **A GitHub App** suits a team, since it doesn't belong to a person. A pull request's author can't approve it, so a token that belongs to a person also stops that person from reviewing the agent's pull requests.
 
 1. [Create an App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) with webhooks turned off and these repository permissions: **Dependabot alerts: read**, **Contents: write**, **Pull requests: write**.
-2. Generate a private key, and install the App on the repository.
+2. Generate a private key, and install the App on the repository. Creating an App doesn't install it: if the token step fails with `Not Found`, the App isn't installed on this repository.
 3. Store the Client ID as a variable and the private key as a secret, then pass them as `app-client-id` and `app-private-key`, as in the example above.
 
 The workflow makes two short-lived tokens from these on each run: one that can only read alerts, for the agent step, and one that can write, made just before the pull request step. The agent's code never holds the one that can write.

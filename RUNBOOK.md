@@ -91,9 +91,11 @@ Push the result. **Expect** every alert reported as fixed to go `fixed`, every b
 | Nothing left blocked | The issue closes with "Nothing is blocked" |
 | PR merged, then run again | Outcome `clean`, no PR, no issue, and the merged branch is deleted |
 
-**3. Clean up.** Restore the fixture's files, delete its secrets and the label, and remove any write permissions you added to its token. Its fixed alerts stay in its history.
+To test a GitHub App, create one with the permissions in the README, install it on the fixture, and pass `app-client-id` and `app-private-key` in place of the tokens. **Expect** the PR's author to be the App, and CI to run on it. With no credentials, expect the first step to fail and say so.
 
-**Results, 2026-11-04, npm 11.16 locally and 11.19 on the runner:** all 46 alerts ended `fixed` once the fixes landed. Of the first run's 16 fixes, all closed about 15 seconds after a direct push; the 4 fixed through a merged PR closed about 9.5 minutes after the merge. All 30 blocked alerts stayed open until their packages were removed. Every row in the table above behaved as expected. GitHub raised a `package.json`-keyed alert for the exact pin only, not for `^` ranges. The first real run also exposed npm refetching a dependency only the replaced package used, which is why the agent now puts such entries back.
+**3. Clean up.** Restore the fixture's files, delete its secrets, variables and the label, and remove any write permissions you added to its token. Uninstall or delete a test App. Its fixed alerts stay in its history.
+
+**Results, 2026-11-04, npm 11.16 locally and 11.19 on the runner:** all 46 alerts ended `fixed` once the fixes landed. Of the first run's 16 fixes, all closed about 15 seconds after a direct push; the 4 fixed through a merged PR closed about 9.5 minutes after the merge. All 30 blocked alerts stayed open until their packages were removed. Every row in the table above behaved as expected. GitHub raised a `package.json`-keyed alert for the exact pin only, not for `^` ranges. The first real run also exposed npm refetching a dependency only the replaced package used, which is why the agent now puts such entries back. A GitHub App was tested the same day on 4 alerts: it read them, opened the PR as the App, and CI ran on it and passed.
 
 ## Regenerating the captured fixtures
 
