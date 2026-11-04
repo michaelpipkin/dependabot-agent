@@ -168,6 +168,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
 | `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory. Targeted strategy only: under `compatible` or `latest` it prints a warning and writes nothing. |
+| `--alerts-file <path>` | `ALERTS_FILE` | — | Read alerts from this JSON file instead of GitHub, with no token needed. It holds what GitHub's alerts API returns, across all states. Targeted strategy only: under `compatible` or `latest` it prints a warning and is ignored. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
 Precedence: **flags > environment variables > config file > defaults.**
@@ -627,40 +628,43 @@ Pass **a GitHub App or two tokens**. If it gets anything else, the workflow's fi
 2. Generate a private key, and install the App on the repository. Creating an App doesn't install it: if the token step fails with `Not Found`, the App isn't installed on this repository.
 3. Store the Client ID as a variable and the private key as a secret, then pass them as `app-client-id` and `app-private-key`, as in the example above.
 
-The workflow makes short-lived tokens from these: one that can only read alerts, for the agent, and, when there's a pull request to open, one that can write.
+The workflow makes short-lived tokens from these: one that can only read alerts, to fetch them, and, when there's a pull request to open, one that can write.
 
 If you add a permission to an App after installing it, the installation's owner has to accept it. Until then, creating a token fails, and the run is reported as failed.
 
 **Two tokens:**
 
-- **`alerts-token`** reads the Dependabot alerts. Use a fine-grained token limited to the repository, with **Dependabot alerts: read**. A classic personal access token with `security_events` also works, but it reaches every repository its owner can and can also dismiss alerts, so it's a worse thing for the agent's code to hold. It is given to the agent step only.
+- **`alerts-token`** reads the Dependabot alerts. Use a fine-grained token limited to the repository, with **Dependabot alerts: read**. A classic personal access token with `security_events` also works, but it reaches every repository its owner can and can also dismiss alerts. It is used only by the step that fetches the alerts.
 - **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. If it belongs to a person, that person can't approve the pull requests, so a service account no reviewer signs in as is better.
 
 **What the agent's code can reach**
 
-The workflow runs in two jobs, each on its own machine:
+A hosted runner gives steps `sudo`, so code running in a job can read the runner's memory, and that memory holds every secret the job refers to, even in an expression that only asks whether a secret was passed. So the workflow runs in three jobs, each on its own machine, and the one that runs the agent refers to no secret at all:
 
-- **`plan`** runs the agent. The write credentials are never in its steps' environments, and its `GITHUB_TOKEN` can only read the repository. Its results are a report and a patch of the package files.
+- **`alerts`** checks the credentials and fetches the alerts into a file. It runs none of the agent's code.
+- **`plan`** runs the agent, which reads that file instead of calling GitHub. It refers to no secret, and its `GITHUB_TOKEN` can only read the repository. Its results are a report and a patch of the package files.
 - **`publish`** starts from a clean checkout and runs none of the agent's code. It refuses a patch that does more than edit `package.json` and `package-lock.json` contents, or that disagrees with the report, then uses the write credential to open the pull request and its `GITHUB_TOKEN` to manage the issue.
 
-That stops a compromised agent package or dependency from reaching a later step through git hooks or the job's environment. **It isn't a complete barrier.** Assume such a package could do these, and pin a version you trust:
+So a compromised agent package or dependency can't reach your tokens or, with an App, the private key. This was tested on a hosted runner: searching the runner's memory for a test secret found it in a job that only asked whether it was passed, and not in a job of the same workflow that didn't refer to it. It relies on how GitHub delivers secrets to runners, so it's worth keeping `plan` free of them if you copy this workflow.
 
-- **Read secrets the `plan` job refers to.** A hosted runner gives steps `sudo`, so code running there can read the runner's memory, which holds every secret the job refers to. In `plan` that includes the App's private key, or `pr-token`.
+**It isn't a complete barrier.** Assume such a package could still do these, and pin a version you trust:
+
 - **Put a harmful change to package files in the pull request.** That includes adding a script or pointing the lockfile at another tarball. Pull requests from this workflow trigger your CI before anyone reviews them, so CI that runs `npm ci` with secrets available could run that code. Consider keeping secrets out of the jobs that run on them.
 - **Write to your Actions cache,** which `permissions:` doesn't limit. If your CI restores caches on other branches, it could read what was written.
+- **Read the alerts and the repository,** through the alerts file and the job's `GITHUB_TOKEN`.
 - **Post misleading text,** since the report becomes the pull request's description and the issue's body.
 
-The report and patch are kept as a workflow artifact for one day, and, like the job summary, can be read by anyone who can read the repository's Actions runs.
+The alerts, report and patch are kept as workflow artifacts for one day, and, like the job summary, can be read by anyone who can read the repository's Actions runs. **On a public repository, that means your alerts are public for that day,** including fixed and dismissed ones.
 
 The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents: read`) and to manage the blocked-alerts issue (`issues: write`).
 
 **What your organisation may need to approve**
 
 - The third-party action `peter-evans/create-pull-request`, which opens the pull request. The workflow pins it to a full commit SHA (v8.1.1).
-- `actions/create-github-app-token`, from GitHub, pinned the same way (v3.3.0). It runs only if you use a GitHub App, in the `publish` job.
-- `actions/upload-artifact` and `actions/download-artifact`, from GitHub, pinned the same way, which carry the report and patch between the jobs.
+- `actions/create-github-app-token`, from GitHub, pinned the same way (v3.3.0). It runs only if you use a GitHub App, in the `alerts` and `publish` jobs.
+- `actions/upload-artifact` and `actions/download-artifact`, from GitHub, pinned the same way, which carry the alerts, report and patch between the jobs.
 - `actions/checkout` and `actions/setup-node`, from GitHub, which it refers to by tag. If your policy requires commit SHAs for these too, copy the workflow and pin them.
-- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin and runs with `alerts-token` in its environment. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies while the token is present. Pinning the version still matters: the agent's own code runs with the token.
+- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin, in a job that holds no secrets. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies. Pinning the version still matters: see [What the agent's code can reach](#credentials).
 - The GitHub App or the two tokens above.
 
 The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.

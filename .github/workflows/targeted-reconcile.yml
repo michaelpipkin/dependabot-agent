@@ -358,7 +358,7 @@ jobs:
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           if [ "$JOB_STATUS" != "success" ]; then
             mkdir -p "$AGENT_REPORT_DIR"
-            printf '\n\n> **Publishing these results failed**, so no pull request reflects them. See the [workflow run](%s).\n' "$run_url" >> "$AGENT_REPORT_DIR/report.md"
+            printf '\n\n> **Publishing these results failed**, so any open pull request may not reflect them. See the [workflow run](%s).\n' "$run_url" >> "$AGENT_REPORT_DIR/report.md"
             OUTCOME=failed
           fi
           open=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
