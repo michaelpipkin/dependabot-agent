@@ -319,6 +319,33 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     );
   });
 
+  describe("a package npm refetches because only a replaced package used it", () => {
+    // balanced-match is used only by brace-expansion. Replacing brace-expansion made
+    // npm fetch it again at the newest ^1.0.0, which the policy doesn't allow.
+    const alerts = [alert(1, "minimatch", "<3.1.4", "3.1.4"), alert(2, "brace-expansion", "<1.1.21", "1.1.21")];
+    const MOVED = ["node_modules/brace-expansion: 1.1.11 -> 1.1.21", "node_modules/minimatch: 3.0.4 -> 3.1.4"];
+    const shapes: Array<[string, ProjectShape]> = [
+      ["reachable from the root", { root: { dependencies: { glob: "^7.1.6" } } }],
+      ["reachable only through a member", { members: { a: { dependencies: { glob: "^7.1.6" } } } }],
+    ];
+
+    for (const [label, shape] of shapes) {
+      it(`${label}: stays where it was, and the tree holds`, () => {
+        const dir = project("2020-06-01", shape);
+        const before = versions(dir);
+        assert.equal(before.get("node_modules/balanced-match"), "1.0.0");
+
+        applied(dir, planFor(dir, alerts));
+
+        const after = versions(dir);
+        assert.deepEqual(movedBetween(before, after), MOVED);
+        npm(dir, `install --package-lock-only ${QUIET}`);
+        assert.deepEqual(movedBetween(after, versions(dir)), []);
+        npm(dir, `ci ${QUIET}`);
+      });
+    }
+  });
+
   describe("must be proven, item 3: a later npm install keeps the versions", () => {
     function holds(dir: string, plan: Plan, moved: string[]): void {
       const before = versions(dir);

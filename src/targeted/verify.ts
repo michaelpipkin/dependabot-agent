@@ -148,7 +148,20 @@ function checkFixed({ before, after, plan }: VerifyInput): VerificationFailure[]
 const isSameProject = (path: string, a: LockEntry, b: LockEntry): boolean =>
   !path.includes("node_modules/") && a.name === b.name && a.link === b.link;
 
-function checkNothingElseMoved({ before, after, plan }: VerifyInput): VerificationFailure[] {
+/**
+ * The installed packages check 2 would fail for moving version: still at the same
+ * path, under the same name, with nothing the plan fixes requiring the new version.
+ */
+export function unrequiredMoves(input: Pick<VerifyInput, "before" | "after" | "plan">): string[] {
+  const moved = (path: string): boolean => {
+    const old = input.before.entries.get(path);
+    const now = input.after.entries.get(path);
+    return old?.version !== undefined && now?.version !== undefined && old.name === now.name && path.includes("node_modules/");
+  };
+  return checkNothingElseMoved(input).flatMap((failure) => (failure.path !== undefined && moved(failure.path) ? [failure.path] : []));
+}
+
+function checkNothingElseMoved({ before, after, plan }: Pick<VerifyInput, "before" | "after" | "plan">): VerificationFailure[] {
   const targetPaths = [...plan.targets.keys()];
   // name -> every version a target of that name is meant to end at
   const targetVersions = new Map<string, Set<string>>();

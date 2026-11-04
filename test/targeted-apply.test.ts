@@ -590,6 +590,70 @@ describe("applyPlan", () => {
   });
 });
 
+describe("a package npm moves beside a fix", () => {
+  const OLD = { version: "1.0.0", resolved: "https://registry.test/balanced-match-1.0.0.tgz", integrity: "sha512-old" };
+  const NEW = { version: "1.0.2", resolved: "https://registry.test/balanced-match-1.0.2.tgz", integrity: "sha512-new" };
+  type Lock = { packages: Record<string, Json> };
+  const lockOf = (project: Project): Lock => readJson(project.lockFile) as Lock;
+
+  /** minimatch's dependency on balanced-match declares `range`, and the lock holds 1.0.0. */
+  const floatProject = (range: string): Project =>
+    memberProject({
+      root: { devDependencies: { glob: "^7.1.6" } },
+      packages: {
+        "node_modules/minimatch": { version: "3.0.4", dependencies: { "balanced-match": range } },
+        "node_modules/balanced-match": OLD,
+      },
+    });
+
+  /** npm as it behaved live: replacing minimatch refetches what only it used at the newest in range. */
+  const floatingNpm = (project: Project, floats: (resolve: number) => boolean) => {
+    const commands: string[] = [];
+    let resolve = 0;
+    const run: NpmRunner = (command) => {
+      commands.push(command);
+      resolve += 1;
+      const lock = lockOf(project);
+      lock.packages["node_modules/minimatch"].version = "3.0.5";
+      if (floats(resolve)) lock.packages["node_modules/balanced-match"] = NEW;
+      writeJson(project.lockFile, lock);
+    };
+    return { run, commands };
+  };
+  const apply = (project: Project, run: NpmRunner) => applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+
+  it("is put back exactly as it was when nothing requires the move", () => {
+    const project = floatProject("^1.0.0");
+    const { run } = floatingNpm(project, (resolve) => resolve === 1);
+
+    assert.deepEqual(apply(project, run), []);
+
+    const { packages } = lockOf(project);
+    assert.deepEqual(packages["node_modules/balanced-match"], OLD);
+    assert.equal(packages["node_modules/minimatch"].version, "3.0.5");
+  });
+
+  it("stays moved when the fix's own range requires it, with no extra resolve", () => {
+    const project = floatProject("^1.0.2");
+    const { run, commands } = floatingNpm(project, (resolve) => resolve === 1);
+
+    assert.deepEqual(apply(project, run), []);
+
+    assert.deepEqual(lockOf(project).packages["node_modules/balanced-match"], NEW);
+    assert.equal(commands.length, 2);
+  });
+
+  it("fails verification if npm keeps moving it, and gives up after a few tries", () => {
+    const project = floatProject("^1.0.0");
+    const { run, commands } = floatingNpm(project, () => true);
+
+    const failures = apply(project, run);
+
+    assert.ok(failures.some((f) => f.check === "nothing-else-moved" && f.path === "node_modules/balanced-match"), JSON.stringify(failures));
+    assert.ok(commands.length <= 6, `ran ${commands.length} resolves`);
+  });
+});
+
 describe("writing overrides keeps the manifest's formatting", () => {
   /** Apply the plan with an npm that does nothing, and return the root manifest's bytes. */
   function written(text: string, plan: Plan): string {

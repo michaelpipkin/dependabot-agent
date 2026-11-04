@@ -6,7 +6,7 @@ import { readNpmOverrides } from "../override-source.js";
 import { log, sortObjectKeys } from "../util.js";
 import { copiesOf, LockIndex, memberOwnersOf, readLockfile, resolveDep } from "./lockfile.js";
 import { DirectBump, ManifestInfo, Plan } from "./plan.js";
-import { overrideRuleFor, overrideValue, verify, VerificationFailure, VerifyInput } from "./verify.js";
+import { overrideRuleFor, overrideValue, unrequiredMoves, verify, VerificationFailure, VerifyInput } from "./verify.js";
 
 export type NpmRunner = (command: string, cwd: string) => void;
 export interface Snapshot {
@@ -269,6 +269,32 @@ function resolveThroughRoot(dir: string, lock: LockIndex, targetNames: string[],
   run(resolveCommand(), dir);
 }
 
+/** How many times to put packages back: each pass can only restore what the last one's entries depended on. */
+const PUT_BACK_PASSES = 3;
+
+/**
+ * When npm replaces a package it drops what only that package used and fetches it again
+ * at the newest version its range allows, so a fix can move a package nothing requires.
+ * Put back the entry the lockfile had, and let npm confirm the tree still holds together.
+ * Whatever npm won't keep is left for verification to report.
+ */
+function putBackUnrequiredMoves(dir: string, before: LockIndex, lockTextBefore: string, plan: Plan, run: NpmRunner): void {
+  const lockFile = join(dir, "package-lock.json");
+  const original = (JSON.parse(lockTextBefore) as { packages: Record<string, unknown> }).packages;
+  for (let pass = 0; pass < PUT_BACK_PASSES; pass++) {
+    const after = readLockfile(dir);
+    const moved = unrequiredMoves({ before, after, plan });
+    if (moved.length === 0) return;
+    const lock = JSON.parse(readFileSync(lockFile, "utf-8")) as { packages: Record<string, unknown> };
+    for (const path of moved) {
+      log(`   Putting back ${path} at ${before.entries.get(path)?.version}: npm moved it to ${after.entries.get(path)?.version}, and no fix requires that.`);
+      lock.packages[path] = original[path];
+    }
+    writeFileSync(lockFile, JSON.stringify(lock, null, 2) + "\n");
+    run(resolveCommand(), dir);
+  }
+}
+
 const manifestLabel = (lockPath: string): string => (lockPath ? `${lockPath}/package.json` : "package.json");
 
 /** The text of the root's and every listed member's manifest, by the label verification uses. */
@@ -325,6 +351,7 @@ export function applyPlan(
   try {
     const commands = plan.bumps.map(bumpCommand);
     const before = readLockfile(dir);
+    const lockTextBefore = readFileSync(lockFile, "utf-8");
     const pins = pinsOf(before, opts.manifests);
     const manifestsBefore = readManifests(dir, opts.manifests);
 
@@ -336,6 +363,7 @@ export function applyPlan(
     const resolved = readLockfile(dir);
     const notMoved = namesNotMoved(before, resolved, plan);
     if (notMoved.length > 0) resolveThroughRoot(dir, resolved, notMoved, opts.manifests, run);
+    putBackUnrequiredMoves(dir, before, lockTextBefore, plan, run);
 
     const settled = readFileSync(lockFile, "utf-8");
     run(resolveCommand(), dir);

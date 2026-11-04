@@ -521,7 +521,7 @@ Things to know:
 The agent applies fixes to the lockfile only: every npm command is `--package-lock-only --ignore-scripts`, and no `node_modules` is needed. `npm ci` passing is not treated as evidence, because it has passed on trees with packages missing. Instead, the result is checked against the snapshot taken before the run:
 
 1. Every copy the plan said it would fix is at its target.
-2. Nothing else moved: every changed entry is a target copy at its target, or a package a target requires.
+2. Nothing else moved: every changed entry is a target copy at its target, or a package a target requires. When npm replaces a package it refetches what only that package used at the newest version in range; the agent puts any such entry back as it was before this check runs, and this check fails only if npm won't keep it there.
 3. Every exact pin in every manifest resolves to the same version as before.
 4. Every changed entry satisfies any matching limit.
 5. The tree is complete: every non-optional dependency resolves to an entry whose version satisfies the declared range, or the difference is explained by an override.
