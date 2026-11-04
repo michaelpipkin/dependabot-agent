@@ -626,7 +626,7 @@ The workflow doesn't set up credentials for a private npm registry. If your lock
 
 | npm | Result |
 | --- | --- |
-| 11.3, 11.6, 11.9, 11.12, 11.14, 11.16 | Every fix applies. |
+| 11.3, 11.6, 11.9, 11.12, 11.14, 11.16, 11.19 | Every fix applies. |
 | 11.0, 10.9 | Some fixes fail safely (see below). |
 
 Versions between these weren't tested. The npm that matters is the one the agent runs, which is the one the job's Node ships, and the log and the report both say which it was. The reusable workflow defaults to Node 24, whose current releases ship npm 11. A pinned older Node 24 ships an older npm.
