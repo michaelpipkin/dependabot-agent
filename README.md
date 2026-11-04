@@ -611,8 +611,10 @@ Put `limits` in `dependabot-agent.config.json` in the repository: the workflow c
 | `changes` | Created or updated, on the fixed branch `dependabot-agent/targeted`, with `report.md` as its description. | Closed if open and nothing is blocked. If some copies are still blocked, the pull request lists them, so no issue is created, and one already open is updated with the report. |
 | `blocked-only` | None. If a pull request from an earlier run is open, it is closed, because the branch no longer differs from the base. | One issue labelled `dependabot-agent-blocked` is created or updated with the report. |
 | `clean` | None, and a stale one is closed in the same way. | Closed if open. |
-| `failed` | None. | Created or updated with the failure, and the job fails. |
-| no report written | None. | Treated as `failed`: the issue and job summary say no report was produced and link to the run. This is what a config error, a crash at startup, or npx failing to fetch the package looks like. |
+| `failed` | None. | Created or updated with the failure, and the job fails. The same happens if publishing the results fails. |
+| no report written | None. | Treated as `failed`: the issue and job summary say no report was produced and link to the run. This is what a config error, a crash at startup, a hang past 45 minutes, unavailable alerts, or npx failing to fetch the package looks like. If `plan` can't start at all, such as a failed checkout, the job fails with no issue. |
+
+The workflow supports one call per run, on one base branch per repository: artifact names and the pull request branch are fixed.
 
 Every outcome writes the report to the job summary (the full one, when the pull request text was cut). If the report records that restoring the files failed, no pull request is created. The pull request commits only `package.json` and `package-lock.json` files, never anything else in the checkout.
 
@@ -650,8 +652,8 @@ So a compromised agent package or dependency can't reach your tokens or, with an
 **It isn't a complete barrier.** Assume such a package could still do these, and pin a version you trust:
 
 - **Put a harmful change to package files in the pull request.** That includes adding a script or pointing the lockfile at another tarball. Pull requests from this workflow trigger your CI before anyone reviews them, so CI that runs `npm ci` with secrets available could run that code. Consider keeping secrets out of the jobs that run on them.
-- **Write to your Actions cache,** which `permissions:` doesn't limit. If your CI restores caches on other branches, it could read what was written.
-- **Read the alerts and the repository,** through the alerts file and the job's `GITHUB_TOKEN`.
+- **Write to your Actions cache,** which `permissions:` doesn't limit. If your CI restores caches, a poisoned entry could run in it, even after you've moved to a good version. The workflow itself uses no cache for this reason.
+- **Read the alerts and the repository, and read or replace this run's artifacts,** through the alerts file, the job's `GITHUB_TOKEN` and its runtime token. So call this workflow from a workflow of its own, with no other jobs.
 - **Post misleading text,** since the report becomes the pull request's description and the issue's body.
 
 The alerts, report and patch are kept as workflow artifacts for one day, and, like the job summary, can be read by anyone who can read the repository's Actions runs. **On a public repository, that means your alerts are public for that day,** including fixed and dismissed ones.
@@ -664,7 +666,7 @@ The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents
 - `actions/create-github-app-token`, from GitHub, pinned the same way (v3.3.0). It runs only if you use a GitHub App, in the `alerts` and `publish` jobs.
 - `actions/upload-artifact` and `actions/download-artifact`, from GitHub, pinned the same way, which carry the alerts, report and patch between the jobs.
 - `actions/checkout` and `actions/setup-node`, from GitHub, which it refers to by tag. If your policy requires commit SHAs for these too, copy the workflow and pin them.
-- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin, in a job that holds no secrets. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies. Pinning the version still matters: see [What the agent's code can reach](#credentials).
+- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin, in a job that refers to no secrets. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies. Pinning the version still matters: see [What the agent's code can reach](#credentials).
 - The GitHub App or the two tokens above.
 
 The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.

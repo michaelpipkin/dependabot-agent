@@ -52,6 +52,7 @@ jobs:
     permissions: {}
     outputs:
       credentials-ok: ${{ steps.credentials.outputs.ok }}
+      alerts-artifact: ${{ steps.save-alerts.outputs.artifact-id }}
     steps:
       # Only whether each was passed: no value reaches this step's environment.
       - name: Check the credentials
@@ -102,6 +103,7 @@ jobs:
           gh api --paginate "repos/$GITHUB_REPOSITORY/dependabot/alerts?ecosystem=npm&per_page=100" | jq -s 'add // []' > "$AGENT_ALERTS_DIR/alerts.json"
 
       - name: Keep the alerts for the next job
+        id: save-alerts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependabot-agent-alerts
@@ -122,6 +124,7 @@ jobs:
       outcome: ${{ steps.report.outputs.outcome }}
       blocked-count: ${{ steps.report.outputs.blocked-count }}
       restore-error: ${{ steps.report.outputs.restore-error }}
+      results-artifact: ${{ steps.save-results.outputs.artifact-id }}
     steps:
       - name: Check out the base branch
         uses: actions/checkout@v6
@@ -129,17 +132,22 @@ jobs:
           ref: ${{ inputs.base-branch }}
           persist-credentials: false
 
+      # package-manager-cache: on by default for a repository that declares npm as its package
+      # manager, and it could carry a compromised run's code into later runs.
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
 
+      # Not on a failed alerts job: a re-run could otherwise find an earlier attempt's alerts.
       - name: Fetch the alerts
         id: fetch-alerts
+        if: ${{ needs.alerts.result == 'success' }}
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dependabot-agent-alerts
+          artifact-ids: ${{ needs.alerts.outputs.alerts-artifact }}
           path: ${{ runner.temp }}/agent-alerts
 
       # The agent needs no node_modules: every npm command it runs is --package-lock-only.
@@ -148,6 +156,8 @@ jobs:
         id: agent
         if: ${{ steps.fetch-alerts.outcome == 'success' }}
         continue-on-error: true
+        # Shorter than the job's, so a hang still reaches the report step and the issue.
+        timeout-minutes: 45
         env:
           AGENT_VERSION: ${{ inputs.agent-version }}
           # From the input either way, so a repository's "dryRun": true can't quietly stop a real run from opening its PR.
@@ -195,7 +205,7 @@ jobs:
             rm -f "$dir/report-full.md"
             why="**The run failed and no report was produced.** The agent may have stopped before it started, or npx could not fetch it."
             if [ "$AGENT_STEP_OUTCOME" = "skipped" ]; then
-              why="**The Dependabot alerts could not be fetched, so the agent didn't run.** Check that the credentials are still valid and, for a GitHub App, that it's installed on this repository."
+              why="**The Dependabot alerts weren't available, so the agent didn't run.** Check that the credentials are still valid and, for a GitHub App, that it's installed on this repository. If this is a re-run of failed jobs more than a day later, the saved alerts have expired: re-run all jobs."
             fi
             cat > "$dir/report.md" << EOF
           # Targeted dependency fixes
@@ -236,6 +246,7 @@ jobs:
         run: git diff --binary -- ':(glob)**/package.json' ':(glob)**/package-lock.json' > "$AGENT_REPORT_DIR/fixes.patch"
 
       - name: Keep the results for the next job
+        id: save-results
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependabot-agent-results
@@ -279,7 +290,7 @@ jobs:
       - name: Fetch the results of the plan
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dependabot-agent-results
+          artifact-ids: ${{ needs.plan.outputs.results-artifact }}
           path: ${{ runner.temp }}/agent-report
 
       # The patch came from the job that ran the agent, so it's checked before it's trusted:
@@ -306,8 +317,14 @@ jobs:
             fail "The patch does more than edit file contents."
           fi
           git apply --include='package.json' --include='package-lock.json' --include='*/package.json' --include='*/package-lock.json' "$patch"
-          if git diff --quiet; then
-            fail "The patch changed no package file."
+          # Judged by what it did, too: a patch can leave out the headers that describe it.
+          status=$(git status --porcelain --ignored)
+          [ -n "$status" ] || fail "The patch changed no package file."
+          if grep -qvE '^ M (.*/)?package(-lock)?\.json$' <<< "$status"; then
+            fail "The patch does more than edit file contents."
+          fi
+          if git diff --raw | grep -qvE '^:100644 100644 '; then
+            fail "The patch does more than edit file contents."
           fi
 
       - name: Create a token to open the pull request

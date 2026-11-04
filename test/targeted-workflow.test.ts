@@ -171,8 +171,9 @@ describe("targeted workflow: three jobs, so the agent's job holds no secret", ()
   // A job's secrets are in its runner's memory, and hosted runners give steps sudo, so even
   // asking whether a secret was passed would put it there. Nothing is exempt from this.
   it("refers to no secret anywhere in plan, not even to ask whether one was passed", () => {
-    assert.ok(!JSON.stringify(plan).includes("secrets."));
-    assert.ok(!JSON.stringify(plan).includes("github.token"));
+    // As a whole word, to catch toJSON(secrets) and secrets['x'] too.
+    assert.doesNotMatch(JSON.stringify(plan), /\bsecrets\b/);
+    assert.doesNotMatch(JSON.stringify(plan), /github\.token|github\[/);
     assert.ok(!JSON.stringify(plan).includes("create-github-app-token"));
     assert.ok(!text.includes("secrets: inherit"));
   });
@@ -189,18 +190,38 @@ describe("targeted workflow: three jobs, so the agent's job holds no secret", ()
     assert.match(plan.if ?? "", /needs\.alerts\.outputs\.credentials-ok == 'true'/);
   });
 
+  it("turns off the package cache, which could carry a compromised run's code into later runs", () => {
+    assert.equal(String(inJob(plan, "actions/setup-node").with?.["package-manager-cache"]), "false");
+    assert.ok(!steps.some((s) => s.uses?.startsWith("actions/cache")));
+  });
+
+  it("bounds the agent step inside the job, so a hang still reaches the report", () => {
+    const { steps: planSteps } = plan as unknown as { steps: Array<Step & { "timeout-minutes"?: number }> };
+    const agent = planSteps.find((s) => s.id === "agent");
+    assert.equal(agent?.["timeout-minutes"], 45);
+  });
+
+  it("reads each artifact by the id the job before it saved, so not an earlier attempt's", () => {
+    assert.equal(inJob(plan, "actions/download-artifact").with?.["artifact-ids"], "${{ needs.alerts.outputs.alerts-artifact }}");
+    assert.equal(inJob(publish, "actions/download-artifact").with?.["artifact-ids"], "${{ needs.plan.outputs.results-artifact }}");
+    assert.equal(inJob(alerts, "actions/upload-artifact").id, "save-alerts");
+    assert.equal(inJob(plan, "actions/upload-artifact").id, "save-results");
+    assert.ok(text.includes("alerts-artifact: ${{ steps.save-alerts.outputs.artifact-id }}"));
+    assert.ok(text.includes("results-artifact: ${{ steps.save-results.outputs.artifact-id }}"));
+  });
+
   it("runs the agent only with alerts to read, and reports it otherwise", () => {
     const fetch = findStep("fetch-alerts");
     assert.equal(fetch["continue-on-error"], true);
+    assert.equal(condition(fetch), "${{ needs.alerts.result == 'success' }}");
     assert.equal(condition(findStep("agent")), "${{ steps.fetch-alerts.outcome == 'success' }}");
     assert.equal(condition(findStep("report")), "");
     assert.match(findStep("agent").run ?? "", /--alerts-file "\$AGENT_ALERTS_FILE"/);
   });
 
-  it("carries the alerts from alerts to plan, under one name and path", () => {
+  it("carries the alerts from alerts to plan", () => {
     const up = inJob(alerts, "actions/upload-artifact");
     const down = inJob(plan, "actions/download-artifact");
-    assert.equal(up.with?.name, down.with?.name);
     assert.equal(up.with?.path, "${{ runner.temp }}/agent-alerts/alerts.json");
     assert.equal(down.with?.path, "${{ runner.temp }}/agent-alerts");
     assert.equal(findStep("agent").env?.AGENT_ALERTS_FILE, "${{ runner.temp }}/agent-alerts/alerts.json");
@@ -218,7 +239,6 @@ describe("targeted workflow: three jobs, so the agent's job holds no secret", ()
     const up = inJob(plan, "actions/upload-artifact");
     const paths = String(up.with?.path).split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
     assert.deepEqual(paths, ["${{ runner.temp }}/agent-report/report.md", "${{ runner.temp }}/agent-report/fixes.patch"]);
-    assert.equal(up.with?.name, inJob(publish, "actions/download-artifact").with?.name);
     assert.equal(String(up.with?.["retention-days"]), "1");
   });
 
@@ -342,6 +362,43 @@ describe("targeted workflow: the patch between the jobs", { skip: !(have("git") 
     ["a mode change", "diff --git a/package.json b/package.json\nold mode 100644\nnew mode 100755\n"],
     ["a symlink", "diff --git a/package.json b/package.json\ndeleted file mode 100644\n--- a/package.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-before\ndiff --git a/package.json b/package.json\nnew file mode 120000\n--- /dev/null\n+++ b/package.json\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n"],
   ];
+  // No git header to give it away: only the result shows what these did.
+  const headerless: Array<[string, string]> = [
+    ["a new package file", "--- /dev/null\n+++ b/scripts/package.json\n@@ -0,0 +1 @@\n+after\n--- a/package.json\n+++ b/package.json\n@@ -1 +1 @@\n-before\n+after\n"],
+    ["a deleted lockfile", "--- a/package-lock.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-before\n--- a/package.json\n+++ b/package.json\n@@ -1 +1 @@\n-before\n+after\n"],
+  ];
+  for (const [label, patch] of headerless) {
+    it(`refuses ${label} in a patch with no git headers`, () => {
+      const { publish, report, done } = repos();
+      try {
+        writeFileSync(join(report, "fixes.patch"), patch);
+        const got = inRepo("apply", publish, report);
+        assert.equal(got.status, 1, got.stdout + got.stderr);
+        assert.match(got.stdout, /more than edit/);
+      } finally {
+        done();
+      }
+    });
+  }
+
+  it("refuses an edit through a package file that's tracked as a symlink", { skip: process.platform === "win32" && "needs symlinks" }, () => {
+    const { publish, report, done } = repos();
+    try {
+      git(publish, "config", "user.email", "test@example.com");
+      git(publish, "config", "user.name", "test");
+      mkdirSync(join(publish, "linked"));
+      spawnSync("ln", ["-s", "../src/index.js", join(publish, "linked", "package.json")]);
+      git(publish, "add", "--", "linked/package.json");
+      git(publish, "commit", "-q", "-m", "a link");
+      writeFileSync(join(report, "fixes.patch"), "--- a/linked/package.json\n+++ b/linked/package.json\n@@ -1 +1 @@\n-../src/index.js\n\\ No newline at end of file\n+/etc/passwd\n\\ No newline at end of file\n");
+      const got = inRepo("apply", publish, report);
+      assert.equal(got.status, 1, got.stdout + got.stderr);
+      assert.match(got.stdout, /more than edit/);
+    } finally {
+      done();
+    }
+  });
+
   for (const [label, patch] of crafted) {
     it(`refuses ${label}, leaving the checkout as it was`, () => {
       const { publish, report, done } = repos();
@@ -646,6 +703,10 @@ describe("targeted workflow: fetching the alerts", { skip: !canRun && "needs bas
   it("fails when GitHub refuses, rather than passing on an empty list", () => {
     assert.notEqual(fetchWith(`echo 'HTTP 403' >&2; exit 1`).status, 0);
   });
+
+  it("fails when a later page does, rather than passing on part of the list", () => {
+    assert.notEqual(fetchWith(`printf '[{"number":1}]\\n'; echo 'HTTP 502' >&2; exit 1`).status, 0);
+  });
 });
 
 describe("targeted workflow: reading the report", { skip: !canRun && "needs bash and jq" }, () => {
@@ -713,7 +774,7 @@ describe("targeted workflow: reading the report", { skip: !canRun && "needs bash
     try {
       const got = read(box, "skipped");
       assert.equal(got.output.outcome, "failed");
-      assert.match(got.report, /alerts could not be fetched/);
+      assert.match(got.report, /alerts weren't available/);
       assert.match(got.report, /https:\/\/github\.example\/acme\/app\/actions\/runs\/42/);
     } finally {
       rmSync(box.dir, { recursive: true, force: true });
