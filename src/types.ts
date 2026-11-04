@@ -17,6 +17,8 @@ export interface DependabotAlert {
      */
     scope?: "development" | "runtime" | null;
   };
+  /** Link to the alert on GitHub. Used by the targeted-mode report. */
+  html_url?: string;
   security_advisory: {
     summary: string;
     severity: "low" | "medium" | "high" | "critical";
@@ -220,4 +222,4 @@ export interface DeploymentRecommendation {
 // ---------------------------------------------------------------------------
 
 export type PackageManagerId = "pnpm" | "npm";
-export type UpdateStrategy = "compatible" | "latest";
+export type UpdateStrategy = "compatible" | "latest" | "targeted";

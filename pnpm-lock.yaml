@@ -169,6 +169,9 @@ importers:
       js-yaml:
         specifier: ^4.1.0
         version: 4.2.0
+      semver:
+        specifier: ^7.8.6
+        version: 7.8.6
     devDependencies:
       '@types/js-yaml':
         specifier: ^4.0.9
@@ -176,6 +179,9 @@ importers:
       '@types/node':
         specifier: ^26.0.0
         version: 26.0.0
+      '@types/semver':
+        specifier: ^7.8.0
+        version: 7.8.0
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -188,11 +194,19 @@ packages:
   '@types/node@26.0.0':
     resolution: {integrity: sha512-vf2YFi1iY9lHGwNJMs01biZFbKJkrZR1T6/MlzjhJLPdntOHLhTrDSnSVcdtvjihi4VQNlrFRIxLsDBlQpAipA==}
 
+  '@types/semver@7.8.0':
+    resolution: {integrity: sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ==}
+
   argparse@2.0.1:
     resolution: {integrity: sha512-8+9WqebbFzpX9OR+Wa6O29asIogeRMzcGtAINdpMHHyAg10f05aSFVBbcEqGf/PXw1EjAZ+q2/bEBg3DvurK3Q==}
 
   js-yaml@4.2.0:
     resolution: {integrity: sha512-ePWsvanv0DWuDRsW8dnt+R4jQ31SCRCQ7hhNcPXZPsoBZiemuZNYGf7adZdqX2D86j6rvKp3RpCxVTSb8WQlOw==}
+    hasBin: true
+
+  semver@7.8.6:
+    resolution: {integrity: sha512-9lpSSU4Mly3mrtruwLs1eLK6+gzbzqeBFwRNjIjE+9LuDpWdYctrQlQ3ej1Ilgi7gknpsTRnPoLP8DpCHqHIJw==}
+    engines: {node: '>=10'}
     hasBin: true
 
   typescript@6.0.3:
@@ -211,11 +225,15 @@ snapshots:
     dependencies:
       undici-types: 8.3.0
 
+  '@types/semver@7.8.0': {}
+
   argparse@2.0.1: {}
 
   js-yaml@4.2.0:
     dependencies:
       argparse: 2.0.1
+
+  semver@7.8.6: {}
 
   typescript@6.0.3: {}
 

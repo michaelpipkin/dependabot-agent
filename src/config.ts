@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import semver from "semver";
 import { CliArgs } from "./cli.js";
 import { loadEnvFile } from "./env-file.js";
 import { PackageManagerId, UpdateStrategy } from "./types.js";
@@ -20,6 +21,8 @@ export interface ResolvedConfig {
   discoverPackages: boolean; // auto-discover isolated sub-packages (own lockfile)
   packages: string[]; // extra manifest dirs to always process (relative to root)
   updateWorkspaceMembers: boolean; // let the update pass rewrite workspace members' manifests
+  limits: Record<string, string>; // targeted mode: package-name glob → semver range it must stay within
+  reportDir?: string; // write a run report here (flag/env only)
 }
 
 interface ConfigFile {
@@ -34,6 +37,7 @@ interface ConfigFile {
   discoverPackages?: boolean;
   packages?: string[];
   updateWorkspaceMembers?: boolean;
+  limits?: Record<string, string>;
   token?: string; // not allowed — warned and ignored
 }
 
@@ -155,6 +159,27 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   // that wants members' versions moved by hand only.
   const updateWorkspaceMembers = config.updateWorkspaceMembers ?? true;
 
+  // Targeted-mode version ceilings (config-file only). Validated up front so a
+  // typo fails the run immediately instead of silently limiting nothing.
+  const limits = config.limits ?? {};
+  for (const [pattern, range] of Object.entries(limits)) {
+    if (typeof range !== "string" || semver.validRange(range) === null) {
+      exitWithError(`Invalid "limits" entry for "${pattern}": "${String(range)}" is not a valid semver range.`);
+    }
+  }
+
+  const reportDir = args.reportDir || env.REPORT_DIR || undefined;
+
+  if (Object.keys(limits).length > 0 && updateStrategy !== "targeted") {
+    warn(`"limits" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
+  }
+  if (updateStrategy === "targeted" && skipUpdate) {
+    warn(`"skipUpdate" has no effect with --update-strategy targeted (it never runs the bulk update).`);
+  }
+  if (updateStrategy === "targeted" && allowPrerelease) {
+    warn(`"allowPrerelease" has no effect with --update-strategy targeted.`);
+  }
+
   // Validate required fields with friendly, actionable messages.
   if (!token) {
     exitWithError("GitHub token is required. Pass --token or set GITHUB_TOKEN.");
@@ -180,6 +205,8 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     discoverPackages,
     packages,
     updateWorkspaceMembers,
+    limits,
+    reportDir,
   };
 }
 
@@ -193,8 +220,8 @@ function parsePmEnv(value: string | undefined): PackageManagerId | undefined {
 
 function parseStrategyEnv(value: string | undefined): UpdateStrategy | undefined {
   if (value === undefined) return undefined;
-  if (value !== "compatible" && value !== "latest") {
-    exitWithError(`Invalid UPDATE_STRATEGY: "${value}" (expected "compatible" or "latest")`);
+  if (value !== "compatible" && value !== "latest" && value !== "targeted") {
+    exitWithError(`Invalid UPDATE_STRATEGY: "${value}" (expected "compatible", "latest" or "targeted")`);
   }
   return value;
 }

@@ -11,6 +11,7 @@ export interface CliArgs {
   packageManager?: PackageManagerId;
   workspaceRoot?: string;
   updateStrategy?: UpdateStrategy;
+  reportDir?: string;
   allowPrerelease?: boolean;
   dryRun?: boolean;
   skipUpdate?: boolean;
@@ -28,9 +29,13 @@ Options:
   --repo <owner/repo>              Target repository (or env GITHUB_REPO). Required.
   --package-manager <pnpm|npm>     Override auto-detection (or env PACKAGE_MANAGER).
   --workspace-root <path>          Project root (or env WORKSPACE_ROOT). Default: cwd.
-  --update-strategy <compatible|latest>
+  --update-strategy <compatible|latest|targeted>
                                    Pre-check update mode (or env UPDATE_STRATEGY).
                                    Default: compatible (does not cross majors).
+                                   targeted: npm only; fix alerts with the smallest
+                                   change instead of updating everything.
+  --report <dir>                   Write a report of the run to this directory
+                                   (or env REPORT_DIR).
   --allow-prerelease               Let the update pass settle on a pre-release version
                                    (or ALLOW_PRERELEASE=true). Off by default: a package
                                    whose "latest" dist-tag points at an rc is otherwise
@@ -58,8 +63,8 @@ function parsePackageManager(flag: string, value: string): PackageManagerId {
 }
 
 function parseUpdateStrategy(flag: string, value: string): UpdateStrategy {
-  if (value !== "compatible" && value !== "latest") {
-    exitWithError(`Invalid value for ${flag}: "${value}" (expected "compatible" or "latest")`);
+  if (value !== "compatible" && value !== "latest" && value !== "targeted") {
+    exitWithError(`Invalid value for ${flag}: "${value}" (expected "compatible", "latest" or "targeted")`);
   }
   return value;
 }
@@ -104,6 +109,9 @@ export function parseArgs(argv: string[], version: string): CliArgs {
         break;
       case "--update-strategy":
         args.updateStrategy = parseUpdateStrategy(flag, takeValue());
+        break;
+      case "--report":
+        args.reportDir = takeValue();
         break;
       case "--config":
         args.config = takeValue();

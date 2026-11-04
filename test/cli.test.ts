@@ -34,3 +34,15 @@ describe("parseArgs — --allow-prerelease", () => {
     assert.equal(args.allowPrerelease, true);
   });
 });
+
+describe("parseArgs — --update-strategy targeted and --report", () => {
+  it("accepts the targeted strategy and --report", () => {
+    const args = parseArgs(["--update-strategy", "targeted", "--report", "out"], "0.0.0");
+    assert.equal(args.updateStrategy, "targeted");
+    assert.equal(args.reportDir, "out");
+  });
+
+  it("leaves reportDir undefined when --report is absent", () => {
+    assert.equal(parseArgs(["--dry-run"], "0.0.0").reportDir, undefined);
+  });
+});

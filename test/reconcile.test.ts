@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  baseNameOfOverrideKey,
   computeOverrideChanges,
   dependentsEscapingEveryCopy,
   findEscapingDependents,
@@ -9,6 +10,7 @@ import {
   effectiveOverrideSpecs,
   groupAlertsByManifestDir,
   highestOverrideFloor,
+  isAgentAuthoredOverride,
   judgeOrphanedOverride,
   loadBearingAlertNames,
   logMultiLineAdvisories,
@@ -1013,5 +1015,21 @@ describe("logMultiLineAdvisories reports the final override shape (idempotent-fl
     const out = capture(() => logMultiLineAdvisories([advisory], [], { "js-yaml": ">=4.1.1 <5" }));
     assert.match(out, /Forcing 4\.1\.1/);
     assert.doesNotMatch(out, /Split into per-line/);
+  });
+});
+
+describe("override key shapes — range selectors", () => {
+  it("baseNameOfOverrideKey understands range selectors", () => {
+    assert.equal(baseNameOfOverrideKey("qs@>=6.0.0 <6.7.3"), "qs");
+    assert.equal(baseNameOfOverrideKey("@babel/core@>=7.0.0 <7.1.0"), "@babel/core");
+    assert.equal(baseNameOfOverrideKey("js-yaml@3"), "js-yaml");
+    assert.equal(baseNameOfOverrideKey("@babel/core"), "@babel/core");
+  });
+
+  it("isAgentAuthoredOverride separates agent keys from hand-written pins", () => {
+    assert.equal(isAgentAuthoredOverride("qs@>=6.0.0 <6.7.3", "6.7.3"), true);
+    assert.equal(isAgentAuthoredOverride("js-yaml@3", ">=3.15.0 <4"), true);
+    assert.equal(isAgentAuthoredOverride("foo@2", "2.3.1"), false);
+    assert.equal(isAgentAuthoredOverride("foo", "2.3.1"), false);
   });
 });

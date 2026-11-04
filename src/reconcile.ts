@@ -42,7 +42,7 @@ import { exitWithError, log } from "./util.js";
 // ---------------------------------------------------------------------------
 
 /** Dependabot's per-alert scope, normalized. Absent/unrecognized → unknown. */
-function alertScope(alert: DependabotAlert): DepScope {
+export function alertScope(alert: DependabotAlert): DepScope {
   if (alert.dependency.scope === "runtime") return "production";
   if (alert.dependency.scope === "development") return "dev";
   return "unknown";
@@ -199,14 +199,28 @@ function rangeLowerMajor(range: string): number | null {
 
 /**
  * The base package name behind an override key, stripping a version-selector
- * suffix: "js-yaml@3" → "js-yaml", "@babel/core@7" → "@babel/core", "lodash" →
- * "lodash". The leading `@` of a scoped package name is never treated as a
- * selector (the suffix must start with a digit).
+ * suffix: "js-yaml@3" → "js-yaml", "@babel/core@7" → "@babel/core", "qs@>=6.0.0
+ * <6.7.3" → "qs", "lodash" → "lodash". The leading `@` of a scoped package name
+ * is never treated as a selector (the suffix must start with a digit or a range
+ * operator).
  */
 export function baseNameOfOverrideKey(key: string): string {
   const at = key.lastIndexOf("@");
-  if (at > 0 && /^\d/.test(key.slice(at + 1))) return key.slice(0, at);
+  if (at > 0 && /^[\d<>=~^]/.test(key.slice(at + 1))) return key.slice(0, at);
   return key;
+}
+
+/**
+ * Whether the agent could have written this override, as opposed to a user's
+ * hand-written pin. Two shapes are the agent's: a bounded ">=…" spec (every
+ * spec computeBoundedSpec writes), and a range-selector key like
+ * "qs@>=6.0.0 <6.7.3" (targeted mode, whose spec is a bare version). A key like
+ * `foo@2: "2.3.1"` or a flat `foo: "2.3.1"` is a pin someone chose.
+ */
+export function isAgentAuthoredOverride(key: string, spec: string): boolean {
+  if (spec.startsWith(">=")) return true;
+  const at = key.lastIndexOf("@");
+  return at > 0 && /^[<>=]/.test(key.slice(at + 1));
 }
 
 /**
@@ -473,7 +487,7 @@ export function computeOverrideChanges(
   const handledBaseNames = new Set([...handledKeys].map(baseNameOfOverrideKey));
   for (const [key, existingSpec] of Object.entries(currentOverrides)) {
     if (handledKeys.has(key)) continue; // this exact key was written or kept above
-    if (!existingSpec.startsWith(">=")) continue; // hand-written pin — never auto-removed
+    if (!isAgentAuthoredOverride(key, existingSpec)) continue; // hand-written pin — never auto-removed
 
     const base = baseNameOfOverrideKey(key);
     const superseded = handledBaseNames.has(base);

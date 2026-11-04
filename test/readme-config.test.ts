@@ -53,6 +53,7 @@ describe("README config examples", () => {
       "discoverPackages",
       "packages",
       "updateWorkspaceMembers",
+      "limits",
     ];
     const [, reference] = configBlocks();
     assert.deepEqual(Object.keys(reference), expected);

@@ -121,7 +121,8 @@ Commit this file at the workspace root. It's auto-discovered — no `--config` f
   "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages
   "packages": [],                // extra manifest dirs to always process
-  "updateWorkspaceMembers": true // let the update pass bump workspace members too
+  "updateWorkspaceMembers": true, // let the update pass bump workspace members too
+  "limits": {}
 }
 ```
 
@@ -161,11 +162,12 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--repo <owner/repo>` | `GITHUB_REPO` | — | Target repository. **Required.** |
 | `--package-manager <pnpm\|npm>` | `PACKAGE_MANAGER` | auto-detect | Override lockfile-based detection. |
 | `--workspace-root <path>` | `WORKSPACE_ROOT` | cwd | Project root. |
-| `--update-strategy <compatible\|latest>` | `UPDATE_STRATEGY` | `compatible` | See [Update strategy](#update-strategy). |
+| `--update-strategy <compatible\|latest\|targeted>` | `UPDATE_STRATEGY` | `compatible` | See [Update strategy](#update-strategy). `targeted` fixes alerts with the smallest change instead of updating everything (npm only). |
 | `--allow-prerelease` | `ALLOW_PRERELEASE=true` | `false` | Let the update pass settle on a pre-release version. See [Pre-releases](#pre-releases). |
 | `--dry-run` | `DRY_RUN=true` | `false` | Print planned changes without writing. |
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
+| `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
 Precedence: **flags > environment variables > config file > defaults.**
@@ -198,11 +200,12 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "exitCode": false,             // exit 2 when override changes are found (CI drift gate)
   "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
   "packages": [],                // extra manifest dirs to always process
-  "updateWorkspaceMembers": true // bump workspace members' manifests too (default true)
+  "updateWorkspaceMembers": true, // bump workspace members' manifests too (default true)
+  "limits": {}                   // targeted mode only: package glob -> semver range, e.g. {"@angular/*": "<22"}
 }
 ```
 
-`discoverPackages`, `packages`, and `updateWorkspaceMembers` are config-file only — they have no flag or environment variable. See [Monorepos & isolated packages](#monorepos--isolated-packages) for what each one governs; they are three different kinds of subdirectory and are easy to mix up.
+`discoverPackages`, `packages`, `updateWorkspaceMembers`, and `limits` are config-file only — they have no flag or environment variable. See [Monorepos & isolated packages](#monorepos--isolated-packages) for what each one governs; they are three different kinds of subdirectory and are easy to mix up.
 
 > **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `.env` / `GITHUB_TOKEN` / CI secrets so they don't get committed.
 
