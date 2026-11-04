@@ -469,7 +469,7 @@ function failureMessage(group: Group, failures: VerificationFailure[], state: Ru
   const more = rest.length > 0 ? ` (and ${rest.length} more)` : "";
   const detail = first.detail.split("\n")[0].replace(/\.$/, "");
   return (
-    `The targeted run failed verification in ${group.label}: ${first.check}${where}: ${detail}${more}. ` +
+    `The targeted run failed${first.check === "run" ? "" : " verification"} in ${group.label}: ${first.check}${where}: ${detail}${more}. ` +
     restoreNote(state)
   );
 }

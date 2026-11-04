@@ -378,7 +378,7 @@ describe("applyPlan", () => {
       if (command === resolveCommand() && ++calls === 2) throw new Error("npm ERR! ERESOLVE");
     };
     const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
-    assert.equal(failures[0].check, "stable");
+    assert.equal(failures[0].check, "run");
     assert.match(failures[0].detail, /ERESOLVE/);
     assert.equal(readJson(project.rootFile).devDependencies, undefined);
   });
@@ -448,7 +448,7 @@ describe("applyPlan", () => {
     };
     const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
     assert.equal(failures.length, 1);
-    assert.equal(failures[0].check, "stable");
+    assert.equal(failures[0].check, "run");
     assert.match(failures[0].detail, /EOVERRIDE/);
   });
 
@@ -465,7 +465,7 @@ describe("applyPlan", () => {
       throw Object.assign(new Error(`Command failed: ${command}\n${stderr}`), { stderr: Buffer.from(stderr) });
     };
     const [failure] = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
-    assert.equal(failure.check, "stable");
+    assert.equal(failure.check, "run");
     assert.match(failure.detail, /^Command failed: npm install /);
     assert.match(failure.detail, /npm error code EOVERRIDE/);
     assert.match(failure.detail, /Override for minimatch@\^3\.0\.4 conflicts/);
@@ -491,7 +491,7 @@ describe("applyPlan", () => {
       manifests: project.manifests,
       run,
     });
-    assert.equal(failures[0].check, "stable");
+    assert.equal(failures[0].check, "run");
     assert.deepEqual(commands, []);
   });
 
@@ -499,7 +499,7 @@ describe("applyPlan", () => {
     const project = memberProject();
     const run: NpmRunner = () => writeFileSync(project.lockFile, "{ not json");
     const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
-    assert.equal(failures[0].check, "stable");
+    assert.equal(failures[0].check, "run");
     assert.match(failures[0].detail, /parse/i);
   });
 
@@ -790,5 +790,80 @@ describe("tryRemoveOverride", () => {
     assert.equal(nested, false);
     assert.deepEqual(commands, []);
     assert.equal(readFileSync(project.rootFile, "utf-8"), rootText);
+  });
+});
+
+describe("the temporary-root step, when an override already names the owner", () => {
+  const tempSpecs = (overrides: Json, rootExtra: Json = {}): { temporary: unknown; root: Json } => {
+    const project = memberProject({ root: { overrides, ...rootExtra } });
+    const seen: Array<Json | undefined> = [];
+    const { run } = fakeNpm(project, { onResolve: (text) => seen.push((JSON.parse(text) as Json).devDependencies as Json | undefined) });
+    const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+    assert.deepEqual(failures.filter((f) => f.check === "run"), []);
+    return { temporary: seen.find((dev) => dev && "glob" in dev)?.glob, root: readJson(project.rootFile) };
+  };
+
+  it("an exact value is the temporary spec, since npm refuses (EOVERRIDE) a root entry the override disagrees with", () => {
+    assert.equal(tempSpecs({ glob: "7.1.6" }).temporary, "7.1.6");
+  });
+
+  it("a range value is the temporary spec too", () => {
+    assert.equal(tempSpecs({ glob: ">=7.1.6 <8" }).temporary, ">=7.1.6 <8");
+  });
+
+  it("a selector that catches the member's range counts", () => {
+    assert.equal(tempSpecs({ "glob@^7": "7.1.6" }).temporary, "7.1.6");
+  });
+
+  it("a selector that doesn't leaves the member's range", () => {
+    assert.equal(tempSpecs({ "glob@^8": "8.0.1" }).temporary, "^7.1.6");
+  });
+
+  it("an override for another package leaves it too", () => {
+    assert.equal(tempSpecs({ chalk: "4.1.0" }).temporary, "^7.1.6");
+  });
+
+  it("a nested override's own '.' value counts", () => {
+    assert.equal(tempSpecs({ glob: { ".": "7.1.6", "inflight": "1.0.6" } }).temporary, "7.1.6");
+  });
+
+  it("a nested override without one leaves it", () => {
+    assert.equal(tempSpecs({ glob: { inflight: "1.0.6" } }).temporary, "^7.1.6");
+  });
+
+  it("a reference to another root dependency takes that dependency's spec", () => {
+    assert.equal(tempSpecs({ glob: "$other" }, { devDependencies: { other: "7.1.7" } }).temporary, "7.1.7");
+  });
+
+  it("the overrides and devDependencies are back as they were afterwards", () => {
+    const { root } = tempSpecs({ glob: "7.1.6" });
+    assert.equal(root.devDependencies, undefined);
+    assert.deepEqual(root.overrides, { glob: "7.1.6", "minimatch@>=3.0.0 <3.0.5": "3.0.5" });
+  });
+});
+
+describe("what a failed npm step is called", () => {
+  it("npm's own error is a run failure, not an unstable lockfile", () => {
+    const project = memberProject();
+    for (const code of ["EOVERRIDE", "ERESOLVE", "E404"]) {
+      const run: NpmRunner = () => {
+        throw Object.assign(new Error("Command failed: npm install"), { stderr: `npm error code ${code}\nnpm error nope` });
+      };
+      const [failure] = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+      assert.equal(failure.check, "run", code);
+      assert.match(failure.detail, new RegExp(code));
+    }
+  });
+
+  it("a lockfile that changes on the second resolve is still called unstable", () => {
+    const project = memberProject();
+    let resolves = 0;
+    const { run: fake } = fakeNpm(project, { reachable: true });
+    const run: NpmRunner = (command, cwd) => {
+      fake(command, cwd);
+      if (command === resolveCommand() && ++resolves === 2) writeFileSync(project.lockFile, readFileSync(project.lockFile, "utf-8") + "\n");
+    };
+    const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+    assert.deepEqual(failures.map((f) => f.check), ["stable"]);
   });
 });

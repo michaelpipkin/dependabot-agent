@@ -760,3 +760,37 @@ describe("treeProblems", () => {
     assert.equal(treeProblems(lock, { "picomatch@>=3.0.0 <3.0.4": "3.0.4" }).size, 1);
   });
 });
+
+describe("a bundled copy's edges", () => {
+  const before = {
+    "": { dependencies: { npm: "8.0.0", "strip-ansi": "^6.0.0" } },
+    "node_modules/npm": { version: "8.0.0", dependencies: { "cli-table3": "^0.6.0" } },
+    "node_modules/npm/node_modules/cli-table3": { version: "0.6.0", inBundle: true, dependencies: { "ansi-regex": "5.0.0", gone: "^1.0.0" } },
+    "node_modules/strip-ansi": { version: "6.0.0", dependencies: { "ansi-regex": "^5.0.0" } },
+    "node_modules/ansi-regex": { version: "5.0.0" },
+  };
+  const after = { ...before, "node_modules/ansi-regex": { version: "5.0.1" } };
+
+  it("aren't tree problems: its package ships what it needs", () => {
+    assert.deepEqual([...treeProblems(makeLock(after), {})], []);
+  });
+
+  it("don't fail a run for moving a copy past what a bundled parent declares", () => {
+    const failures = run(before, after, { "node_modules/ansi-regex": "5.0.1" }, { overrides: { "ansi-regex@>=5.0.0 <5.0.1": "5.0.1" } });
+    assert.deepEqual(failures, []);
+  });
+
+  it("an ordinary package's edge in the same place is still one", () => {
+    const plain = {
+      ...after,
+      "node_modules/npm/node_modules/cli-table3": { version: "0.6.0", dependencies: { "ansi-regex": "5.0.0" } },
+    };
+    assert.deepEqual([...treeProblems(makeLock(plain), {})], ["node_modules/npm/node_modules/cli-table3 -> ansi-regex@5.0.0"]);
+  });
+
+  it("a bundled copy that moved is still caught", () => {
+    const moved = { ...before, "node_modules/npm/node_modules/cli-table3": { version: "0.6.1", inBundle: true } };
+    const failures = run(before, moved, {});
+    assert.ok(failures.some((f) => f.check === "nothing-else-moved" && f.path === "node_modules/npm/node_modules/cli-table3"), JSON.stringify(failures));
+  });
+});

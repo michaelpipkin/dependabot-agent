@@ -290,7 +290,8 @@ function problemsOf(lock: LockIndex, overrides: Record<string, string>): Map<str
   const problems = new Map<string, Problem>();
   const root = lock.entries.get("");
   for (const edge of edgesOf(lock)) {
-    if (edge.optional) continue;
+    // A bundled package ships what it needs in its parent's tarball, whatever the lockfile's edges say.
+    if (edge.optional || lock.entries.get(edge.from)?.inBundle) continue;
     const label = `${edge.from} -> ${edge.name}@${edge.spec}`;
     if (!edge.resolved) {
       problems.set(label, "unresolved");
@@ -315,7 +316,7 @@ export function treeProblems(lock: LockIndex, overrides: Record<string, string>)
 }
 
 /** An override's value as a version or range: `$name` takes what the root declares for it. */
-function overrideValue(value: string, root: LockEntry | undefined): string | null {
+export function overrideValue(value: string, root: LockEntry | undefined): string | null {
   if (!value.startsWith("$")) return value;
   if (!root) return null;
   const ref = value.slice(1);
@@ -333,10 +334,19 @@ function catches(spec: string, selector: string): boolean {
   }
 }
 
+/** npm applies the first override key that matches the edge, and only that one: its raw value, or null if none does. */
+export function overrideRuleFor(name: string, spec: string, overrides: Record<string, string>): string | null {
+  for (const [key, raw] of Object.entries(overrides)) {
+    if (overrideKeyName(key) !== name) continue;
+    const selector = key.length > name.length ? key.slice(name.length + 1) : "*";
+    if (catches(spec, selector)) return raw;
+  }
+  return null;
+}
+
 /**
- * npm applies the first override key that matches the edge, and only that one,
- * rewriting the edge to the key's value: an exact version, or a range that a
- * floating override like ">=1.2.5" leaves open.
+ * Whether an override accounts for this version: npm rewrites the edge to the key's
+ * value, an exact version or a range that a floating override like ">=1.2.5" leaves open.
  */
 function explainedByOverride(
   name: string,
@@ -345,15 +355,10 @@ function explainedByOverride(
   overrides: Record<string, string>,
   root: LockEntry | undefined,
 ): boolean {
-  for (const [key, raw] of Object.entries(overrides)) {
-    if (overrideKeyName(key) !== name) continue;
-    const selector = key.length > name.length ? key.slice(name.length + 1) : "*";
-    if (!catches(spec, selector)) continue;
-    const value = overrideValue(raw, root);
-    if (value === null) return false;
-    return semver.valid(value, NPM_RANGE) ? value === version : semver.satisfies(version, value, NPM_RANGE);
-  }
-  return false;
+  const raw = overrideRuleFor(name, spec, overrides);
+  const value = raw === null ? null : overrideValue(raw, root);
+  if (value === null) return false;
+  return semver.valid(value, NPM_RANGE) ? value === version : semver.satisfies(version, value, NPM_RANGE);
 }
 
 /**

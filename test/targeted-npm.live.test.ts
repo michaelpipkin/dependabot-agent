@@ -609,7 +609,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     plan.bumps[0].target = "99.99.99";
     const failures = applyPlan(dir, plan, { limits: {}, manifests: manifestsOf(dir) });
     assert.equal(failures.length, 1);
-    assert.equal(failures[0].check, "stable");
+    assert.equal(failures[0].check, "run");
     assert.match(failures[0].detail, /chalk@99\.99\.99/);
     assert.match(failures[0].detail, /npm error code ETARGET/);
     assert.doesNotMatch(failures[0].detail, /complete log/);
@@ -798,5 +798,176 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         assert.equal(text(dir, "package-lock.json"), settled);
       });
     }
+
+    describe("an alert on a lockfile discovery prunes", () => {
+      const X = ".github/actions/x";
+      const onX = (patch: Partial<DependabotAlert["dependency"]> = {}): DependabotAlert => {
+        const base = alert(1, "minimatch", ">= 3.0.0, < 3.0.5", "3.0.5");
+        return { ...base, dependency: { ...base.dependency, manifest_path: `${X}/package-lock.json`, ...patch } };
+      };
+      const withAction = (rootDeps: Record<string, string>): string => {
+        const dir = project("2021-01-01", { root: { dependencies: rootDeps } });
+        const sub = join(dir, X);
+        mkdirSync(sub, { recursive: true });
+        write(sub, { root: { name: "action", dependencies: { glob: "^7.1.6" } } });
+        npm(sub, `install --before=2021-01-01 --package-lock-only ${QUIET}`);
+        return dir;
+      };
+
+      it("is fixed in its own lockfile, with nothing vulnerable at the root", async () => {
+        const dir = withAction({ chalk: "^4.0.0" });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const rootLock = text(dir, "package-lock.json");
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [onX()] });
+
+        const got = report(reportDir);
+        assert.equal(got.outcome, "changes");
+        assert.deepEqual(got.alerts.map((a) => [a.number, a.packageName, a.status]), [[1, "minimatch", "fixed"]]);
+        assert.equal(readLockfile(join(dir, X)).entries.get("node_modules/minimatch")?.version, "3.0.5");
+        assert.equal(text(dir, "package-lock.json"), rootLock);
+      });
+
+      it("leaves a vulnerable copy at the root alone", async () => {
+        const dir = withAction({ glob: "^7.1.6" });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const rootLock = text(dir, "package-lock.json");
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [onX()] });
+
+        assert.equal(readLockfile(join(dir, X)).entries.get("node_modules/minimatch")?.version, "3.0.5");
+        assert.equal(text(dir, "package-lock.json"), rootLock);
+      });
+
+      it("with discovery off, is blocked by name and nothing moves", async () => {
+        const dir = withAction({ glob: "^7.1.6" });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const rootLock = text(dir, "package-lock.json");
+
+        await runTargeted({ ...cfg(dir, reportDir), discoverPackages: false }, { fetchAlerts: async () => [onX()] });
+
+        const got = report(reportDir);
+        assert.equal(got.outcome, "blocked-only");
+        assert.equal(got.alerts[0].copies[0].reason, "manifest-not-processed");
+        assert.ok((got.alerts[0].copies[0].detail ?? "").includes(`${X}/package-lock.json`));
+        assert.equal(text(dir, "package-lock.json"), rootLock);
+      });
+    });
+
+    describe("a bundled copy", () => {
+      const ANSI_ALERT = alert(1, "ansi-regex", ">= 5.0.0, < 5.0.1", "5.0.1");
+
+      it("blocks only itself: a run on npm@8.0.0 no longer fails on it", async () => {
+        const dir = project("2030-01-01", { root: { dependencies: { npm: "8.0.0", chalk: "^4.0.0" } } });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const before = text(dir, "package-lock.json");
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [ANSI_ALERT] });
+
+        const got = report(reportDir);
+        assert.equal(got.outcome, "blocked-only");
+        const bundled = got.alerts[0].copies.find((c) => c.path === "node_modules/npm/node_modules/cli-table3/node_modules/ansi-regex");
+        assert.equal(bundled?.reason, "bundled");
+        assert.match(bundled?.detail ?? "", /upgrad/i);
+        assert.equal(text(dir, "package-lock.json"), before);
+      });
+
+      it("doesn't stop the hoisted copy beside it from being fixed", async () => {
+        const dir = project("2021-08-01", { root: { dependencies: { npm: "7.20.0", "strip-ansi": "^6.0.0" } } });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const before = versions(dir);
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [ANSI_ALERT] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        assert.equal(got.outcome, "changes");
+        assert.equal(got.alerts[0].status, "partly-fixed");
+        assert.deepEqual(movedBetween(before, versions(dir)), ["node_modules/ansi-regex: 5.0.0 -> 5.0.1"]);
+        assert.deepEqual(json(dir, "package.json").overrides, { "ansi-regex@>=5.0.0 <5.0.1": "5.0.1" });
+      });
+    });
+
+    describe("the temporary-root step with an override on the owner", () => {
+      for (const [label, overrides] of [
+        ["an exact value", { glob: "7.1.6" }],
+        ["a range value", { glob: ">=7.1.6 <8" }],
+        ["a nested value", { glob: { ".": "7.1.6" } }],
+      ] as Array<[string, Record<string, unknown>]>) {
+        it(`${label}: moves the target, and gives the manifest back`, async () => {
+          const dir = project("2021-01-01", { root: { overrides }, members: { a: { dependencies: { glob: "^7.1.6" } } } });
+          const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+          dirs.push(reportDir);
+          const before = versions(dir);
+
+          await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+
+          const got = report(reportDir);
+          assert.deepEqual(got.failures, []);
+          assert.equal(got.outcome, "changes");
+          assert.deepEqual(movedBetween(before, versions(dir)), MOVED_ONE);
+          assert.deepEqual(json(dir, "package.json").overrides, { ...overrides, [MINIMATCH_KEY]: "3.0.5" });
+          assert.equal(json(dir, "package.json").devDependencies, undefined);
+          npm(dir, `ci ${QUIET}`);
+        });
+      }
+    });
+
+    describe("an Angular tree that lives only in a workspace member", { skip: Number(execSync("npm --version", { encoding: "utf-8" }).split(".")[0]) < 11 && "npm 10 can fail this one safely: see the README" }, () => {
+      it("moves nanoid through the temporary-root step on the npm the workflow runs", async () => {
+        const dir = project("2024-12-15", {
+          members: {
+            web: {
+              dependencies: { "@angular/core": "^19.0.0", "@angular/common": "^19.0.0", rxjs: "^7.8.0", "zone.js": "^0.15.0" },
+              devDependencies: { "@angular/build": "^19.0.0", "@angular/compiler-cli": "^19.0.0", "@angular/compiler": "^19.0.0", typescript: "~5.6.0" },
+            },
+          },
+        });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [alert(1, "nanoid", ">= 3.0.0, < 3.3.11", "3.3.11")] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        assert.equal(got.outcome, "changes");
+        assert.equal(readLockfile(dir).entries.get("node_modules/nanoid")?.version, "3.3.11");
+        assert.equal(got.npmVersion, execSync("npm --version", { encoding: "utf-8" }).trim());
+      });
+    });
+
+    describe("removing an override", () => {
+      it("a real removal: the key goes, the outcome is changes, and the next run is clean", async () => {
+        const key = MINIMATCH_KEY;
+        const closed = { ...MINIMATCH_ALERT, state: "fixed" as const };
+        const dir = project("2030-01-01", { root: { overrides: { [key]: "3.0.5" }, dependencies: { glob: "7.2.3" } } });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const before = versions(dir);
+
+        const first = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [closed] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        assert.equal(got.outcome, "changes");
+        assert.deepEqual(got.removedOverrides.map((o) => o.key), [key]);
+        assert.equal(first.overrideChanges, 1);
+        assert.equal(json(dir, "package.json").overrides, undefined);
+        assert.deepEqual(movedBetween(before, versions(dir)), [], "a removal moves no version");
+
+        const settled = text(dir, "package-lock.json");
+        const manifest = text(dir, "package.json");
+        const second = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [closed] });
+        assert.equal(report(reportDir).outcome, "clean");
+        assert.equal(second.overrideChanges, 0);
+        assert.equal(text(dir, "package-lock.json"), settled);
+        assert.equal(text(dir, "package.json"), manifest);
+      });
+    });
   });
 });

@@ -23,7 +23,8 @@ export type BlockReason =
   | "major-crossing"
   | "hand-written-override"
   | "selector-conflict"
-  | "manifest-not-processed";
+  | "manifest-not-processed"
+  | "bundled";
 export type AlertStatus = "fixed" | "partly-fixed" | "blocked" | "awaiting-close" | "not-found";
 
 export interface CopyDecision {
@@ -175,7 +176,10 @@ interface PackageContext {
   name: string;
   alerts: DependabotAlert[];
   copies: LockEntry[];
+  /** The edges an override could affect: not a bundled package's, nor one landing on a bundled copy. */
   edges: Edge[];
+  /** Every edge to this package, for reporting who a fix lands past. */
+  allEdges: Edge[];
   handWritten: string | null;
   /** The agent's own existing keys for this package whose selector is a range. */
   agentKeys: AgentKey[];
@@ -313,6 +317,30 @@ function declarationBlock(ctx: PackageContext, copy: LockEntry): Block | null {
   return null;
 }
 
+/** The package whose tarball ships a bundled copy: the nearest one up its path that isn't itself bundled. */
+function bundlerOf(lock: LockIndex, copy: LockEntry): LockEntry | undefined {
+  let path = copy.path;
+  for (;;) {
+    const at = path.lastIndexOf("/node_modules/");
+    if (at < 0) return undefined;
+    path = path.slice(0, at);
+    const entry = lock.entries.get(path);
+    if (entry && !entry.inBundle) return entry;
+  }
+}
+
+/** A bundled copy comes out of its parent's tarball, so neither a bump nor an override can reach it. */
+function bundleBlock(ctx: PackageContext, copy: LockEntry): Block | null {
+  if (!copy.inBundle) return null;
+  const bundler = bundlerOf(ctx.input.lock, copy);
+  const parent = bundler?.name || "the package that bundles it";
+  const shipped = bundler?.name ? `${bundler.name}@${bundler.version}` : "its parent package";
+  return {
+    reason: "bundled",
+    detail: `Bundled inside ${shipped}, which ships this copy in its own tarball, so npm can't move it. Fixing it needs an upgrade of ${parent}.`,
+  };
+}
+
 /** npm matches an override's name against the name a dependent declares, so a selector can't reach an alias. */
 function aliasBlock(ctx: PackageContext, copy: LockEntry): Block | null {
   if (copy.installedAs === ctx.name) return null;
@@ -324,7 +352,7 @@ function aliasBlock(ctx: PackageContext, copy: LockEntry): Block | null {
 
 /** The first row that stops `copy` taking `alert`'s patch, or null if nothing does. */
 function pairBlock(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert): Block | null {
-  const block = targetBlock(ctx, alert) ?? aliasBlock(ctx, copy) ?? declarationBlock(ctx, copy);
+  const block = targetBlock(ctx, alert) ?? bundleBlock(ctx, copy) ?? aliasBlock(ctx, copy) ?? declarationBlock(ctx, copy);
   if (block) return block;
 
   const target = patchOf(alert)!;
@@ -382,12 +410,15 @@ function edgesStayingPut(ctx: PackageContext, copy: LockEntry): Edge[] {
   return ctx.edges.filter((edge) => edge.resolved?.path === copy.path && !isBumpedEdge(ctx, edge));
 }
 
-/** Edges into `copy` that provably reject `target`. A spec with no declared range can't be judged. */
+/** Whether this edge provably rejects `target`. A spec with no declared range can't be judged. */
+function rejects(edge: Edge, target: string): boolean {
+  const declared = declaredRange(edge.spec);
+  return declared !== null && !semver.satisfies(target, declared, LOOSE);
+}
+
+/** Edges into `copy` that a bump won't rewrite and that reject `target`. */
 function edgesRejecting(ctx: PackageContext, copy: LockEntry, target: string): Edge[] {
-  return edgesStayingPut(ctx, copy).filter((edge) => {
-    const declared = declaredRange(edge.spec);
-    return declared !== null && !semver.satisfies(target, declared, LOOSE);
-  });
+  return edgesStayingPut(ctx, copy).filter((edge) => rejects(edge, target));
 }
 
 /** Step 4: raise the target until it's outside every alert that can still be taken. */
@@ -587,7 +618,7 @@ function findConflict(ctx: PackageContext, range: string, fixing: LockEntry[]): 
   // Also the spec's rule as written: the selector must exclude every copy staying
   // put, including one npm wouldn't match by its spec (a git dependency, say).
   for (const copy of copiesOf(ctx.input.lock, ctx.name)) {
-    if (copy.installedAs !== ctx.name) continue; // an alias is out of the selector's reach
+    if (copy.installedAs !== ctx.name || copy.inBundle) continue; // an alias or a bundled copy is out of the selector's reach
     if (!moving.has(copy.path) && copy.version && semver.satisfies(copy.version, range)) {
       return `${ctx.name}@${copy.version} at ${copy.path} stays put, but the override "${range}" would also catch it.`;
     }
@@ -682,7 +713,9 @@ function blocked(copy: LockEntry, block: Block): CopyDecision {
 
 function fixedDecision(ctx: PackageContext, copy: LockEntry, target: string): CopyDecision {
   const past = new Map<string, { dependent: string; range: string }>();
-  for (const edge of edgesRejecting(ctx, copy, target)) {
+  // Every edge: a bundled package can't be moved or overridden, but it's still a dependent the fix lands past.
+  for (const edge of ctx.allEdges) {
+    if (edge.resolved?.path !== copy.path || isBumpedEdge(ctx, edge) || !rejects(edge, target)) continue;
     const dependent = dependentName(ctx, edge);
     past.set(`${dependent}\0${edge.spec}`, { dependent, range: edge.spec });
   }
@@ -802,12 +835,14 @@ function planPackage(
     return outcomes;
   }
 
+  const allEdges = edgesTo(input.lock, name);
   const ctx: PackageContext = {
     input,
     name,
     alerts,
     copies,
-    edges: edgesTo(input.lock, name),
+    edges: allEdges.filter((edge) => !input.lock.entries.get(edge.from)?.inBundle && !edge.resolved?.inBundle),
+    allEdges,
     handWritten: findHandWritten(input.overrides, name),
     agentKeys: agentKeysOf(input.overrides.flat, name),
   };

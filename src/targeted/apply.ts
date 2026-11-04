@@ -6,7 +6,7 @@ import { readNpmOverrides } from "../override-source.js";
 import { log, sortObjectKeys } from "../util.js";
 import { copiesOf, LockIndex, memberOwnersOf, readLockfile, resolveDep } from "./lockfile.js";
 import { DirectBump, ManifestInfo, Plan } from "./plan.js";
-import { verify, VerificationFailure, VerifyInput } from "./verify.js";
+import { overrideRuleFor, overrideValue, verify, VerificationFailure, VerifyInput } from "./verify.js";
 
 export type NpmRunner = (command: string, cwd: string) => void;
 export interface Snapshot {
@@ -201,13 +201,16 @@ const ROOT_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", 
  * optional edges, which npm reaches the same way, though a range a member really
  * depends on is preferred over one it only peers on. Left out are a sibling member
  * (its own dependencies are looked at in turn) and anything the root already declares,
- * since a root entry wins.
+ * since a root entry wins. An override matching an entry supplies its spec instead: npm
+ * refuses (EOVERRIDE) a root dependency that an override contradicts, on any shape of
+ * value, and is content with one that says the same.
  */
 function temporaryRootEntries(
   lock: LockIndex,
   memberPaths: string[],
   targetNames: string[],
   root: Record<string, unknown>,
+  overrides: Record<string, string>,
 ): Record<string, string> {
   const required: Record<string, string> = {};
   const weaker: Record<string, string> = {};
@@ -224,7 +227,22 @@ function temporaryRootEntries(
       else weaker[name] ??= spec;
     }
   }
-  return { ...weaker, ...required };
+  const entries: Record<string, string> = {};
+  for (const [name, spec] of Object.entries({ ...weaker, ...required })) {
+    const rule = overrideRuleFor(name, spec, overrides);
+    entries[name] = (rule === null ? null : overrideValue(rule, lock.entries.get(""))) ?? spec;
+  }
+  return entries;
+}
+
+/** Each root override's value as npm reads it: a string, or a nested block's own ".". */
+function ownOverrideValues({ flat, nested }: ReturnType<typeof readNpmOverrides>): Record<string, string> {
+  const values = { ...flat };
+  for (const [key, block] of Object.entries(nested)) {
+    const own = (block as Record<string, unknown> | null)?.["."];
+    if (typeof own === "string") values[key] = own;
+  }
+  return values;
 }
 
 /**
@@ -237,7 +255,7 @@ function resolveThroughRoot(dir: string, lock: LockIndex, targetNames: string[],
   const saved = readFileSync(rootFile, "utf-8");
   const root = JSON.parse(saved) as Record<string, unknown>;
   const memberPaths = manifests.filter((m) => !m.notWorkspace).map((m) => m.lockPath).filter((path) => path !== "");
-  const entries = temporaryRootEntries(lock, memberPaths, targetNames, root);
+  const entries = temporaryRootEntries(lock, memberPaths, targetNames, root, ownOverrideValues(readNpmOverrides(dir)));
   if (Object.keys(entries).length === 0) return;
 
   log(`   Resolving ${targetNames.join(", ")} through temporary root entries: ${Object.keys(entries).join(", ")}.`);
@@ -286,7 +304,7 @@ function safeVerify(input: VerifyInput): VerificationFailure[] {
   try {
     return verify(input);
   } catch (e) {
-    return [{ check: "stable", detail: `Verification could not finish: ${messageOf(e)}` }];
+    return [{ check: "run", detail: `Verification could not finish: ${messageOf(e)}` }];
   }
 }
 
@@ -336,7 +354,7 @@ export function applyPlan(
       stable,
     });
   } catch (e) {
-    return [{ check: "stable", detail: failureDetail(e) }];
+    return [{ check: "run", detail: failureDetail(e) }];
   }
 }
 

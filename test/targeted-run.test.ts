@@ -413,7 +413,7 @@ describe("applying", () => {
 
     await assert.rejects(
       runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), msAlert()], npm)),
-      (e: Error) => e instanceof AgentError && /failed verification in functions: stable/.test(e.message),
+      (e: Error) => e instanceof AgentError && /failed in functions: run/.test(e.message),
     );
 
     // The root group had already succeeded, and its files are back as they were.
@@ -421,7 +421,7 @@ describe("applying", () => {
     assert.ok(npm.commands.length >= 2, "the root group was applied before functions failed");
     const report = reportIn(reportDir);
     assert.equal(report.outcome, "failed");
-    assert.equal(report.failures[0].check, "stable");
+    assert.equal(report.failures[0].check, "run");
     assert.match(report.failures[0].detail, /^In functions: /);
     assert.match(report.failures[0].detail, /ETARGET/);
   });
@@ -956,7 +956,7 @@ describe("a failed run reports, whatever failed", () => {
     writeProject(dir, qsProject());
     await assert.rejects(
       runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], fakeNpm({ failIn: dir }))),
-      /failed verification in root: stable/,
+      /failed in root: run/,
     );
   });
 });
@@ -1100,7 +1100,7 @@ describe("a file: package outside the repository", () => {
     const mtime = statSync(file).mtimeMs;
     const npm = fakeNpm({ failIn: repo });
 
-    await assert.rejects(runTargeted(cfgFor(repo), depsFor([qsAlert()], npm)), /failed verification in root/);
+    await assert.rejects(runTargeted(cfgFor(repo), depsFor([qsAlert()], npm)), /failed in root/);
 
     assert.ok(npm.commands.length > 0, "the run did try to apply a fix");
     assert.ok(npm.commands.every((c) => !c.includes("../x")));
@@ -1136,7 +1136,7 @@ describe("a restore that fails", () => {
       runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], { run })),
       (e: Error) =>
         e instanceof AgentError &&
-        /failed verification in root: stable/.test(e.message) &&
+        /failed in root: run/.test(e.message) &&
         /Restoring the files failed/.test(e.message) &&
         /Could not restore 1 file\(s\)/.test(e.message) &&
         !/Every file was restored/.test(e.message),
@@ -1163,13 +1163,13 @@ describe("a failed report that can't be written", () => {
 
     await assert.rejects(
       runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], fakeNpm({ failIn: dir }))),
-      /failed verification in root: stable/,
+      /failed in root: run/,
     );
 
     const printed = logs.filter((l) => l.includes("## Failures"));
     assert.equal(printed.length, 1, "one report, not two");
-    assert.match(printed[0], /\*\*stable\*\*/);
-    assert.doesNotMatch(printed[0], /\*\*run\*\*/);
+    assert.match(printed[0], /ETARGET/);
+    assert.doesNotMatch(printed[0], /Could not write the report/);
   });
 });
 

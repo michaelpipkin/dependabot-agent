@@ -297,3 +297,31 @@ describe("lockfile index", () => {
     });
   });
 });
+
+describe("bundled entries", () => {
+  const lock = makeLock({
+    "": { dependencies: { npm: "8.0.0" } },
+    "node_modules/npm": { version: "8.0.0", dependencies: { x: "^1.0.0" } },
+    "node_modules/npm/node_modules/x": { version: "1.0.0", inBundle: true },
+  });
+
+  it("reads inBundle, and defaults it to false", () => {
+    assert.equal(lock.entries.get("node_modules/npm/node_modules/x")?.inBundle, true);
+    assert.equal(lock.entries.get("node_modules/npm")?.inBundle, false);
+  });
+
+  it("a bundled copy still counts as a copy, so the report can name it", () => {
+    assert.deepEqual(copiesOf(lock, "x").map((c) => c.path), ["node_modules/npm/node_modules/x"]);
+  });
+
+  it("isn't a reason to make its bundler a temporary root entry: that can't move it", () => {
+    const member = makeLock({
+      "": {},
+      "packages/a": { dependencies: { npm: "8.0.0" } },
+      "node_modules/a": { link: true, resolved: "packages/a" },
+      "node_modules/npm": { version: "8.0.0", dependencies: { x: "^1.0.0" } },
+      "node_modules/npm/node_modules/x": { version: "1.0.0", inBundle: true },
+    });
+    assert.deepEqual(memberOwnersOf(member, ["packages/a"], ["x"]), {});
+  });
+});

@@ -2064,3 +2064,109 @@ describe("readNpmOverrides", () => {
     });
   });
 });
+
+describe("bundled copies", () => {
+  const BUNDLED = "node_modules/npm/node_modules/cli-table3/node_modules/ansi-regex";
+  const ansiAlert = (): DependabotAlert => alert(1, "ansi-regex", ">= 5.0.0, < 5.0.1", "5.0.1");
+  const npmBundle = {
+    "node_modules/npm": { version: "8.0.0", dependencies: { "cli-table3": "^0.6.0" }, bundleDependencies: ["cli-table3"] },
+    "node_modules/npm/node_modules/cli-table3": { version: "0.6.0", inBundle: true, dependencies: { "ansi-regex": "^5.0.0" } },
+  };
+  const rootNpm = { dependencies: { npm: "8.0.0", "strip-ansi": "^6.0.0" } };
+
+  it("a bundled copy is blocked, saying a parent upgrade is what it needs, and the run writes nothing for it", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({ "": rootNpm, ...npmBundle, [BUNDLED]: { version: "5.0.0", inBundle: true } }),
+    });
+    assert.equal(p.alerts[0].status, "blocked");
+    const [copy] = p.alerts[0].copies;
+    assert.equal(copy.path, BUNDLED);
+    assert.equal(copy.reason, "bundled");
+    assert.match(copy.detail ?? "", /npm@8\.0\.0/);
+    assert.match(copy.detail ?? "", /upgrad/i);
+    assert.deepEqual(p.addOverrides, {});
+    assert.deepEqual(p.bumps, []);
+    assert.equal(p.targets.size, 0);
+  });
+
+  it("a bundled copy with no patched version says that first", () => {
+    const p = plan({
+      alerts: [alert(1, "ansi-regex", ">= 5.0.0", null)],
+      lock: makeLock({ "": rootNpm, ...npmBundle, [BUNDLED]: { version: "5.0.0", inBundle: true } }),
+    });
+    assert.equal(p.alerts[0].copies[0].reason, "no-fix");
+  });
+
+  it("a safe bundled copy isn't reported at all", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({ "": rootNpm, ...npmBundle, [BUNDLED]: { version: "5.0.1", inBundle: true } }),
+    });
+    assert.equal(p.alerts[0].status, "awaiting-close");
+  });
+
+  it("a hoisted copy beside a vulnerable bundled one is still fixed: partly fixed, not over-blocked", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({
+        "": rootNpm,
+        ...npmBundle,
+        [BUNDLED]: { version: "5.0.0", inBundle: true },
+        "node_modules/strip-ansi": { version: "6.0.0", dependencies: { "ansi-regex": "^5.0.0" } },
+        "node_modules/ansi-regex": { version: "5.0.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "partly-fixed");
+    assert.deepEqual(p.addOverrides, { "ansi-regex@>=5.0.0 <5.0.1": "5.0.1" });
+    assert.deepEqual([...p.targets.keys()], ["node_modules/ansi-regex"]);
+    const byPath = new Map(p.alerts[0].copies.map((c) => [c.path, c]));
+    assert.equal(byPath.get("node_modules/ansi-regex")?.action, "override");
+    assert.equal(byPath.get(BUNDLED)?.reason, "bundled");
+  });
+
+  it("a bundled parent's edge doesn't count as something the selector would catch", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({
+        "": rootNpm,
+        ...npmBundle,
+        // Safe, but declared by a range the selector matches.
+        [BUNDLED]: { version: "5.0.1", inBundle: true },
+        "node_modules/strip-ansi": { version: "6.0.0", dependencies: { "ansi-regex": "^5.0.0" } },
+        "node_modules/ansi-regex": { version: "5.0.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.deepEqual(p.addOverrides, { "ansi-regex@>=5.0.0 <5.0.1": "5.0.1" });
+  });
+
+  it("nor does the edge of the package that bundles it", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({
+        "": rootNpm,
+        "node_modules/npm": { version: "8.0.0", dependencies: { "ansi-regex": "^5.0.0" }, bundleDependencies: ["ansi-regex"] },
+        "node_modules/npm/node_modules/ansi-regex": { version: "5.0.1", inBundle: true },
+        "node_modules/strip-ansi": { version: "6.0.0", dependencies: { "ansi-regex": "^5.0.0" } },
+        "node_modules/ansi-regex": { version: "5.0.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+  });
+
+  it("a bundled parent resolving out to the hoisted copy doesn't block it, and is flagged if the fix lands past its range", () => {
+    const p = plan({
+      alerts: [ansiAlert()],
+      lock: makeLock({
+        "": rootNpm,
+        "node_modules/npm": { version: "8.0.0", dependencies: { "cli-table3": "^0.6.0" }, bundleDependencies: ["cli-table3"] },
+        "node_modules/npm/node_modules/cli-table3": { version: "0.6.0", inBundle: true, dependencies: { "ansi-regex": "5.0.0" } },
+        "node_modules/strip-ansi": { version: "6.0.0", dependencies: { "ansi-regex": "^5.0.0" } },
+        "node_modules/ansi-regex": { version: "5.0.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.deepEqual(p.alerts[0].copies[0].pastDeclared, [{ dependent: "cli-table3", range: "5.0.0" }]);
+  });
+});

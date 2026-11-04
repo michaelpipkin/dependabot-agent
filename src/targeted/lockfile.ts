@@ -8,6 +8,7 @@ export interface LockEntry {
   installedAs: string; // the name it's installed under, which is what Node and npm's edges resolve by
   version?: string;
   link?: string; // link target path, when this entry is a workspace link
+  inBundle: boolean; // shipped inside another package's tarball: npm's resolution doesn't reach it
   dependencies: Record<string, string>;
   optionalDependencies: Record<string, string>;
   peerDependencies: Record<string, string>;
@@ -31,6 +32,7 @@ type RawEntry = {
   name?: string;
   version?: string;
   link?: boolean;
+  inBundle?: boolean;
   resolved?: string;
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
@@ -93,6 +95,7 @@ export function parseLock(raw: unknown): LockIndex {
       installedAs: installedName(path, e),
       version: e.version,
       link: e.link && e.resolved ? e.resolved : undefined,
+      inBundle: e.inBundle === true,
       dependencies: e.dependencies ?? {},
       optionalDependencies: e.optionalDependencies ?? {},
       peerDependencies: e.peerDependencies ?? {},
@@ -165,7 +168,7 @@ export function reachableFrom(lock: LockIndex, startPaths: string[]): Set<string
 /**
  * For each workspace member, the direct dependencies (name -> declared range) through which a copy
  * of one of `targetNames` is reachable. A target declared directly by a member is not its own owner.
- * An aliased copy doesn't count, since an override can't reach it. When members declare different
+ * An aliased or bundled copy doesn't count, since an override can't reach it. When members declare different
  * ranges for the same owner, the first one wins.
  */
 export function memberOwnersOf(lock: LockIndex, memberPaths: string[], targetNames: string[]): Record<string, string> {
@@ -179,7 +182,7 @@ export function memberOwnersOf(lock: LockIndex, memberPaths: string[], targetNam
       const reached = reachableFrom(lock, [edge.resolved.path]);
       const leadsToTarget = [...reached].some((p) => {
         const entry = lock.entries.get(p)!;
-        return targets.has(entry.name) && entry.installedAs === entry.name;
+        return targets.has(entry.name) && entry.installedAs === entry.name && !entry.inBundle;
       });
       if (leadsToTarget) owners[edge.name] = edge.spec;
     }
