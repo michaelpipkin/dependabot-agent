@@ -101,6 +101,41 @@ describe("lockfile index", () => {
     assert.equal(lock.entries.get("node_modules/@s/a")?.name, "@s/a");
   });
 
+  describe("aliased installs: npm writes the real name beside the path", () => {
+    const lock = makeLock({
+      "": { dependencies: { foo: "npm:minimatch@3.1.2", qs: "npm:other@1.0.0", plain: "^1.0.0" } },
+      "node_modules/foo": { name: "minimatch", version: "3.1.2" },
+      "node_modules/qs": { name: "other", version: "1.0.0" },
+      "node_modules/plain": { version: "1.0.0" },
+    });
+
+    it("names the entry by what it really is, and keeps the name it's installed under", () => {
+      const foo = lock.entries.get("node_modules/foo");
+      assert.equal(foo?.name, "minimatch");
+      assert.equal(foo?.installedAs, "foo");
+      assert.equal(lock.entries.get("node_modules/plain")?.name, "plain");
+      assert.equal(lock.entries.get("node_modules/plain")?.installedAs, "plain");
+    });
+
+    it("copiesOf finds a copy by its real name, not its path", () => {
+      assert.deepEqual(copiesOf(lock, "minimatch").map((e) => e.path), ["node_modules/foo"]);
+      assert.deepEqual(copiesOf(lock, "foo"), []);
+      assert.deepEqual(copiesOf(lock, "qs"), []);
+      assert.deepEqual(copiesOf(lock, "other").map((e) => e.path), ["node_modules/qs"]);
+    });
+
+    it("resolveDep stays path-based, as Node's resolution is", () => {
+      assert.equal(resolveDep(lock, "", "foo")?.path, "node_modules/foo");
+      assert.equal(resolveDep(lock, "", "minimatch"), null);
+      assert.equal(resolveDep(lock, "", "qs")?.name, "other");
+    });
+
+    it("edges stay keyed by the declared name", () => {
+      assert.deepEqual(edgesTo(lock, "foo").map((e) => e.resolved?.path), ["node_modules/foo"]);
+      assert.deepEqual(edgesTo(lock, "minimatch"), []);
+    });
+  });
+
   it("copiesOf returns every installed copy, not links or workspace members", () => {
     const lock = makeLock({
       "": {},

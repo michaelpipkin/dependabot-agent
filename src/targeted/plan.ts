@@ -174,8 +174,26 @@ interface PackageContext {
   input: PlanInput;
   name: string;
   alerts: DependabotAlert[];
+  copies: LockEntry[];
   edges: Edge[];
   handWritten: string | null;
+  /** The agent's own existing keys for this package whose selector is a range. */
+  agentKeys: AgentKey[];
+}
+
+interface AgentKey {
+  key: string;
+  /** What npm matches dependents against: the part after the version `@`, or `*` for a flat key. */
+  selector: string;
+}
+
+function agentKeysOf(flat: Record<string, string>, name: string): AgentKey[] {
+  return Object.entries(flat).flatMap(([key, spec]) => {
+    if (overrideKeyName(key) !== name || !isAgentAuthoredOverride(key, spec)) return [];
+    const at = key.lastIndexOf("@");
+    const selector = at > 0 ? key.slice(at + 1) : "*";
+    return semver.validRange(selector) === null ? [] : [{ key, selector }];
+  });
 }
 
 /** A manifest declaring this package, where that declaration resolves to the copy. */
@@ -222,12 +240,20 @@ function findNested(block: Record<string, unknown>, name: string, parents: strin
 // Step 2: the second table's rows, for a copy inside the alert's range
 // ---------------------------------------------------------------------------
 
+function stillInside(target: string, alert: DependabotAlert): Block {
+  return {
+    reason: "target-unavailable",
+    detail: `${target} is still inside alert #${alert.number}'s range "${rangeOf(alert)}".`,
+  };
+}
+
 function targetBlock(ctx: PackageContext, alert: DependabotAlert): Block | null {
   const id = alert.security_vulnerability.first_patched_version?.identifier;
   if (!id) return { reason: "no-fix", detail: `Alert #${alert.number} has no patched version.` };
 
   const target = patchOf(alert);
   if (!target) return { reason: "target-unavailable", detail: `Patched version ${id} isn't a stable release.` };
+  if (inRange(target, alert) === true) return stillInside(target, alert);
 
   const published = ctx.input.published.get(ctx.name);
   if (!published) {
@@ -269,9 +295,18 @@ function declarationBlock(ctx: PackageContext, copy: LockEntry): Block | null {
   return null;
 }
 
+/** npm matches an override's name against the name a dependent declares, so a selector can't reach an alias. */
+function aliasBlock(ctx: PackageContext, copy: LockEntry): Block | null {
+  if (copy.installedAs === ctx.name) return null;
+  return {
+    reason: "selector-conflict",
+    detail: `Installed as ${copy.installedAs}, an alias of ${ctx.name}, which an override for ${ctx.name} can't reach.`,
+  };
+}
+
 /** The first row that stops `copy` taking `alert`'s patch, or null if nothing does. */
 function pairBlock(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert): Block | null {
-  const block = targetBlock(ctx, alert) ?? declarationBlock(ctx, copy);
+  const block = targetBlock(ctx, alert) ?? aliasBlock(ctx, copy) ?? declarationBlock(ctx, copy);
   if (block) return block;
 
   const target = patchOf(alert)!;
@@ -294,10 +329,10 @@ interface SolvedLine {
   included: Set<DependabotAlert>;
   /** The subset of `included` taken only because the target fell inside its range. */
   raised: Set<DependabotAlert>;
-  /** What the line's fix covers; set whenever `fixing` is non-empty. */
-  range: string | null;
   /** The override to write, when one is needed. */
   key: string | null;
+  /** The agent's existing keys that `key` replaces. */
+  replaced: string[];
   /** Copies that would have moved but for a selector conflict. */
   conflicts: Map<string, Block>;
 }
@@ -308,8 +343,8 @@ function emptyLine(): SolvedLine {
     target: null,
     included: new Set(),
     raised: new Set(),
-    range: null,
     key: null,
+    replaced: [],
     conflicts: new Map(),
   };
 }
@@ -318,21 +353,23 @@ function dependentName(ctx: PackageContext, edge: Edge): string {
   return ctx.input.lock.entries.get(edge.from)?.name || "root";
 }
 
-/** Edges into `copy` that won't be rewritten by a bump: a manifest's own declaration will be. */
-function edgesStayingPut(ctx: PackageContext, copy: LockEntry): Edge[] {
-  const declarations = declarationsOf(ctx, copy);
-  return ctx.edges.filter(
-    (edge) =>
-      edge.resolved?.path === copy.path &&
-      !declarations.some((d) => d.manifest.lockPath === edge.from && d.dep.spec === edge.spec),
-  );
+/** Whether a bump will rewrite this edge: it's a manifest's own declaration of the copy it resolves to. */
+function isBumpedEdge(ctx: PackageContext, edge: Edge): boolean {
+  if (!edge.resolved) return false;
+  return declarationsOf(ctx, edge.resolved).some((d) => d.manifest.lockPath === edge.from && d.dep.spec === edge.spec);
 }
 
-/** Edges into `copy` that provably reject `target`. A spec that isn't a range can't be judged. */
+/** Edges into `copy` that a bump won't rewrite. */
+function edgesStayingPut(ctx: PackageContext, copy: LockEntry): Edge[] {
+  return ctx.edges.filter((edge) => edge.resolved?.path === copy.path && !isBumpedEdge(ctx, edge));
+}
+
+/** Edges into `copy` that provably reject `target`. A spec with no declared range can't be judged. */
 function edgesRejecting(ctx: PackageContext, copy: LockEntry, target: string): Edge[] {
-  return edgesStayingPut(ctx, copy).filter(
-    (edge) => semver.validRange(edge.spec) !== null && !semver.satisfies(target, edge.spec),
-  );
+  return edgesStayingPut(ctx, copy).filter((edge) => {
+    const declared = declaredRange(edge.spec);
+    return declared !== null && !semver.satisfies(target, declared, LOOSE);
+  });
 }
 
 /** Step 4: raise the target until it's outside every alert that can still be taken. */
@@ -346,18 +383,22 @@ function raiseTarget(
   let target = start;
   for (;;) {
     const current = target;
-    // An alert that fails its rows doesn't raise the target. It's left out, and
-    // reported as blocked by decide() if the final target is still in its range.
+    // An alert that fails its rows, or whose patch is no higher, doesn't raise the
+    // target. It's left out, and decide() reports it blocked if the final target
+    // is still in its range.
     // One probe copy speaks for the line: the candidates all pass the copy-level
     // rows, and sharing a line means sharing the major-crossing answer.
     const next = ctx.alerts.find(
-      (a) => !included.has(a) && inRange(current, a) === true && pairBlock(ctx, probe, a) === null,
+      (a) =>
+        !included.has(a) &&
+        inRange(current, a) === true &&
+        pairBlock(ctx, probe, a) === null &&
+        compare(patchOf(a)!, current) > 0,
     );
     if (!next) return target;
     included.add(next);
     raised.add(next);
-    const patch = patchOf(next)!;
-    if (compare(patch, target) > 0) target = patch;
+    target = patchOf(next)!;
   }
 }
 
@@ -377,40 +418,102 @@ function rangesIntersect(spec: string, range: string): boolean {
   return semver.validRange(spec, LOOSE) !== null && semver.intersects(spec, range, LOOSE);
 }
 
+const isGitSpec = (spec: string): boolean => GIT_SPECS.some((git) => git.test(spec.trim()));
+
+/**
+ * The semver range a spec declares, seeing through what wraps it: an alias's
+ * `npm:name@range` (a bare `npm:name` means `*`), or a git spec's `#semver:`
+ * range. Null when it declares none: a tag, a path, a URL, a plain git spec.
+ */
+function declaredRange(spec: string): string | null {
+  let declared = spec.trim();
+  if (isGitSpec(declared)) {
+    const attrs = declared.split("#")[1]?.split("::") ?? [];
+    const gitRange = attrs.find((attr) => attr.startsWith("semver:"))?.slice("semver:".length);
+    if (gitRange === undefined) return null;
+    declared = gitRange;
+  } else if (/^npm:/i.test(declared)) {
+    const at = declared.indexOf("@", "npm:".length + 1);
+    declared = at > 0 ? declared.slice(at + 1) : "*";
+  }
+  return semver.validRange(declared, LOOSE) === null ? null : declared;
+}
+
 /**
  * Whether npm would apply an override with this range to a dependent declaring
  * `spec`. Follows OverrideSet.getEdgeRule in @npmcli/arborist: it never looks at
  * the version a dependent resolved to, only at what it declares.
- *   - range or version: semver.intersects.
- *   - alias: the same, on what's after `npm:name@` (a bare `npm:name` means `*`).
- *   - git: intersects on its `#semver:` range; with no such range, never matches.
+ *   - a declared range (see declaredRange): semver.intersects.
+ *   - git with no range: never matches.
  *   - anything else (tag, file, directory, remote): always matches.
  * A spec npm can't parse at all (`workspace:*`) lands in that last group: npm
  * would stop on it, and reporting a block is better than failing the whole run.
  */
 function selectorCatches(spec: string, range: string): boolean {
-  const declared = spec.trim();
-  if (GIT_SPECS.some((git) => git.test(declared))) {
-    const attrs = declared.split("#")[1]?.split("::") ?? [];
-    const gitRange = attrs.find((attr) => attr.startsWith("semver:"))?.slice("semver:".length);
-    return gitRange !== undefined && rangesIntersect(gitRange, range);
+  const declared = declaredRange(spec);
+  if (declared !== null) return rangesIntersect(declared, range);
+  return !isGitSpec(spec);
+}
+
+/** The whole release line `version` sits on, as a range. */
+function lineSpan(version: string): string {
+  return `>=${lineStart(version)} <${render(compatibleCeiling(parseSemver(version)!))}`;
+}
+
+/** The new selector's lower bound: it must still catch what the keys it replaces were catching. */
+function carriedLowerBound(alerts: Iterable<DependabotAlert>, replaced: AgentKey[]): string | null {
+  const advisory = lowestLowerBound(alerts);
+  if (advisory === null) return null;
+  return replaced.reduce((lowest, { selector }) => {
+    const floor = semver.minVersion(selector)?.version;
+    return floor && compare(floor, lowest) < 0 ? floor : lowest;
+  }, advisory);
+}
+
+/**
+ * Whether a key belongs to an alert that's only waiting for GitHub to close it.
+ * The first table keeps such a key: the fix it holds is what lets the alert close.
+ */
+function heldByAwaitingClose(ctx: PackageContext, key: AgentKey, raised: Set<DependabotAlert>): boolean {
+  return ctx.alerts.some((alert) => {
+    const patch = patchOf(alert);
+    return (
+      patch !== null &&
+      !raised.has(alert) &&
+      ctx.copies.every((copy) => inRange(copy.version ?? "", alert) === false) &&
+      rangesIntersect(key.selector, lineSpan(patch))
+    );
+  });
+}
+
+/** Why the override can't move `copy`, or null if every dependent holding it would get the new key. */
+function unreachableReason(ctx: PackageContext, copy: LockEntry, range: string, others: AgentKey[]): string | null {
+  const edges = edgesStayingPut(ctx, copy);
+  if (edges.length === 0 && declarationsOf(ctx, copy).length === 0) {
+    return `Nothing declares ${ctx.name}@${copy.version} at ${copy.path}, so an override can't reach it.`;
   }
-  let inner = declared;
-  if (/^npm:/i.test(declared)) {
-    const at = declared.indexOf("@", "npm:".length + 1);
-    inner = at > 0 ? declared.slice(at + 1) : "*";
+  for (const edge of edges) {
+    const dependent = `${dependentName(ctx, edge)} declares ${ctx.name} "${edge.spec}"`;
+    if (!selectorCatches(edge.spec, range)) return `${dependent}, which the override "${range}" wouldn't match.`;
+    const other = others.find((k) => selectorCatches(edge.spec, k.selector));
+    if (other) return `${dependent}, which the existing override "${other.key}" also matches; npm applies only one.`;
   }
-  return semver.validRange(inner, LOOSE) === null || rangesIntersect(inner, range);
+  return null;
 }
 
 /**
  * Step 5: what the selector would catch that isn't being fixed on this line. A
  * safe copy can be caught even though its own version falls outside the selector,
  * because npm matches on the dependent's declared spec (see selectorCatches).
+ * And npm refuses outright (EOVERRIDE) an override matching any root edge, moving
+ * or not, resolved or not, so only a root edge the bump rewrites first is exempt.
  */
 function findConflict(ctx: PackageContext, range: string, fixing: LockEntry[]): string | null {
   const moving = new Set(fixing.map((c) => c.path));
   for (const edge of ctx.edges) {
+    if (edge.from === "" && !isBumpedEdge(ctx, edge) && selectorCatches(edge.spec, range)) {
+      return `The root declares ${ctx.name} "${edge.spec}", and npm refuses an override "${range}" matching it (EOVERRIDE).`;
+    }
     if (!edge.resolved || moving.has(edge.resolved.path)) continue;
     if (selectorCatches(edge.spec, range)) {
       return (
@@ -422,6 +525,7 @@ function findConflict(ctx: PackageContext, range: string, fixing: LockEntry[]): 
   // Also the spec's rule as written: the selector must exclude every copy staying
   // put, including one npm wouldn't match by its spec (a git dependency, say).
   for (const copy of copiesOf(ctx.input.lock, ctx.name)) {
+    if (copy.installedAs !== ctx.name) continue; // an alias is out of the selector's reach
     if (!moving.has(copy.path) && copy.version && semver.satisfies(copy.version, range)) {
       return `${ctx.name}@${copy.version} at ${copy.path} stays put, but the override "${range}" would also catch it.`;
     }
@@ -447,25 +551,48 @@ function solveLine(ctx: PackageContext, copies: LockEntry[]): SolvedLine {
   const fixing = candidates.filter((copy) => compare(copy.version!, target) < 0);
   if (fixing.length === 0) return emptyLine();
 
-  const range = selectorRange(lowestLowerBound(included), target);
-  const line: SolvedLine = { ...emptyLine(), fixing, target, included, raised, range };
+  // npm takes the first key matching a dependent's declared spec, so keys whose
+  // version ranges don't overlap can still compete. Every key of ours on the line
+  // is replaced, and the new one starts low enough to catch what they caught. Keys
+  // that stay can't be left matching a dependent the new key has to reach.
+  const span = lineSpan(target);
+  const replaced = ctx.agentKeys.filter(
+    (k) => rangesIntersect(k.selector, span) && !heldByAwaitingClose(ctx, k, raised),
+  );
+  const range = selectorRange(carriedLowerBound(included, replaced), target);
+  const key = `${ctx.name}@${range}`;
+  const others = ctx.agentKeys.filter((k) => !replaced.includes(k) && k.key !== key);
+  const line: SolvedLine = { ...emptyLine(), fixing, target, included, raised };
 
-  // Step 6: a bump is enough only if no other dependent still rejects the target.
+  // Step 6: a bump is enough only if no other dependent still rejects the target,
+  // and no existing key is left to catch one.
   const needSelector = fixing.filter(
-    (copy) => declarationsOf(ctx, copy).length === 0 || edgesRejecting(ctx, copy, target).length > 0,
+    (copy) =>
+      declarationsOf(ctx, copy).length === 0 ||
+      replaced.length > 0 ||
+      edgesRejecting(ctx, copy, target).length > 0 ||
+      edgesStayingPut(ctx, copy).some((edge) => others.some((k) => selectorCatches(edge.spec, k.selector))),
   );
   if (needSelector.length === 0) return line;
 
-  const conflict = findConflict(ctx, range, fixing);
-  if (!conflict) return { ...line, key: `${ctx.name}@${range}` };
+  const staying = new Map<string, string>();
+  for (const copy of needSelector) {
+    const reason = unreachableReason(ctx, copy, range, others);
+    if (reason) staying.set(copy.path, reason);
+  }
+  if (staying.size === 0) {
+    const conflict = findConflict(ctx, range, fixing);
+    if (!conflict) return { ...line, key, replaced: replaced.map((k) => k.key).filter((k) => k !== key) };
+    for (const copy of needSelector) staying.set(copy.path, conflict);
+  }
 
-  // Those copies stay put. The rest are bumps that need no override, and with
-  // fewer copies on the line their earliest fix may be lower, so solve them afresh.
+  // Those copies stay put. The rest may still move, and with fewer copies on the
+  // line their earliest fix may be lower, so solve them afresh.
   const rest = solveLine(
     ctx,
-    fixing.filter((copy) => !needSelector.includes(copy)),
+    fixing.filter((copy) => !staying.has(copy.path)),
   );
-  for (const copy of needSelector) rest.conflicts.set(copy.path, { reason: "selector-conflict", detail: conflict });
+  for (const [path, detail] of staying) rest.conflicts.set(path, { reason: "selector-conflict", detail });
   return rest;
 }
 
@@ -510,9 +637,10 @@ function decide(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert, li
 
   if (line.target && line.fixing.includes(copy)) {
     const targetHit = inRange(line.target, alert);
-    const coveredHere = copyHit === true && (line.included.has(alert) || targetHit === false);
-    if (coveredHere || line.raised.has(alert)) return fixedDecision(ctx, copy, line.target);
-    if (targetHit === true) return blocked(copy, pairBlock(ctx, copy, alert)!);
+    if (targetHit === true) return blocked(copy, pairBlock(ctx, copy, alert) ?? stillInside(line.target, alert));
+    if ((copyHit === true && targetHit === false) || line.raised.has(alert)) {
+      return fixedDecision(ctx, copy, line.target);
+    }
   }
 
   if (copyHit === false) return null;
@@ -567,32 +695,19 @@ function recordBumps(ctx: PackageContext, line: SolvedLine, plan: Plan): void {
   }
 }
 
-/** Whether an existing key could apply to versions in `range`. A flat key applies to every version. */
-function keyOverlaps(key: string, range: string): boolean {
-  const at = key.lastIndexOf("@");
-  const selector = at > 0 ? key.slice(at + 1) : "*";
-  return semver.validRange(selector) !== null && semver.intersects(selector, range);
-}
-
 /**
- * Replace the agent's own keys that this run's fixes supersede. Limited to keys
- * overlapping a line being fixed: two overlapping keys would leave npm to apply
- * whichever comes first, but a key on another line is still holding that line's
- * earlier fix, and only a `fixed` alert may free an override.
+ * Write each line's key and drop the keys it replaces. A key on another line is
+ * never among them: it's still holding that line's earlier fix, and only a `fixed`
+ * alert may free an override.
  */
 function recordOverrides(ctx: PackageContext, lines: SolvedLine[], plan: Plan): void {
-  const flat = ctx.input.overrides.flat;
-  const fixedLines = lines.filter((line) => line.fixing.length > 0);
-  const written = new Set<string>();
-  for (const { key, target } of fixedLines) {
+  const removed = new Set<string>();
+  for (const { key, target, replaced } of lines) {
     if (!key) continue;
-    written.add(key);
-    if (flat[key] !== target) plan.addOverrides[key] = target!;
+    if (ctx.input.overrides.flat[key] !== target) plan.addOverrides[key] = target!;
+    for (const old of replaced) removed.add(old);
   }
-  for (const [key, spec] of Object.entries(flat)) {
-    if (overrideKeyName(key) !== ctx.name || written.has(key) || !isAgentAuthoredOverride(key, spec)) continue;
-    if (fixedLines.some((line) => keyOverlaps(key, line.range!))) plan.removeOverrideKeys.push(key);
-  }
+  plan.removeOverrideKeys.push(...removed);
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +731,10 @@ function planPackage(
     input,
     name,
     alerts,
+    copies,
     edges: edgesTo(input.lock, name),
     handWritten: findHandWritten(input.overrides, name),
+    agentKeys: agentKeysOf(input.overrides.flat, name),
   };
   const lines = solveLines(ctx, copies);
   const lineOf = (copy: LockEntry): SolvedLine =>

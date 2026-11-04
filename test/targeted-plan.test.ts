@@ -1189,6 +1189,56 @@ describe("past a declared range", () => {
     assert.deepEqual(p.alerts[0].copies[0].pastDeclared, [{ dependent: "p", range: "6.7.0" }]);
   });
 
+  it("judges an alias: a fix past `npm:qs@6.7.0` is flagged", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { express: "^4.0.0" } },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "npm:qs@6.7.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].copies[0].action, "override");
+    assert.deepEqual(p.alerts[0].copies[0].pastDeclared, [{ dependent: "express", range: "npm:qs@6.7.0" }]);
+  });
+
+  it("a direct bump writes the selector when an alias parent pins the old version", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { qs: "^6.5.0", express: "^4.0.0" } },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "npm:qs@6.7.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+      manifests: [root(dep("qs", "^6.5.0"), dep("express", "^4.0.0"))],
+    });
+    assert.equal(p.bumps.length, 1);
+    assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.7.3": "6.7.3" });
+    assert.deepEqual(p.alerts[0].copies[0].pastDeclared, [{ dependent: "express", range: "npm:qs@6.7.0" }]);
+  });
+
+  it("judges a git spec's #semver: range, and an alias that admits the target isn't flagged", () => {
+    const flagged = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { a: "^1.0.0" } },
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "github:a/qs#semver:6.7.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+    assert.deepEqual(flagged.alerts[0].copies[0].pastDeclared, [{ dependent: "a", range: "github:a/qs#semver:6.7.0" }]);
+
+    const admitted = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { a: "^1.0.0" } },
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "npm:qs@^6.7.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+    assert.deepEqual(admitted.alerts[0].copies[0].pastDeclared, []);
+  });
+
   it("makes no claim about a spec that isn't a range", () => {
     const p = plan({
       alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
@@ -1212,6 +1262,421 @@ describe("past a declared range", () => {
     });
     assert.deepEqual(p.alerts[0].copies[0].pastDeclared, []);
     assert.equal(p.alerts[0].copies[0].target, undefined);
+  });
+});
+
+describe("existing keys npm would apply first", () => {
+  // npm takes the first rule matching the dependent's declared spec, so a key
+  // that matches it wins even when its version range doesn't overlap the new key's.
+  it("carries a stale key's lower bound into the new selector, and removes the key", () => {
+    const p = plan({
+      alerts: [alert(1, "a", ">= 3.1.0, < 3.6.0", "3.6.0")],
+      lock: makeLock({
+        "": { dependencies: { parent: "^1.0.0" } },
+        "node_modules/parent": { version: "1.0.0", dependencies: { a: "^3.0.0" } },
+        "node_modules/a": { version: "3.1.0" },
+      }),
+      flat: { "a@>=3.0.0 <3.1.0": "3.1.0" },
+    });
+    assert.deepEqual(p.addOverrides, { "a@>=3.0.0 <3.6.0": "3.6.0" });
+    assert.deepEqual(p.removeOverrideKeys, ["a@>=3.0.0 <3.1.0"]);
+    assert.equal(p.alerts[0].status, "fixed");
+  });
+
+  it("clears a pair of keys an earlier run left wedged", () => {
+    const p = plan({
+      alerts: [alert(1, "a", ">= 3.1.0, < 3.6.0", "3.6.0")],
+      lock: transitive("a", "3.1.0"),
+      flat: { "a@>=3.0.0 <3.1.0": "3.1.0", "a@>=3.1.0 <3.6.0": "3.6.0" },
+    });
+    assert.deepEqual(p.addOverrides, { "a@>=3.0.0 <3.6.0": "3.6.0" });
+    assert.deepEqual(p.removeOverrideKeys, ["a@>=3.0.0 <3.1.0", "a@>=3.1.0 <3.6.0"]);
+  });
+
+  it("a flat floating key carries no bound: the new key starts at the line", () => {
+    const p = plan({
+      alerts: [alert(1, "a", ">= 3.5.0, < 3.6.0", "3.6.0")],
+      lock: transitive("a", "3.5.1"),
+      flat: { a: ">=3.5.0 <4" },
+    });
+    assert.deepEqual(p.addOverrides, { "a@>=3.0.0 <3.6.0": "3.6.0" });
+    assert.deepEqual(p.removeOverrideKeys, ["a"]);
+  });
+
+  it("a bump with a stale key on its line also writes the selector, so the key can't win", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", ">= 6.7.0, < 6.8.0", "6.8.0")],
+      lock: makeLock({
+        "": { dependencies: { qs: "^6.5.0", express: "^4.0.0" } },
+        "node_modules/qs": { version: "6.7.3" },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "^6.5.0" } },
+      }),
+      manifests: [root(dep("qs", "^6.5.0"), dep("express", "^4.0.0"))],
+      flat: { "qs@>=6.0.0 <6.7.3": "6.7.3" },
+    });
+    assert.equal(p.bumps[0].target, "6.8.0");
+    assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.8.0": "6.8.0" });
+    assert.deepEqual(p.removeOverrideKeys, ["qs@>=6.0.0 <6.7.3"]);
+  });
+
+  it("blocks rather than leaving a key from another line to catch the same dependent", () => {
+    const p = plan({
+      alerts: [alert(1, "minimatch", ">= 5.0.0, < 5.1.7", "5.1.7")],
+      lock: makeLock({
+        "": { dependencies: { parent: "^1.0.0" } },
+        "node_modules/parent": { version: "1.0.0", dependencies: { minimatch: ">=3.0.0 <6" } },
+        "node_modules/minimatch": { version: "5.1.0" },
+      }),
+      flat: { "minimatch@>=3.0.0 <3.1.3": "3.1.3" },
+    });
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assert.match(p.alerts[0].copies[0].detail ?? "", /minimatch@>=3\.0\.0 <3\.1\.3/);
+    assertNoWrites(p);
+  });
+});
+
+describe("a key left in place and a bump", () => {
+  it("blocks the bump: the key would pull a dependent that accepts the target back to its value", () => {
+    const p = plan({
+      alerts: [alert(1, "minimatch", ">= 5.0.0, < 5.1.7", "5.1.7")],
+      lock: makeLock({
+        "": { dependencies: { minimatch: "^5.0.0", parent: "^1.0.0" } },
+        "node_modules/parent": { version: "1.0.0", dependencies: { minimatch: ">=3.0.0 <6" } },
+        "node_modules/minimatch": { version: "5.1.0" },
+      }),
+      manifests: [root(dep("minimatch", "^5.0.0"), dep("parent", "^1.0.0"))],
+      flat: { "minimatch@>=3.0.0 <3.1.3": "3.1.3" },
+    });
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assert.match(p.alerts[0].copies[0].detail ?? "", /minimatch@>=3\.0\.0 <3\.1\.3/);
+    assertNoWrites(p);
+  });
+});
+
+describe("copies the selector can't reach", () => {
+  /** One copy of `name`, held by one parent declaring it with `spec`. */
+  function heldBy(name: string, spec: string, version: string): LockIndex {
+    return makeLock({
+      "": { dependencies: { parent: "^1.0.0" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { [name]: spec } },
+      [`node_modules/${name}`]: { version },
+    });
+  }
+
+  it("keeps a parent's forced pin caught, by carrying the old key's bound", () => {
+    const p = plan({
+      alerts: [alert(1, "a", ">= 3.1.2, < 3.6.0", "3.6.0")],
+      lock: heldBy("a", "3.0.0", "3.1.3"),
+      flat: { "a@>=3.0.0 <3.1.3": "3.1.3" },
+    });
+    assert.deepEqual(p.addOverrides, { "a@>=3.0.0 <3.6.0": "3.6.0" });
+    assert.deepEqual(p.removeOverrideKeys, ["a@>=3.0.0 <3.1.3"]);
+    assert.equal(p.alerts[0].copies[0].action, "override");
+    assert.deepEqual(p.alerts[0].copies[0].pastDeclared, [{ dependent: "parent", range: "3.0.0" }]);
+  });
+
+  it("blocks a forced pin the selector would miss, and leaves the old key in place", () => {
+    // No key to carry a bound from, so nothing matches the parent's 3.0.0.
+    const p = plan({ alerts: [alert(1, "a", ">= 3.1.2, < 3.6.0", "3.6.0")], lock: heldBy("a", "3.0.0", "3.1.3") });
+    const copy = p.alerts[0].copies[0];
+    assert.equal(copy.action, "blocked");
+    assert.equal(copy.reason, "selector-conflict");
+    assert.match(copy.detail ?? "", /parent/);
+    assert.match(copy.detail ?? "", /3\.0\.0/);
+    assertNoWrites(p);
+  });
+
+  it("blocks a pre-release copy: its exact declaration doesn't intersect the selector", () => {
+    const p = plan({
+      alerts: [alert(1, "a", "< 21.1.0", "21.1.0")],
+      lock: heldBy("a", "21.0.0-next.3", "21.0.0-next.3"),
+    });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assertNoWrites(p);
+  });
+
+  it("blocks a copy only reachable through a git spec with no semver range", () => {
+    const p = plan({ alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")], lock: heldBy("qs", "github:a/qs", "6.7.0") });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].action, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assert.match(p.alerts[0].copies[0].detail ?? "", /github:a\/qs/);
+    assertNoWrites(p);
+  });
+
+  it("a git spec's own #semver: range can be caught", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: heldBy("qs", "github:a/qs#semver:^6.7.0", "6.7.0"),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+  });
+
+  it("blocks a copy nothing declares", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({ "": {}, "node_modules/qs": { version: "6.7.0" } }),
+    });
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assertNoWrites(p);
+  });
+
+  it("one unreachable copy inside the selector blocks the copy that shares it", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { x: "^1.0.0", y: "^1.0.0" } },
+        "node_modules/x": { version: "1.0.0", dependencies: { qs: "github:a/qs" } },
+        "node_modules/x/node_modules/qs": { version: "6.7.0" },
+        "node_modules/y": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/qs": { version: "6.7.1" },
+      }),
+    });
+    assert.deepEqual(
+      p.alerts[0].copies.map((c) => c.reason),
+      ["selector-conflict", "selector-conflict"],
+    );
+    assertNoWrites(p);
+  });
+
+  describe("an awaiting-close alert's key", () => {
+    it("is kept, so a fix the key would beat is blocked until that alert closes", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3"), alert(2, "qs", ">= 6.9.0, < 6.9.4", "6.9.4")],
+        lock: heldBy("qs", "^6.0.0", "6.9.0"),
+        flat: { qs: ">=6.7.3 <7" },
+      });
+      assert.equal(p.alerts[0].status, "awaiting-close");
+      assert.equal(p.alerts[1].status, "blocked");
+      assert.equal(p.alerts[1].copies[0].reason, "selector-conflict");
+      assert.match(p.alerts[1].copies[0].detail ?? "", /"qs"/);
+      assertNoWrites(p);
+    });
+
+    it("is kept beside a new key when no dependent matches both", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3"), alert(2, "qs", ">= 6.9.0, < 6.9.4", "6.9.4")],
+        lock: heldBy("qs", "6.9.0", "6.9.0"),
+        flat: { "qs@>=6.0.0 <6.7.3": "6.7.3" },
+      });
+      assert.equal(p.alerts[0].status, "awaiting-close");
+      assert.equal(p.alerts[1].status, "fixed");
+      assert.deepEqual(p.addOverrides, { "qs@>=6.9.0 <6.9.4": "6.9.4" });
+      assert.deepEqual(p.removeOverrideKeys, []);
+    });
+
+    it("is replaced once that alert has closed", () => {
+      const p = plan({
+        alerts: [alert(2, "qs", ">= 6.9.0, < 6.9.4", "6.9.4")],
+        lock: heldBy("qs", "^6.0.0", "6.9.0"),
+        flat: { qs: ">=6.7.3 <7" },
+      });
+      assert.equal(p.alerts[0].status, "fixed");
+      assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.9.4": "6.9.4" });
+      assert.deepEqual(p.removeOverrideKeys, ["qs"]);
+    });
+
+    it("isn't kept for an alert raised into: that alert is being fixed", () => {
+      const p = plan({
+        alerts: [alert(1, "a", "< 3.1.0", "3.1.0"), alert(2, "a", ">= 3.1.0, < 3.6.0", "3.6.0")],
+        lock: transitive("a", "3.0.0"),
+        flat: { a: ">=3.0.0 <4" },
+      });
+      assert.deepEqual(p.addOverrides, { "a@>=3.0.0 <3.6.0": "3.6.0" });
+      assert.deepEqual(p.removeOverrideKeys, ["a"]);
+    });
+  });
+});
+
+describe("root declarations (npm's EOVERRIDE)", () => {
+  it("a root-only peer declaration the selector catches is a conflict", () => {
+    const p = plan({
+      alerts: [alert(1, "minimatch", "< 3.1.2", "3.1.2")],
+      lock: makeLock({
+        "": { peerDependencies: { minimatch: "^3.0.4" } },
+        "node_modules/minimatch": { version: "3.0.4", peer: true },
+      }),
+    });
+    const copy = p.alerts[0].copies[0];
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(copy.action, "blocked");
+    assert.equal(copy.reason, "selector-conflict");
+    assert.match(copy.detail ?? "", /\^3\.0\.4/);
+    assertNoWrites(p);
+  });
+
+  it("so is a root peer that resolves to nothing: npm checks every root edge", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": {
+          dependencies: { express: "^4.0.0" },
+          peerDependencies: { qs: "^6.0.0" },
+          peerDependenciesMeta: { qs: { optional: true } },
+        },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.0" } },
+        "node_modules/express/node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+    assertNoWrites(p);
+  });
+
+  it("a root peer outside the selector is fine", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", ">= 6.5.0, < 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { express: "^4.0.0" }, peerDependencies: { qs: "^6.9.0" } },
+        "node_modules/qs": { version: "6.9.1" },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.0" } },
+        "node_modules/express/node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+  });
+
+  it("a member's peer on a moving copy isn't a root edge, so it doesn't conflict", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": {},
+        "packages/a": { name: "a", peerDependencies: { qs: "^6.5.0" } },
+        "node_modules/a": { link: true, resolved: "packages/a" },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+      manifests: [root(), member("packages/a")],
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.7.3": "6.7.3" });
+  });
+
+  it("a root direct dependency the bump rewrites stays out of the check", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { qs: "^6.5.0", express: "^4.0.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.0" } },
+      }),
+      manifests: [root(dep("qs", "^6.5.0"), dep("express", "^4.0.0"))],
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.equal(p.addOverrides["qs@>=6.0.0 <6.7.3"], "6.7.3");
+  });
+});
+
+describe("an alert's own range against the target", () => {
+  it("a target inside another alert's range can't fix that alert", () => {
+    const p = plan({
+      alerts: [alert(1, "a", "< 3.6.0", "3.6.0"), alert(2, "a", ">= 3.5.0, < 3.9.0", "3.5.5")],
+      lock: transitive("a", "3.0.0"),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.equal(p.targets.get("node_modules/a"), "3.6.0");
+    assert.equal(p.alerts[1].status, "blocked");
+    assert.equal(p.alerts[1].copies[0].reason, "target-unavailable");
+    assert.match(p.alerts[1].copies[0].detail ?? "", /still inside/);
+  });
+
+  it("the same when the copy is inside both ranges", () => {
+    const p = plan({
+      alerts: [alert(1, "a", "< 3.6.0", "3.6.0"), alert(2, "a", ">= 3.5.0, < 3.9.0", "3.5.5")],
+      lock: transitive("a", "3.5.2"),
+    });
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.equal(p.alerts[1].status, "blocked");
+    assert.equal(p.alerts[1].copies[0].reason, "target-unavailable");
+  });
+
+  it("a patch below the target never lowers it", () => {
+    const p = plan({
+      alerts: [alert(1, "a", "< 3.6.0", "3.6.0"), alert(2, "a", ">= 3.5.0, < 3.9.0", "3.4.0")],
+      lock: transitive("a", "3.0.0"),
+    });
+    assert.equal(p.targets.get("node_modules/a"), "3.6.0");
+    assert.equal(p.alerts[0].status, "fixed");
+    assert.equal(p.alerts[1].status, "blocked");
+    assert.equal(p.alerts[1].copies[0].reason, "target-unavailable");
+  });
+
+  it("a patch inside its own range isn't a fix, and nothing moves for it", () => {
+    const p = plan({ alerts: [alert(1, "a", ">= 3.0.0, <= 3.5.0", "3.5.0")], lock: transitive("a", "3.0.0") });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "target-unavailable");
+    assert.match(p.alerts[0].copies[0].detail ?? "", /still inside/);
+    assertNoWrites(p);
+  });
+
+  it("every blocked decision has a reason and a detail", () => {
+    const p = plan({
+      alerts: [alert(1, "a", ">= 3.4.0, <= 3.6.0", "3.6.0"), alert(2, "a", "< 3.1.0", "3.1.0")],
+      lock: makeLock({
+        "": { dependencies: { p: "^1.0.0", q: "^1.0.0" } },
+        "node_modules/p": { version: "1.0.0", dependencies: { a: "3.0.0" } },
+        "node_modules/a": { version: "3.0.0" },
+        "node_modules/q": { version: "1.0.0", dependencies: { a: "3.4.0" } },
+        "node_modules/q/node_modules/a": { version: "3.4.0" },
+      }),
+    });
+    assert.equal(p.alerts[1].status, "fixed");
+    assert.equal(p.targets.get("node_modules/a"), "3.1.0");
+    assert.equal(p.alerts[0].status, "blocked");
+    for (const copy of p.alerts[0].copies) {
+      assert.equal(copy.action, "blocked");
+      assert.equal(copy.reason, "target-unavailable");
+      assert.ok(copy.detail);
+    }
+  });
+});
+
+describe("aliased installs", () => {
+  it("a vulnerable copy installed under an alias is blocked, not not-found", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { foo: "npm:qs@6.7.0" } },
+        "node_modules/foo": { name: "qs", version: "6.7.0" },
+      }),
+      manifests: [root(dep("foo", "npm:qs@6.7.0"))],
+    });
+    assert.equal(p.alerts[0].status, "blocked");
+    const copy = p.alerts[0].copies[0];
+    assert.equal(copy.path, "node_modules/foo");
+    assert.equal(copy.action, "blocked");
+    assert.equal(copy.reason, "selector-conflict");
+    assert.match(copy.detail ?? "", /alias/);
+    assert.match(copy.detail ?? "", /foo/);
+    assertNoWrites(p);
+  });
+
+  it("a package installed at qs's path that isn't qs has nothing to do with qs's alerts", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { parent: "^1.0.0" } },
+        "node_modules/parent": { version: "1.0.0", dependencies: { qs: "npm:other@1.0.0" } },
+        "node_modules/qs": { name: "other", version: "1.0.0" },
+      }),
+    });
+    assert.equal(p.alerts[0].status, "not-found");
+    assertNoWrites(p);
+  });
+
+  it("an aliased copy doesn't stop the real copy being fixed: no selector can reach it", () => {
+    const p = plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { foo: "npm:qs@6.7.0", parent: "^1.0.0" } },
+        "node_modules/foo": { name: "qs", version: "6.7.0" },
+        "node_modules/parent": { version: "1.0.0", dependencies: { qs: "^6.7.0" } },
+        "node_modules/qs": { version: "6.7.1" },
+      }),
+      manifests: [root(dep("foo", "npm:qs@6.7.0"), dep("parent", "^1.0.0"))],
+    });
+    assert.equal(p.alerts[0].status, "partly-fixed");
+    assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.7.3": "6.7.3" });
+    assert.deepEqual([...p.targets], [["node_modules/qs", "6.7.3"]]);
   });
 });
 

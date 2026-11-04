@@ -4,7 +4,8 @@ import { exitWithError } from "../util.js";
 
 export interface LockEntry {
   path: string; // "node_modules/a/node_modules/b", "packages/a", or "" for root
-  name: string;
+  name: string; // what the package really is: an alias's entry carries its real name
+  installedAs: string; // the name it's installed under, which is what Node and npm's edges resolve by
   version?: string;
   link?: string; // link target path, when this entry is a workspace link
   dependencies: Record<string, string>;
@@ -38,8 +39,8 @@ type RawEntry = {
   devDependencies?: Record<string, string>;
 };
 
-/** Name of the package installed at `path`: its last node_modules segment, else the declared name. */
-function entryName(path: string, raw: RawEntry): string {
+/** The name a package is installed under: its last node_modules segment, else the declared name. */
+function installedName(path: string, raw: RawEntry): string {
   const idx = path.lastIndexOf(NM);
   if (idx >= 0 && (idx === 0 || path[idx - 1] === "/")) return path.slice(idx + NM.length);
   return raw.name ?? path.slice(path.lastIndexOf("/") + 1);
@@ -74,7 +75,10 @@ export function parseLock(raw: unknown): LockIndex {
   for (const [path, e] of Object.entries(packages)) {
     entries.set(path, {
       path,
-      name: entryName(path, e),
+      // npm writes `name` on a node_modules entry only when it differs from the
+      // path: `"node_modules/foo": { "name": "minimatch" }` is minimatch, aliased.
+      name: e.name ?? installedName(path, e),
+      installedAs: installedName(path, e),
       version: e.version,
       link: e.link && e.resolved ? e.resolved : undefined,
       dependencies: e.dependencies ?? {},
@@ -103,7 +107,7 @@ export function resolveDep(lock: LockIndex, fromPath: string, name: string): Loc
   }
 }
 
-/** Every installed copy of `name`: node_modules entries only (not links, workspace members or the root). */
+/** Every installed copy of the package `name`, aliased or not: node_modules entries only (not links, workspace members or the root). */
 export function copiesOf(lock: LockIndex, name: string): LockEntry[] {
   return [...lock.entries.values()].filter((e) => e.name === name && !e.link && e.path.includes(NM));
 }
