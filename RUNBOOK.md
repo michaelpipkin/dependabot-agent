@@ -48,7 +48,7 @@ GITHUB_TOKEN=$(gh auth token) dependabot-agent --repo michaelpipkin/dependabot-a
 To confirm the full loop closes, drop `--dry-run`, apply the overrides, and push:
 
 - **pnpm**: `pnpm install` re-resolves overrides directly.
-- **npm**: a plain `npm install` does **not** re-resolve a changed `overrides` block — you must clear the tree: `rm -rf node_modules package-lock.json && npm install`. (The agent prints this.)
+- **npm**: a plain `npm install` applies an override to a package the root `package.json` reaches, but not to one reached only through workspace members. If the old versions stay, clear the tree: `rm -rf node_modules package-lock.json && npm install`, which re-resolves everything, so other packages may move too. (The agent prints both.)
 
 Then wait for Dependabot to re-scan; the four **lockfile**-keyed alerts should go `fixed`, each consumer resolving to its own patched line (3.15.0 / 4.3.0). The member `package.json` alerts stay open — they track the *declared* version, which the override doesn't change; that's expected and doesn't occur for a transitive dependency.
 

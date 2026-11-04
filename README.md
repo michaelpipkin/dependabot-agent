@@ -242,6 +242,7 @@ The agent runs a dependency update before reconciling, so legitimately-fixed pac
 
 - **`compatible`** (default) — stay within existing semver ranges; does not cross majors automatically. pnpm: `pnpm update`; npm: `npm update --save`.
 - **`latest`** — allow crossing majors. pnpm: `pnpm update --latest`; npm: `npm install <alerted-pkg>@latest` for the alerted direct dependencies.
+- **`targeted`** (npm only) — no bulk update at all. Each alert gets the smallest change that resolves it, or is reported as blocked. See [Targeted mode (npm)](#targeted-mode-npm).
 
 Under either strategy the update pass leaves two things alone: [exact pins](#exact-pins-are-never-rewritten) and, unless you opt in, [pre-releases](#pre-releases).
 
@@ -409,6 +410,211 @@ The agent does not rewrite an override to match a direct dep, and it does not us
 
 **Edge case:** if a *direct* dependency is still vulnerable after the update — e.g. the only patched version is a major bump and you're on the default `compatible` strategy, so the update can't cross the major — the agent will write an override for a package that is also a direct dep, and `npm install` will then reject it with the conflict error. Fix it by re-running with `--update-strategy latest` (bumps the direct dep across the major and rewrites its declared range, so the alert closes without an override), or bump that dependency by hand. If the package is an [exact pin](#exact-pins-are-never-rewritten), `latest` will not move it either — the run says so explicitly ("Pinned AND alerted"), and raising the pin by hand is the only fix.
 
+## Targeted mode (npm)
+
+Targeted mode is for teams that don't run a general `npm update`: packages move only when they have been vetted, or when a Dependabot alert makes it unavoidable. It answers each open alert with the smallest change that resolves it, or says why it can't. Nothing else in the lockfile moves.
+
+```bash
+dependabot-agent --update-strategy targeted --dry-run
+```
+
+> **Status: new.** Targeted mode is recent, and some of it is not yet proven.
+>
+> - It has been tested on **npm 11.16 on Windows**. Linux and npm 10 are still to be confirmed, so no minimum npm version is claimed (see [Supported npm versions](#supported-npm-versions)).
+> - It has not yet been shown on a live repository that Dependabot closes the alerts after the overrides this mode writes. The agent's earlier fixtures confirmed that for `name@major` override keys only.
+>
+> **Run it with `--dry-run` on a real repository first**, read the plan, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
+
+It supports npm only. Run against a pnpm project, it stops at startup with an error, before anything is written. `compatible`, `latest` and everything on pnpm behave as before.
+
+### What it changes, and what it doesn't
+
+The unit of decision is each **copy** of a package in `package-lock.json`, not each alert. One alert can cover several copies at different versions, and they can have different outcomes.
+
+**What can move**
+
+- A copy inside an alert's vulnerable range, to the **earliest version that fixes it**: the alert's patched version. Where several alerts hit one release line, the highest patch on that line.
+- A **direct dependency** is fixed by raising its declared range in the manifest that declares it, keeping the existing `^` or `~`.
+- A **transitive dependency** is fixed with an `overrides` entry in the root `package.json`, keyed to the vulnerable versions and set to exactly the target:
+
+  ```json
+  "overrides": {
+    "qs@>=6.0.0 <6.7.3": "6.7.3"
+  }
+  ```
+
+  The key has a lower bound as well as an upper one, so it can't catch a copy on another major line.
+- A package a fixed package newly requires, or that has to move with it. These are listed under "Other changes" in the report.
+
+**What doesn't move**
+
+- A copy outside the vulnerable range, even of an alerted package.
+- An exact pin (`"3.0.2"`). A pin means "don't touch", and an alerted pin is reported as blocked.
+- A fix that would cross a major version (under `0.x`, a minor). That includes direct dependencies, even with no limit set: a major bump is what needs vetting, so a person chooses to make it.
+- Anything beyond a limit you have set (below).
+- A parent package. Raising a parent to clear a transitive alert is out of scope.
+- An override a person wrote.
+
+A fix can still land **past a range a dependent declares**, within the same major: for example `4.0.3` to `4.0.4` where a parent pins `4.0.3`. The change is applied, and the report lists it under "Applied past a declared range — review these" so a person looks at it.
+
+**Partial fixes.** A copy that can be fixed is fixed even if another copy of the same package is blocked. The alert is reported as partly fixed and stays open on GitHub until every copy is resolved.
+
+### Why a copy is blocked
+
+A blocked copy is left exactly as it is, and the report names the copy and the reason. Nothing is skipped silently.
+
+| Reason | What it means |
+|---|---|
+| `no-fix` | The advisory has no patched version yet. |
+| `target-unavailable` | The patched version isn't published on npm, is a pre-release, is still inside the vulnerable range, isn't above the installed version, or its published versions couldn't be read. |
+| `unreadable-range` | The installed version or the advisory's range couldn't be compared. |
+| `limit` | The patched version is outside a limit in your config. |
+| `pin` | The copy is a direct dependency declared at an exact version. |
+| `unrewritable-spec` | The copy is a direct dependency whose spec can't be safely rewritten: a compound range, a tag, or a git spec. Also, a `file:` dependency that isn't a workspace member, a package declared in two dependency fields of one manifest, or a workspace member's declaration while `updateWorkspaceMembers` is `false`. |
+| `major-crossing` | The patched version is in a later major (or, under `0.x`, a later minor) than the copy. |
+| `hand-written-override` | A person wrote an override that names this package. It is never changed or removed. |
+| `selector-conflict` | The override the fix needs can't be written without moving something it shouldn't, or can't reach the copy. For example: it would also catch a copy that must stay put; the root declares a range the override would collide with (npm rejects that with `EOVERRIDE`); the copy is an alias; a dependent declares a range the override wouldn't match; an existing agent-written override still holds a different dependent's fix; or the copy sits inside a workspace member's own `node_modules`, where npm's override can't reach it. |
+
+### Limits
+
+`limits` caps how far named packages may move. Each key is a package name or a `*` glob, and each value is a semver range. It is read from the config file only.
+
+```jsonc
+// dependabot-agent.config.json
+{
+  "updateStrategy": "targeted",
+  "limits": {
+    "@angular/*": "<22"
+  }
+}
+```
+
+A fix whose target is outside a matching limit is blocked with the reason `limit`, so a fix that needs Angular 22 stays a hard no. If several alerts hit one release line and the highest patch would break a limit, the highest patch that doesn't is used, the alert that needs the higher one is blocked, and the lower one is still fixed. Limits are also checked after the run on every version that changed, including packages that moved as a side effect, so a limit can't be crossed indirectly. A malformed limit stops the run at startup. `limits` under another strategy prints a warning and has no effect.
+
+### Overrides already in `package.json`
+
+- **Hand-written** overrides (a plain name, `name@2`, or one nested under a parent) are never changed or removed. If one applies to an alerted package, that copy is blocked and the report names the override.
+- **Written by the agent** on an earlier `compatible` or `latest` run (a value beginning `>=`): if the package has an open alert, the old key is replaced with the new shape, but only when it matches what a moving copy's dependents declare, because npm applies only the first key that matches. A key that still holds another dependent's fix, one the new key wouldn't cover, blocks the copy rather than being replaced. With no open alert, such an override is left alone, so adopting this mode moves nothing.
+- An override is **removed** only when its alert is fixed, every dependent now asks for a safe version, and removing it moves no locked version. Otherwise it is kept, and the report says so.
+
+### Workspaces
+
+Targeted mode reads the root, the workspace members and any `file:` packages from `package-lock.json`, not from the workspace globs, so any glob form works. Isolated sub-packages with their own lockfile (a `functions/` folder, say) are processed too, and share one report, one pull request and one all-or-nothing result.
+
+Things to know:
+
+- **Overrides on a member-only tree.** npm applies an override only when the package is reachable from the root `package.json`. For a package reachable only through workspace members, targeted mode adds the members' relevant dependencies to the root `devDependencies` temporarily, resolves, then restores `package.json` exactly and resolves again. This relies on npm behaviour that npm doesn't document, which is why the result is verified rather than assumed.
+- **A copy nested inside a member.** A copy that needs an override and sits in a workspace member's own `node_modules` is blocked, because npm's override can't reach it. Moving the members to one range of the parent package clears it.
+- **A package declared twice.** A package declared in two dependency fields of one manifest (say `dependencies` and `devDependencies`) is blocked: npm can't rewrite both.
+- **Alerts stay open until every copy is resolved.** An alert for a package that has a copy still blocked stays open on GitHub. An alert keyed to a member's `package.json` tracks the version that manifest *declares*, which an override doesn't change, so it may show as awaiting close even after the lockfile is fixed.
+
+### How a run is checked
+
+The agent applies fixes to the lockfile only: every npm command is `--package-lock-only --ignore-scripts`, and no `node_modules` is needed. `npm ci` passing is not treated as evidence, because it has passed on trees with packages missing. Instead, the result is checked against the snapshot taken before the run:
+
+1. Every copy the plan said it would fix is at its target.
+2. Nothing else moved: every changed entry is a target copy at its target, or a package a target requires.
+3. Every exact pin in every manifest resolves to the same version as before.
+4. Every changed entry satisfies any matching limit.
+5. The tree is complete: every non-optional dependency resolves to an entry whose version satisfies the declared range, or the difference is explained by an override.
+6. Only the expected `package.json` files changed, and no temporary `devDependencies` remain.
+7. A second resolve changes nothing.
+
+If any check fails, **every file is restored, the run exits with code 1, and the report says which check failed and on which package.** It never produces a partial result. If restoring itself fails, the report says so and the pull request step doesn't run.
+
+### The report
+
+`--report <dir>` writes:
+
+- `report.md`: the text for a pull request or issue. Sections are Fixed, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text.
+- `report.json`: the same data, plus an `outcome` that a workflow can act on.
+
+| `outcome` | Meaning |
+|---|---|
+| `changes` | At least one file changed. |
+| `blocked-only` | Nothing changed, and at least one copy is blocked. |
+| `clean` | Nothing changed and nothing is blocked. Alerts awaiting close or not found are in the job summary only, so they don't raise a false issue. |
+| `failed` | The run failed. A failed report is written on any exit once `--report` is set. |
+
+A dry run produces the same report, labelled as a plan, and writes nothing.
+
+### Running it in GitHub Actions
+
+This repository provides a reusable workflow, `.github/workflows/targeted-reconcile.yml`. Your repository calls it on its own schedule.
+
+```yaml
+# .github/workflows/targeted-dependabot-fixes.yml
+name: Targeted Dependabot fixes
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Print the plan only: no pull request, no issue"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 6 * * 1" # weekly: GitHub has no trigger for a new Dependabot alert
+
+jobs:
+  targeted:
+    permissions: # a called workflow can't hold more than its caller grants
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@vX.Y.Z # pin a tag or a commit SHA
+    with:
+      base-branch: main
+      agent-version: "X.Y.Z" # the first release that includes targeted mode
+      dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+    secrets:
+      alerts-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+      pr-token: ${{ secrets.DEPENDABOT_PR_TOKEN }}
+```
+
+| Input | Default | |
+|---|---|---|
+| `base-branch` | required | The branch the run starts from and the pull request targets. |
+| `agent-version` | required | The `dependabot-agent` version to run. Required so every caller pins what it trusts. |
+| `node-version` | `"22"` | Node version for the run. |
+| `dry-run` | `false` | Adds `--dry-run`. The plan goes to the job summary and nothing is written: no pull request, no issue. |
+
+Put `limits` in `dependabot-agent.config.json` in the repository: the workflow checks out `base-branch` and the agent reads that file.
+
+**What each outcome does**
+
+| `outcome` | Pull request | Issue |
+|---|---|---|
+| `changes` | Created or updated, on the fixed branch `dependabot-agent/targeted`, with `report.md` as its description. | Closed if open and nothing is blocked. Left alone if some copies are still blocked: the pull request lists them. |
+| `blocked-only` | None. If a pull request from an earlier run is open, it is closed, because the branch no longer differs from the base. | One issue labelled `dependabot-agent-blocked` is created or updated with the report. |
+| `clean` | None, and a stale one is closed in the same way. | Closed if open. |
+| `failed` | None. | Created or updated with the failure, and the job fails. |
+| no report written | None. | Treated as `failed`: the issue and job summary say no report was produced and link to the run. This is what a crash at startup, or npx failing to fetch the package, looks like. |
+
+Every outcome writes the report to the job summary (the full one, when the pull request text was cut). If the report records that restoring the files failed, no pull request is created. The pull request commits only `package.json` and `package-lock.json` files, never anything else in the checkout. Closing a stale pull request on a run with no changes is how `create-pull-request` is meant to behave, but it has not been confirmed end to end yet.
+
+**Two tokens, and why not `GITHUB_TOKEN`**
+
+- **`alerts-token`** reads the Dependabot alerts. The built-in `GITHUB_TOKEN` can't, under any `permissions:` setting. Use a classic personal access token with `security_events`, or a fine-grained token or GitHub App with **Dependabot alerts: read**. It is given to the agent step only.
+- **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. It must not be `GITHUB_TOKEN`, for two reasons:
+  1. A pull request created with `GITHUB_TOKEN` does not trigger `pull_request` workflows, so your CI would never run on it. This mode relies on CI for all build and test verification.
+  2. A pull request's author can't approve it. If the token belongs to a person, that person can't be a reviewer. Use a **GitHub App** or a **service account** that no reviewer is signed in as. The tool doesn't prefer one: pick whichever your organisation already approves. One credential can serve both inputs if it holds both sets of permissions.
+
+The issue step uses the job's own `GITHUB_TOKEN`, which is why the workflow asks for `issues: write`.
+
+**What your organisation may need to approve**
+
+- The third-party action `peter-evans/create-pull-request@v8`, which opens the pull request. The workflow refers to it by tag; if your policy requires commit SHAs, copy the workflow and pin it.
+- `actions/checkout` and `actions/setup-node`, from GitHub.
+- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin and runs with `alerts-token` in its environment.
+- The two tokens above.
+
+The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.
+
+### Supported npm versions
+
+**Tested on npm 11.16, on Windows.** Linux and npm 10 are still to be confirmed. On npm 10 only plain overrides and direct bumps have been tried, not the temporary-root step. The lockfile must be `lockfileVersion` 2 or 3 (npm 7 or later). If a different npm version changes the behaviour this mode depends on, the post-run checks are meant to catch it and fail the run rather than produce a wrong tree, but that is not a substitute for a dry run on your own repository.
+
 ## After running
 
 If overrides were added or changed, run your package manager's install to apply them to the lockfile:
@@ -417,11 +623,13 @@ If overrides were added or changed, run your package manager's install to apply 
 pnpm install
 ```
 
-**On npm, a plain `npm install` is not enough.** npm resolves from the existing `node_modules` and `package-lock.json` and does not re-resolve just because `overrides` changed — the old versions stay in place (`--force` and `--package-lock-only` don't help either). Apply a newly written override with a clean install:
+**On npm, what a plain `npm install` does depends on how the package is reached.** npm resolves from the existing `node_modules` and `package-lock.json`. It applies a changed `overrides` entry to a package reachable from the **root** `package.json`. It does not apply one to a package reachable only through **workspace members**: the old version stays in place, and `--force` and `--package-lock-only` don't help. A clean reinstall re-resolves the whole tree and so applies every override:
 
 ```bash
 rm -rf node_modules package-lock.json && npm install
 ```
+
+A clean reinstall moves everything the declared ranges now allow, not just the overridden packages (312 of 545 packages in one test Angular project). If you want only the alerted packages to move, use [targeted mode](#targeted-mode-npm) instead.
 
 The agent prints the right command for your package manager after it writes the overrides.
 

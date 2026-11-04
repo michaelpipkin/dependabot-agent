@@ -114,6 +114,8 @@ Details:
 
 Fixes operate on the lockfile and need no `node_modules`. All install commands use `--package-lock-only --ignore-scripts`.
 
+Members and `file:` packages are read from the lockfile, not from a workspace glob, so any glob form works. A package outside the root is never read from disk.
+
 Snapshot `package-lock.json` and every manifest first. Then:
 
 1. **Raise direct dependencies.** For each manifest declaring a vulnerable copy:
@@ -140,6 +142,8 @@ Snapshot `package-lock.json` and every manifest first. Then:
 
 Override key order follows the existing `sortObjectKeys`, and nested overrides are preserved as `override-source.ts` already does.
 
+Replaced override keys are removed before the bumps run, and new keys are added after them. A plan with no changes runs no npm at all.
+
 ### Verification
 
 Apply these checks to the result. `npm ci` alone is not evidence: it passed on trees missing packages entirely. `npm ls` is not usable as the gate either: it reports valid overrides as `invalid` in member-only trees. So the tool needs its own lockfile check.
@@ -159,11 +163,11 @@ Verification failure is all-or-nothing for a first version: restore the snapshot
 *(Builder's calls, following the rule that the agent never discards a pin it didn't write.)*
 
 - **Hand-written** (a plain name, `name@2`, or a nested override under a parent): never changed or removed. If one applies to an alerted package, that package is blocked and the report names the override. Nested overrides under a parent that the alert's copy sits beneath count too.
-- **Written by the agent on an earlier `compatible` or `latest` run** (a value starting with `>=`): if the package has an open alert, replace it with the new key shape. Verification still applies, so if this moves anything unexpected the run fails rather than passing it through. With no open alert, leave it alone so that adopting the mode moves nothing.
+- **Written by the agent on an earlier `compatible` or `latest` run** (a value starting with `>=`): if the package has an open alert, replace it with the new key shape, but only when its selector matches what a moving copy's dependents will declare. npm applies the first key that matches a dependent, so only such a key competes with the new one. A key that doesn't match stays, because it may still be holding an earlier fix. A key that still holds another dependent's fix, one the new key wouldn't cover, blocks the copy instead of being replaced. Verification still applies, so if this moves anything unexpected the run fails rather than passing it through. With no open alert, leave it alone so that adopting the mode moves nothing.
 
 ### Removing overrides
 
-Keep the existing rules: only `fixed` alerts free an override, upstream ranges must have moved on, and hand-written overrides are never removed. In targeted mode, a removal additionally happens only if it moves no lockfile version. Otherwise keep the override and say so in the report.
+Keep the existing rules: only `fixed` alerts free an override, upstream ranges must have moved on, and hand-written overrides are never removed. In targeted mode, a removal additionally happens only if it moves no lockfile version. Otherwise keep the override and say so in the report. Replacing a key with the new shape follows the rule under "Existing overrides": it happens only when the key matches what a moving copy's dependents will declare, and a key that still holds another dependent's fix blocks the copy instead.
 
 Two existing functions need to learn the new key shape:
 
@@ -200,9 +204,9 @@ Provide a reusable workflow (`workflow_call`) in this repo. Consumers call it on
 | `changes` | Create or update a PR from a fixed branch, using `peter-evans/create-pull-request` with `body-path: report.md`. Close the blocked issue if nothing is blocked |
 | `blocked-only` | Create or update one labelled issue with `report.md`. No PR |
 | `clean` | Job summary only. Close the issue if open |
-| `failed` | Fail the job and update the issue with the failure |
+| `failed` | Fail the job and update the issue with the failure. A missing `report.json` counts as `failed`: the job summary and issue say that no report was produced and link to the run |
 
-Every outcome also writes `report.md` to `$GITHUB_STEP_SUMMARY`.
+Every outcome also writes the report to `$GITHUB_STEP_SUMMARY`: `report-full.md` when the tool wrote one (it does only when `report.md` was cut to fit GitHub's size limit, and the cut note points to the job summary), otherwise `report.md`. A report with a `restoreError` means the checkout is in an unknown state, so no PR is created. Nothing is written to GitHub on a dry run.
 
 `pip-cost-sharing/.github/workflows/dependabot-agent.yml` is the model for this workflow. It already shows that a personal access token is needed for the alerts API because `GITHUB_TOKEN` can't read it, and that a fixed branch name makes reruns update one PR.
 
@@ -225,7 +229,7 @@ Throwaway projects, npm 11.16 unless noted, with lockfiles made using `--before=
 | Workspace, members only: deleting lock entries, then installing | **Package disappeared from the lockfile; `npm ci` still passed** |
 | Workspace, members only: rewriting lock entries by hand | Works only if the new version needs no new dependencies; otherwise a broken tree that passes `npm ci` |
 | Workspace, members only: re-requesting the parent with `--no-save` | Nothing moved |
-| **Workspace, members only: temporary root dependencies** | **Worked: 4 of 545 on Angular 21, manifests restored, second run stable, including members with different ranges** |
+| **Workspace, members only: temporary root dependencies** | **Worked: 4 of 545 on Angular 21, manifests restored, second run stable, including members with different ranges, when the members share one hoisted copy. A copy nested inside a member's own `node_modules` is blocked: the override can't reach it, and moving the members to one range of the parent clears it** |
 | Same technique, target above a safe copy | Safe copy moved too, which is why verification check 2 exists |
 | Direct bump with `-w`; `~` with `--save-prefix=~`; devDependency stays in `devDependencies` | All correct |
 | Clean reinstall, for comparison | 312 of 545 moved |

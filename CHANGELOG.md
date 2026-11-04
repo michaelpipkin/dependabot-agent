@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Added
+
+- **`targeted` update strategy (npm only).** `--update-strategy targeted`, or `"updateStrategy": "targeted"` in the config file. For teams that don't run a general `npm update`: it makes no bulk update, and answers each open Dependabot alert with the smallest change that resolves it, or reports why it can't. A direct dependency has its declared range raised (keeping `^` or `~`); a transitive one gets an exact override keyed to the vulnerable versions, such as `"qs@>=6.0.0 <6.7.3": "6.7.3"`, and each copy moves to the earliest patched version. Exact pins, fixes that cross a major, and hand-written overrides are never touched; each is reported as blocked, with the reason. Fixes work on the lockfile only (`--package-lock-only --ignore-scripts`), are checked afterwards (fixed, nothing else moved, pins and limits held, tree complete, stable on a second resolve), and are rolled back in full if any check fails. Packages reachable only through workspace members are handled with a temporary root dependency step, and the root manifest is restored exactly. Members and `file:` packages are read from the lockfile, so any workspace glob works. Running it on pnpm stops at startup. See [Targeted mode (npm)](README.md#targeted-mode-npm).
+- **`"limits"`.** Config-file only: a map from a package name or `*` glob to a semver range, such as `{"@angular/*": "<22"}`. A fix whose target is outside a matching limit is blocked. Only used by `targeted`; under another strategy it prints a warning.
+- **`--report <dir>`.** Writes `report.md` (a pull request or issue body) and `report.json` (with an `outcome` of `changes`, `blocked-only`, `clean` or `failed`). When `report.md` had to be cut to fit GitHub's size limit, `report-full.md` holds the complete text.
+- **A reusable workflow, `.github/workflows/targeted-reconcile.yml`.** Callers pass `base-branch` and `agent-version` (both required), and optionally `node-version` and `dry-run`, plus two secrets: `alerts-token` to read alerts and `pr-token` to open the pull request. It opens or updates one pull request on `dependabot-agent/targeted`, keeps one `dependabot-agent-blocked` issue current, and fails the job when the run fails or produces no report. The pull request token is separate from `GITHUB_TOKEN` on purpose: pull requests made with `GITHUB_TOKEN` don't trigger a repository's CI.
+
+### Changed
+
+- **The npm guidance after a run is corrected.** The README, the runbook and the agent's own output said a plain `npm install` doesn't apply a changed `overrides` entry. It does for packages reachable from the root `package.json`; it doesn't for packages reachable only through workspace members. A clean reinstall re-resolves the whole tree, so it applies every override but also moves whatever else the declared ranges allow. The agent still prints the clean-reinstall command, now with that explanation. `compatible`, `latest` and pnpm behave as before.
+
+### Status
+
+Targeted mode is new. It has been tested on npm 11.16 on Windows; Linux and npm 10 are still to be confirmed. It has not yet been confirmed on a live repository that Dependabot closes the alerts after the overrides it writes. Run it with `--dry-run` on a real repository first.
+
 ## [1.2.0]
 
 Both changes here concern **workspace members** — the `packages/*` projects that share the root's install and override file. The agent could already see them when reading the dependency tree, but not when updating or when deciding an override could be dropped.

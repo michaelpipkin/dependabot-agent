@@ -823,11 +823,15 @@ export function applyOverrideChanges(
   source.write(newOverrides);
   log(`\n✅ ${source.label} updated at ${source.filePath}`);
   if (pmId === "npm") {
-    // npm resolves from an existing node_modules + package-lock.json and does not
-    // re-resolve just because `overrides` changed — a plain `npm install` (even
-    // --force or --package-lock-only) leaves the old versions in place. Applying
-    // a newly written override needs a clean resolve. Verified on npm 11.
-    log("   Then apply them with a clean install — npm won't re-resolve otherwise:");
+    // Verified on npm 11: a plain `npm install` applies an override to a package
+    // reachable from the root package.json, but not to one reachable only through
+    // workspace members, where it leaves the old version in place (--force and
+    // --package-lock-only make no difference). A clean reinstall re-resolves the
+    // whole tree, which applies every override but also moves whatever else the
+    // declared ranges now allow. The targeted strategy applies overrides itself.
+    log("   Then apply them. Run `npm install`: npm applies an override to any package the root");
+    log("   package.json reaches, but not to one reached only through workspace members.");
+    log("   To re-resolve the whole tree, which can move other packages too, clear it first:");
     log("      rm -rf node_modules package-lock.json && npm install");
   } else {
     log("   Run `pnpm install` to apply the new overrides to your lockfile.");

@@ -1,0 +1,192 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Reusable workflow for the `targeted` update strategy (npm only). A repository
+# calls it from its own `schedule` and `workflow_dispatch`; see "Targeted mode
+# (npm)" in the README for a calling workflow and for what each token needs.
+name: Targeted Dependabot fixes
+
+on:
+  workflow_call:
+    inputs:
+      base-branch:
+        description: "Branch to run against and to open the pull request into."
+        type: string
+        required: true
+      agent-version:
+        description: "Version of dependabot-agent to run. Required so each caller pins what it trusts."
+        type: string
+        required: true
+      node-version:
+        description: "Node.js version to run the agent with."
+        type: string
+        default: "22"
+      dry-run:
+        description: "Print the plan to the job summary. Writes nothing: no pull request, no issue."
+        type: boolean
+        default: false
+    secrets:
+      alerts-token:
+        description: "Can read Dependabot alerts: a classic PAT with security_events, or a fine-grained token or GitHub App with Dependabot alerts: read. The built-in GITHUB_TOKEN can't."
+        required: true
+      pr-token:
+        description: "Opens the pull request. Not GITHUB_TOKEN: PRs it opens don't trigger your CI. Needs contents and pull requests write."
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.base-branch }}
+          # create-pull-request pushes with pr-token, so no credential needs to stay in .git.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # The agent needs no node_modules: every npm command it runs is --package-lock-only.
+      # It exits 1 when the run fails, and the report is still read below, so don't stop here.
+      - name: Run dependabot-agent (targeted)
+        id: agent
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.alerts-token }}
+          AGENT_VERSION: ${{ inputs.agent-version }}
+          AGENT_DRY_RUN: ${{ inputs.dry-run }}
+          AGENT_REPOSITORY: ${{ github.repository }}
+          # Outside the checkout, so create-pull-request can't commit the report.
+          AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+        run: |
+          args=(--update-strategy targeted --repo "$AGENT_REPOSITORY" --report "$AGENT_REPORT_DIR")
+          if [ "$AGENT_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          npx -y "dependabot-agent@${AGENT_VERSION}" "${args[@]}"
+
+      # No report.json means the run never got as far as writing one (a crash at
+      # startup, or npx couldn't fetch the package). That counts as failed.
+      - name: Read the report
+        id: report
+        env:
+          AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+          AGENT_STEP_OUTCOME: ${{ steps.agent.outcome }}
+        run: |
+          set -euo pipefail
+          dir="$AGENT_REPORT_DIR"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          outcome=""
+          blocked=0
+          restore=false
+
+          if [ -f "$dir/report.md" ] && [ -f "$dir/report.json" ] && jq -e . "$dir/report.json" > /dev/null 2>&1; then
+            outcome=$(jq -r '.outcome? // empty' "$dir/report.json" 2> /dev/null || true)
+            blocked=$(jq -r '.blockedCount? // 0' "$dir/report.json" 2> /dev/null || echo 0)
+            if [ "$(jq -r '(.restoreError? // "") | tostring | length' "$dir/report.json" 2> /dev/null || echo 0)" != "0" ]; then
+              restore=true
+            fi
+          fi
+          case "$outcome" in changes | blocked-only | clean | failed) ;; *) outcome="" ;; esac
+          case "$blocked" in '' | *[!0-9]*) blocked=0 ;; esac
+
+          if [ -z "$outcome" ]; then
+            outcome=failed
+            blocked=0
+            restore=false
+            mkdir -p "$dir"
+            rm -f "$dir/report-full.md"
+            cat > "$dir/report.md" << EOF
+          # Targeted dependency fixes
+
+          > **The run failed and no report was produced.** The agent may have stopped before it started, or npx could not fetch it. See the [workflow run]($run_url) for its log.
+          EOF
+          elif [ "$AGENT_STEP_OUTCOME" != "success" ] && [ "$outcome" != "failed" ]; then
+            # An error exit means whatever the report says can't be trusted to match the files.
+            outcome=failed
+            for file in "$dir/report.md" "$dir/report-full.md"; do
+              if [ -f "$file" ]; then
+                printf '\n\n> The agent exited with an error after writing this report, so the run is treated as failed. See the [workflow run](%s).\n' "$run_url" >> "$file"
+              fi
+            done
+          fi
+          if [ "$restore" = "true" ]; then
+            outcome=failed
+          fi
+
+          # report.md promises the complete report is in the job summary when it was cut.
+          summary="$dir/report.md"
+          if [ -f "$dir/report-full.md" ]; then
+            summary="$dir/report-full.md"
+          fi
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "outcome=$outcome"
+            echo "blocked-count=$blocked"
+            echo "restore-error=$restore"
+          } >> "$GITHUB_OUTPUT"
+
+      # Runs for clean and blocked-only too: with no diff, create-pull-request closes
+      # a stale PR from an earlier run instead of leaving it open.
+      - name: Open or update the pull request
+        if: ${{ steps.report.outputs.outcome != 'failed' && steps.report.outputs.restore-error != 'true' && !inputs.dry-run }}
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.pr-token }}
+          base: ${{ inputs.base-branch }}
+          branch: dependabot-agent/targeted
+          # Only the fix: nothing else in the checkout may be committed.
+          add-paths: "**/package.json,**/package-lock.json"
+          commit-message: "fix(deps): resolve Dependabot alerts with targeted changes"
+          title: "fix(deps): resolve Dependabot alerts with targeted changes"
+          body-path: ${{ runner.temp }}/agent-report/report.md
+          delete-branch: true
+
+      - name: Update the blocked-alerts issue
+        id: issue
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OUTCOME: ${{ steps.report.outputs.outcome }}
+          BLOCKED_COUNT: ${{ steps.report.outputs.blocked-count }}
+          AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+        run: |
+          set -euo pipefail
+          label="dependabot-agent-blocked"
+          title="Dependabot alerts the agent could not fix"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          open=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          case "$OUTCOME" in
+            blocked-only | failed)
+              gh label create "$label" --color B60205 --description "Dependabot alerts that dependabot-agent left for a person" --force > /dev/null
+              if [ -n "$open" ]; then
+                gh issue edit "$open" --title "$title" --body-file "$AGENT_REPORT_DIR/report.md"
+              else
+                gh issue create --title "$title" --label "$label" --body-file "$AGENT_REPORT_DIR/report.md"
+              fi
+              ;;
+            clean | changes)
+              # With a PR open and some copies still blocked, the PR's report lists them. Leave the issue alone.
+              if [ "$OUTCOME" = "clean" ] || [ "$BLOCKED_COUNT" = "0" ]; then
+                if [ -n "$open" ]; then
+                  gh issue close "$open" --comment "Nothing is blocked as of [this run]($run_url)."
+                fi
+              fi
+              ;;
+          esac
+
+      - name: Fail the job when the run failed
+        if: ${{ !cancelled() && steps.report.outputs.outcome == 'failed' }}
+        run: |
+          echo "::error title=dependabot-agent failed::The targeted run failed, so no pull request was opened. See the job summary."
+          exit 1
