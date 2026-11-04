@@ -41,6 +41,8 @@ const text = readFileSync(WORKFLOW, "utf-8");
 const wf = yaml.load(text) as Workflow;
 const steps = Object.values(wf.jobs)[0].steps;
 
+const have = (tool: string): boolean => spawnSync("bash", ["-c", `command -v ${tool}`]).status === 0;
+
 const findStep = (needle: string): Step => {
   const step = steps.find((s) => s.uses?.startsWith(needle) || s.id === needle);
   assert.ok(step, `no step matching ${needle}`);
@@ -65,7 +67,8 @@ describe("targeted workflow: shape", () => {
   });
 
   it("asks for only the permissions it uses", () => {
-    assert.deepEqual(wf.permissions, { contents: "write", "pull-requests": "write", issues: "write" });
+    // The PR is opened with pr-token, so GITHUB_TOKEN only checks out and manages the issue.
+    assert.deepEqual(wf.permissions, { contents: "read", issues: "write" });
   });
 
   it("checks out the branch the PR will target", () => {
@@ -93,11 +96,67 @@ describe("targeted workflow: tokens", () => {
     assert.equal(findStep("agent").env?.GITHUB_TOKEN, "${{ secrets.alerts-token }}");
   });
 
-  it("commits only the fix", () => {
+  it("names the PR branch and base", () => {
     const step = findStep("peter-evans/create-pull-request");
-    assert.equal(step.with?.["add-paths"], "**/package.json,**/package-lock.json");
     assert.equal(step.with?.branch, "dependabot-agent/targeted");
     assert.equal(step.with?.base, "${{ inputs.base-branch }}");
+  });
+});
+
+// Entries as create-pull-request reads them: comma or newline separated, each handed to `git add -- <entry>`.
+const addPaths = (): string[] =>
+  String(findStep("peter-evans/create-pull-request").with?.["add-paths"])
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+const git = (cwd: string, ...args: string[]): string => {
+  const result = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout;
+};
+
+describe("targeted workflow: what gets committed", { skip: !have("git") && "needs git" }, () => {
+  it("stages every package file, at the root and below, and nothing else", () => {
+    const dir = mkdtempSync(join(tmpdir(), "targeted-addpaths-"));
+    try {
+      git(dir, "init", "-q");
+      git(dir, "config", "user.email", "test@example.com");
+      git(dir, "config", "user.name", "test");
+      const files = [
+        "package.json",
+        "package-lock.json",
+        "functions/package.json",
+        "functions/package-lock.json",
+        "packages/app/package.json",
+        "src/index.js",
+        "README.md",
+        "tsconfig.json",
+        "docs/package.json.md",
+      ];
+      const write = (stamp: string): void => {
+        for (const file of files) {
+          mkdirSync(join(dir, path.dirname(file)), { recursive: true });
+          writeFileSync(join(dir, file), stamp);
+        }
+      };
+      write("before\n");
+      git(dir, "add", "--", ".");
+      git(dir, "commit", "-q", "-m", "initial");
+      write("after\n");
+
+      git(dir, "add", "--", ...addPaths());
+      const staged = git(dir, "diff", "--cached", "--name-only").split("\n").filter(Boolean).sort();
+      assert.deepEqual(staged, [
+        "functions/package-lock.json",
+        "functions/package.json",
+        "package-lock.json",
+        "package.json",
+        "packages/app/package.json",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -112,6 +171,12 @@ describe("targeted workflow: the agent step", () => {
     assert.match(run, /--update-strategy targeted/);
     assert.match(run, /--report "\$AGENT_REPORT_DIR"/);
     assert.match(run, /--dry-run/);
+  });
+
+  it("runs no install scripts, and ignores a caller's exitCode setting", () => {
+    const env = findStep("agent").env ?? {};
+    assert.equal(env.NPM_CONFIG_IGNORE_SCRIPTS, "true");
+    assert.equal(env.EXIT_CODE, "false");
   });
 
   it("keeps the report outside the checkout so it can't be committed", () => {
@@ -144,7 +209,6 @@ describe("targeted workflow: gates", () => {
 // Running the shell steps
 // ---------------------------------------------------------------------------
 
-const have = (tool: string): boolean => spawnSync("bash", ["-c", `command -v ${tool}`]).status === 0;
 const canRun = have("jq") && have("bash");
 
 interface Sandbox {

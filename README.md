@@ -559,8 +559,7 @@ on:
 jobs:
   targeted:
     permissions: # a called workflow can't hold more than its caller grants
-      contents: write
-      pull-requests: write
+      contents: read
       issues: write
     uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@vX.Y.Z # pin a tag or a commit SHA
     with:
@@ -596,17 +595,17 @@ Every outcome writes the report to the job summary (the full one, when the pull 
 **Two tokens, and why not `GITHUB_TOKEN`**
 
 - **`alerts-token`** reads the Dependabot alerts. The built-in `GITHUB_TOKEN` can't, under any `permissions:` setting. Use a classic personal access token with `security_events`, or a fine-grained token or GitHub App with **Dependabot alerts: read**. It is given to the agent step only.
-- **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. It must not be `GITHUB_TOKEN`, for two reasons:
+- **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. It must not be `GITHUB_TOKEN`, for two reasons:
   1. A pull request created with `GITHUB_TOKEN` does not trigger `pull_request` workflows, so your CI would never run on it. This mode relies on CI for all build and test verification.
   2. A pull request's author can't approve it. If the token belongs to a person, that person can't be a reviewer. Use a **GitHub App** or a **service account** that no reviewer is signed in as. The tool doesn't prefer one: pick whichever your organisation already approves. One credential can serve both inputs if it holds both sets of permissions.
 
-The issue step uses the job's own `GITHUB_TOKEN`, which is why the workflow asks for `issues: write`.
+The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents: read`) and to manage the blocked-alerts issue (`issues: write`).
 
 **What your organisation may need to approve**
 
 - The third-party action `peter-evans/create-pull-request@v8`, which opens the pull request. The workflow refers to it by tag; if your policy requires commit SHAs, copy the workflow and pin it.
 - `actions/checkout` and `actions/setup-node`, from GitHub.
-- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin and runs with `alerts-token` in its environment.
+- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin and runs with `alerts-token` in its environment. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies while the token is present. Pinning the version still matters: the agent's own code runs with the token.
 - The two tokens above.
 
 The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.

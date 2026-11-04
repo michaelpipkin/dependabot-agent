@@ -32,9 +32,10 @@ on:
         description: "Opens the pull request. Not GITHUB_TOKEN: PRs it opens don't trigger your CI. Needs contents and pull requests write."
         required: true
 
+# GITHUB_TOKEN only checks out the repository and manages the issue. The pull request
+# is opened with pr-token, which carries its own permissions.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
   issues: write
 
 jobs:
@@ -65,6 +66,10 @@ jobs:
           AGENT_REPOSITORY: ${{ github.repository }}
           # Outside the checkout, so create-pull-request can't commit the report.
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+          # npx runs no install scripts of the package or its dependencies while alerts-token is in the environment.
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+          # A caller's exitCode setting would make a run with changes exit 2, which would read as failed.
+          EXIT_CODE: "false"
         run: |
           args=(--update-strategy targeted --repo "$AGENT_REPOSITORY" --report "$AGENT_REPORT_DIR")
           if [ "$AGENT_DRY_RUN" = "true" ]; then
@@ -143,8 +148,13 @@ jobs:
           token: ${{ secrets.pr-token }}
           base: ${{ inputs.base-branch }}
           branch: dependabot-agent/targeted
-          # Only the fix: nothing else in the checkout may be committed.
-          add-paths: "**/package.json,**/package-lock.json"
+          # Only the fix: nothing else in the checkout may be committed. Git's default pathspec
+          # needs a "/" for "**", so the root files are named, and the rest are globs.
+          add-paths: |
+            package.json
+            package-lock.json
+            :(glob)**/package.json
+            :(glob)**/package-lock.json
           commit-message: "fix(deps): resolve Dependabot alerts with targeted changes"
           title: "fix(deps): resolve Dependabot alerts with targeted changes"
           body-path: ${{ runner.temp }}/agent-report/report.md
