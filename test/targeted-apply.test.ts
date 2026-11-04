@@ -643,6 +643,28 @@ describe("a package npm moves beside a fix", () => {
     assert.equal(commands.length, 2);
   });
 
+  it("is never put back when bundled: its version comes from the tarball, so the lockfile would be false", () => {
+    const project = floatProject("^1.0.0");
+    const lockBefore = lockOf(project);
+    lockBefore.packages["node_modules/balanced-match"] = { ...OLD, inBundle: true };
+    writeJson(project.lockFile, lockBefore);
+    const bundledNew = { ...NEW, inBundle: true };
+    const commands: string[] = [];
+    const run: NpmRunner = (command) => {
+      commands.push(command);
+      const lock = lockOf(project);
+      lock.packages["node_modules/minimatch"].version = "3.0.5";
+      lock.packages["node_modules/balanced-match"] = bundledNew;
+      writeJson(project.lockFile, lock);
+    };
+
+    const failures = apply(project, run);
+
+    assert.ok(failures.some((f) => f.check === "nothing-else-moved" && f.path === "node_modules/balanced-match"), JSON.stringify(failures));
+    assert.deepEqual(lockOf(project).packages["node_modules/balanced-match"], bundledNew);
+    assert.equal(commands.length, 2, "no resolve was spent putting it back");
+  });
+
   it("fails verification if npm keeps moving it, and gives up after a few tries", () => {
     const project = floatProject("^1.0.0");
     const { run, commands } = floatingNpm(project, () => true);

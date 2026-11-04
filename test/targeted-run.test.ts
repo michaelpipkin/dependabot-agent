@@ -1523,6 +1523,47 @@ describe("an alert on a manifest that no lockfile in the run answers for", () =>
     assert.deepEqual(treeOf(dir), before);
   });
 
+  it("a package.json inside a committed node_modules is blocked, though the lockfile holds that path", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeFiles(dir, ["node_modules/a/package.json"]);
+    const reportDir = tempDir();
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert({ manifest: "node_modules/a/package.json" })], fakeNpm()));
+
+    assertBlocked(reportDir, "node_modules/a/package.json");
+  });
+
+  it("a pnpm-lock.yaml is blocked when the config forces npm, so the pnpm check passes", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    const reportDir = tempDir();
+    const before = treeOf(dir);
+
+    await runTargeted(cfgFor(dir, { reportDir, packageManager: "npm" }), depsFor([qsAlert({ manifest: "pnpm-lock.yaml" })], fakeNpm()));
+
+    assertBlocked(reportDir, "pnpm-lock.yaml");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("a stuck pin in an isolated package names a path that exists", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeProject(join(dir, "functions"), {
+      root: { name: "functions", dependencies: { ms: "2.0.0" } },
+      packages: { "node_modules/ms": { version: "2.0.5" } },
+    });
+    const reportDir = tempDir();
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([msAlert()], fakeNpm()));
+
+    const [copy] = reportIn(reportDir).alerts[0].copies;
+    assert.equal(reportIn(reportDir).alerts[0].status, "blocked");
+    assert.equal(copy.reason, "pin");
+    assert.equal(copy.path, "functions/package.json");
+  });
+
   it("the rest of the run carries on, and the blocked alert is counted", async () => {
     const dir = tempDir();
     writeProject(dir, qsProject());
@@ -1547,6 +1588,28 @@ describe("an alert on a manifest that no lockfile in the run answers for", () =>
     await runTargeted(cfgFor(dir, { reportDir, dryRun: true }), depsFor([qsAlert({ manifest: "examples/demo/package.json" })], fakeNpm()));
 
     assertBlocked(reportDir, "examples/demo/package.json");
+  });
+});
+
+describe("a failed run beside an npm-shrinkwrap.json", () => {
+  it("restores the shrinkwrap too: npm writes to it, and the report says every file was restored", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeFileSync(join(dir, "npm-shrinkwrap.json"), '{"lockfileVersion":3,"packages":{}}\n');
+    const before = treeOf(dir);
+    const npm = fakeNpm({
+      onResolve(cwd) {
+        writeFileSync(join(cwd, "npm-shrinkwrap.json"), '{"lockfileVersion":3,"changed":true,"packages":{}}\n');
+      },
+    });
+    const failing: NpmRunner = (command, cwd) => {
+      npm.run(command, cwd);
+      throw new Error("npm error code E500");
+    };
+
+    await assert.rejects(runTargeted(cfgFor(dir), depsFor([qsAlert()], { run: failing })), AgentError);
+
+    assert.deepEqual(treeOf(dir), before);
   });
 });
 

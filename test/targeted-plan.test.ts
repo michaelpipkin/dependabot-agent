@@ -125,6 +125,36 @@ describe("an alert on a package.json whose copy is already safe", () => {
     assert.equal(p.alerts[0].copies[0].reason, "pin");
   });
 
+  it("names the path in the lockfile's own terms, which the report places", () => {
+    const p = plan({ alerts: [on("functions/package.json")], lock: safe, manifests: [root(dep("qs", "6.5.0"))], manifestPrefix: "functions" });
+    assert.equal(p.alerts[0].copies[0].path, "package.json");
+    assert.equal(p.alerts[0].manifest, "functions/package.json");
+  });
+
+  it("is blocked when the lockfile has no copy at all", () => {
+    const p = plan({ alerts: [on("packages/a/package.json")], lock: transitive("other", "1.0.0"), manifests: [root(), member("packages/a", dep("qs", "6.5.0"))] });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "pin");
+    assertNoWrites(p);
+  });
+
+  it("is only partly fixed when another copy gets fixed: a fixed copy doesn't close it", () => {
+    const p = plan({
+      alerts: [on("packages/a/package.json")],
+      lock: makeLock({
+        "": {},
+        "packages/a": { name: "a", version: "1.0.0", dependencies: { qs: "6.5.0" } },
+        "packages/b": { name: "b", version: "1.0.0", dependencies: { qs: "^6.5.1" } },
+        "node_modules/qs": { version: "6.9.4" },
+        "packages/b/node_modules/qs": { version: "6.5.1" },
+      }),
+      manifests: [root(), member("packages/a", dep("qs", "6.5.0")), member("packages/b", dep("qs", "^6.5.1"))],
+    });
+    assert.equal(p.alerts[0].status, "partly-fixed", JSON.stringify(p.alerts[0].copies));
+    assert.ok(p.alerts[0].copies.some((c) => c.action !== "blocked"));
+    assert.equal(p.alerts[0].copies.filter((c) => c.reason === "pin").length, 1);
+  });
+
   it("is blocked at the root too", () => {
     const p = plan({ alerts: [on("package.json")], lock: safe, manifests: [root(dep("qs", "6.5.0"))] });
     assert.equal(p.alerts[0].status, "blocked");

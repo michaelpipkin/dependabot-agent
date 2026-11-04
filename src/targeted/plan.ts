@@ -760,14 +760,13 @@ function decide(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert, li
  * tracks what that manifest declares, so the alert won't close however safe the
  * installed copy is, and saying it will would let a run look clean with it still open.
  */
-function stuckOnPin(ctx: PackageContext, alert: DependabotAlert): CopyDecision | null {
-  const declared = alert.dependency.manifest_path;
-  const prefix = ctx.input.manifestPrefix ? `${ctx.input.manifestPrefix}/` : "";
-  const manifest = ctx.input.manifests.find((m) => `${prefix}${manifestFile(m)}` === declared);
-  const pin = manifest?.deps.find((d) => d.name === ctx.name && isExactPin(d.spec) && inRange(parseSimpleSpec(d.spec)!.version, alert) === true);
+function stuckOnPin(input: PlanInput, name: string, alert: DependabotAlert): CopyDecision | null {
+  const prefix = input.manifestPrefix ? `${input.manifestPrefix}/` : "";
+  const manifest = input.manifests.find((m) => `${prefix}${manifestFile(m)}` === alert.dependency.manifest_path);
+  const pin = manifest?.deps.find((d) => d.name === name && isExactPin(d.spec) && inRange(parseSimpleSpec(d.spec)!.version, alert) === true);
   if (!manifest || !pin) return null;
   return {
-    path: declared,
+    path: manifestFile(manifest),
     version: pin.spec,
     action: "blocked",
     reason: "pin",
@@ -854,7 +853,10 @@ function planPackage(
   const outcomes = new Map<DependabotAlert, AlertOutcome>();
   const copies = copiesOf(input.lock, name);
   if (copies.length === 0) {
-    for (const alert of alerts) outcomes.set(alert, outcomeOf(alert, "not-found", []));
+    for (const alert of alerts) {
+      const pinned = stuckOnPin(input, name, alert);
+      outcomes.set(alert, pinned ? outcomeOf(alert, "blocked", [pinned]) : outcomeOf(alert, "not-found", []));
+    }
     return outcomes;
   }
 
@@ -875,8 +877,8 @@ function planPackage(
 
   for (const alert of alerts) {
     const decisions = copies.flatMap((copy) => decide(ctx, copy, alert, lineOf(copy)) ?? []);
-    const pinned = decisions.length === 0 ? stuckOnPin(ctx, alert) : null;
-    if (pinned) decisions.push(pinned);
+    const pinned = stuckOnPin(input, name, alert);
+    if (pinned && !decisions.some((d) => d.reason === "pin")) decisions.push(pinned);
     outcomes.set(alert, outcomeOf(alert, statusOf(decisions), decisions));
   }
   for (const line of lines) recordBumps(ctx, line, plan);

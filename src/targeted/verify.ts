@@ -151,12 +151,15 @@ const isSameProject = (path: string, a: LockEntry, b: LockEntry): boolean =>
 /**
  * The installed packages check 2 would fail for moving version: still at the same
  * path, under the same name, with nothing the plan fixes requiring the new version.
+ * Never a bundled one: its version comes from its parent's tarball, so an older entry
+ * would only make the lockfile disagree with what npm ci installs.
  */
 export function unrequiredMoves(input: Pick<VerifyInput, "before" | "after" | "plan">): string[] {
   const moved = (path: string): boolean => {
     const old = input.before.entries.get(path);
     const now = input.after.entries.get(path);
-    return old?.version !== undefined && now?.version !== undefined && old.name === now.name && path.includes("node_modules/");
+    if (old?.version === undefined || now?.version === undefined || old.inBundle || now.inBundle) return false;
+    return old.name === now.name && path.includes("node_modules/");
   };
   return checkNothingElseMoved(input).flatMap((failure) => (failure.path !== undefined && moved(failure.path) ? [failure.path] : []));
 }

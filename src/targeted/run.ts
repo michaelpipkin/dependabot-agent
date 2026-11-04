@@ -109,14 +109,27 @@ function nearestLockfileDir(root: string, from: string, owners: Set<string>): st
   return root;
 }
 
-/** What an alert's manifest may be called for this run to answer it. pnpm-lock.yaml goes on to the pnpm check, which stops the run. */
+/** What an alert's manifest may be called for this run to answer it. pnpm-lock.yaml goes on to the pnpm check, and is refused if that passes. */
 const MANIFEST_FILES = new Set(["package.json", "package-lock.json", "pnpm-lock.yaml"]);
+
+const notReadDetail = (manifest: string): string =>
+  `${manifest} is a lockfile this run doesn't read: it fixes package-lock.json only, so a change here wouldn't close this alert.`;
 
 /** Whether the lockfile in `dir` holds `at`, a directory below it, as a workspace member or `file:` package. */
 function lockfileHolds(dir: string, at: string): boolean {
   // Nothing to look in: the group's own read of this directory stops the run and says why.
   if (!existsSync(path.join(dir, "package-lock.json")) || hasOldLockfile(dir)) return true;
-  return readLockfile(dir).entries.has(posix(path.relative(dir, at)));
+  const relative = posix(path.relative(dir, at));
+  return !/(^|\/)node_modules\//.test(relative) && readLockfile(dir).entries.has(relative);
+}
+
+/** Once the pnpm checks have passed, a pnpm-lock.yaml alert means the config forced npm, and nothing here reads that file. */
+function refusePnpmLockAlerts(placed: PlacedAlerts): void {
+  const isPnpmLock = (alert: DependabotAlert): boolean => path.basename(alert.dependency.manifest_path) === "pnpm-lock.yaml";
+  for (const alert of placed.processed.filter(isPnpmLock)) {
+    placed.unprocessed.push(unprocessedAlert(alert, notReadDetail(alert.dependency.manifest_path)));
+  }
+  placed.processed = placed.processed.filter((alert) => !isPnpmLock(alert));
 }
 
 interface PlacedAlerts {
@@ -151,7 +164,7 @@ function placeAlerts(open: DependabotAlert[], cfg: ResolvedConfig, extraDirs: st
       continue;
     }
     if (!MANIFEST_FILES.has(path.basename(manifest))) {
-      refuse(`${manifest} is a lockfile this run doesn't read: it fixes package-lock.json only, so a change here wouldn't close this alert.`);
+      refuse(notReadDetail(manifest));
       continue;
     }
     const dir = nearestLockfileDir(root, at, owners);
@@ -525,7 +538,9 @@ async function planGroups(
       manifestPrefix: prefix,
     });
     const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
-    const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...manifestFiles])];
+    // npm writes to a shrinkwrap when there is one, so a failed run has to put it back too.
+    const shrinkwrap = path.join(dir, "npm-shrinkwrap.json");
+    const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...(existsSync(shrinkwrap) ? [shrinkwrap] : []), ...manifestFiles])];
     groups.push({ dir, label, prefix, manifests, before: lock, plan, files });
   }
   return groups;
@@ -608,6 +623,7 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
     log(`🧩 Alerted package(s) that discovery skips: ${placed.addedDirs.map((d) => posix(path.relative(cfg.workspaceRoot, d))).join(", ")}`);
     assertTargetedSupported(placed.addedDirs, cfg);
   }
+  refusePnpmLockAlerts(placed);
 
   const groups = await planGroups(cfg, deps, placed.processed, [...extraDirs, ...placed.addedDirs]);
   const alerts = [...groups.flatMap(reportedAlerts), ...placed.unprocessed];

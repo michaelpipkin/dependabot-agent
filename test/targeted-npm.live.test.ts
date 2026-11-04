@@ -319,6 +319,22 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     );
   });
 
+  it("a target that brings new bundled packages fails verification, rather than a lockfile that lies about them", () => {
+    // npm bundles its dependencies, and 8.1.2's bundle differs from 8.1.0's. Putting
+    // those entries back passed every check while `npm ci` installed something else.
+    const dir = project("2030-01-01", { root: { dependencies: { npm: "8.1.0" } } });
+    write(dir, { root: { dependencies: { npm: "^8.1.0" } } });
+    npm(dir, `install --package-lock-only ${QUIET}`);
+    assert.equal(versions(dir).get("node_modules/npm"), "8.1.0");
+
+    const failures = applyPlan(dir, planFor(dir, [alert(1, "npm", "<8.1.2", "8.1.2")]), { limits: {}, manifests: manifestsOf(dir) });
+
+    assert.ok(
+      failures.some((f) => f.check === "nothing-else-moved" && f.path?.startsWith("node_modules/npm/node_modules/")),
+      JSON.stringify(failures.slice(0, 3)),
+    );
+  });
+
   describe("a package npm refetches because only a replaced package used it", () => {
     // balanced-match is used only by brace-expansion. Replacing brace-expansion made
     // npm fetch it again at the newest ^1.0.0, which the policy doesn't allow.
