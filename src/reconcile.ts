@@ -201,26 +201,31 @@ function rangeLowerMajor(range: string): number | null {
  * The base package name behind an override key, stripping a version-selector
  * suffix: "js-yaml@3" → "js-yaml", "@babel/core@7" → "@babel/core", "qs@>=6.0.0
  * <6.7.3" → "qs", "lodash" → "lodash". The leading `@` of a scoped package name
- * is never treated as a selector (the suffix must start with a digit or a range
- * operator).
+ * is never treated as a selector (the suffix must start with a digit, or with
+ * ">=" as in targeted mode's range selectors). Any other suffix, such as
+ * "foo@<2.0.0", is left whole: it is not a shape the agent writes.
  */
 export function baseNameOfOverrideKey(key: string): string {
   const at = key.lastIndexOf("@");
-  if (at > 0 && /^[\d<>=~^]/.test(key.slice(at + 1))) return key.slice(0, at);
+  if (at > 0 && /^(\d|>=)/.test(key.slice(at + 1))) return key.slice(0, at);
   return key;
 }
 
 /**
  * Whether the agent could have written this override, as opposed to a user's
  * hand-written pin. Two shapes are the agent's: a bounded ">=…" spec (every
- * spec computeBoundedSpec writes), and a range-selector key like
- * "qs@>=6.0.0 <6.7.3" (targeted mode, whose spec is a bare version). A key like
- * `foo@2: "2.3.1"` or a flat `foo: "2.3.1"` is a pin someone chose.
+ * spec computeBoundedSpec writes), and exactly the key targeted mode writes —
+ * "name@>=X.Y.Z <A.B.C" with the bare spec "A.B.C", the range's own upper
+ * bound. A key like `foo@2: "2.3.1"`, `foo@<2.0.0: "2.0.0"`, or a flat `foo:
+ * "2.3.1"` is a pin someone chose, and so is a range key whose value isn't its
+ * upper bound.
  */
 export function isAgentAuthoredOverride(key: string, spec: string): boolean {
   if (spec.startsWith(">=")) return true;
   const at = key.lastIndexOf("@");
-  return at > 0 && /^[<>=]/.test(key.slice(at + 1));
+  if (at <= 0) return false;
+  const m = /^>=\d+\.\d+\.\d+ <(\d+\.\d+\.\d+)$/.exec(key.slice(at + 1));
+  return m !== null && m[1] === spec;
 }
 
 /**
@@ -478,12 +483,14 @@ export function computeOverrideChanges(
   // guarantee: open ⇒ keep the override; a load-bearing pin is never dropped
   // while its alert is unresolved).
   //
-  // Only ever remove an AGENT-authored key. Every spec the agent writes is a
-  // bounded ">=…" from computeBoundedSpec, so a key whose spec isn't ">="-shaped
-  // is a user's hand-written pin (e.g. `foo@2: "2.3.1"`) — left untouched even
-  // when its base is alerted, whether it would otherwise be dropped as a stale
-  // variant (superseded) or as an orphan whose alert is now fixed. The agent
-  // never discards a pin it didn't write.
+  // Only ever remove an AGENT-authored key (isAgentAuthoredOverride). The agent
+  // writes two shapes: a bounded ">=…" spec from computeBoundedSpec, and
+  // targeted mode's "name@>=X.Y.Z <A.B.C" key with the bare spec "A.B.C". Any
+  // other key is a user's hand-written pin (e.g. `foo@2: "2.3.1"` or
+  // `foo@<2.0.0: "2.0.0"`) — left untouched even when its base is alerted,
+  // whether it would otherwise be dropped as a stale variant (superseded) or as
+  // an orphan whose alert is now fixed. The agent never discards a pin it didn't
+  // write.
   const handledBaseNames = new Set([...handledKeys].map(baseNameOfOverrideKey));
   for (const [key, existingSpec] of Object.entries(currentOverrides)) {
     if (handledKeys.has(key)) continue; // this exact key was written or kept above

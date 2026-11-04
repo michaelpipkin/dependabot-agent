@@ -1032,4 +1032,27 @@ describe("override key shapes — range selectors", () => {
     assert.equal(isAgentAuthoredOverride("foo@2", "2.3.1"), false);
     assert.equal(isAgentAuthoredOverride("foo", "2.3.1"), false);
   });
+
+  it("isAgentAuthoredOverride only trusts the exact shape targeted mode writes", () => {
+    assert.equal(isAgentAuthoredOverride("foo@<2.0.0", "2.0.0"), false);
+    assert.equal(isAgentAuthoredOverride("foo@>=1.0.0 <2.0.0", "1.5.0"), false);
+    assert.equal(isAgentAuthoredOverride("@babel/core@>=7.0.0 <7.1.0", "7.1.0"), true);
+  });
+
+  it("baseNameOfOverrideKey leaves a hand-written '<' selector whole", () => {
+    assert.equal(baseNameOfOverrideKey("foo@<2.0.0"), "foo@<2.0.0");
+  });
+
+  it("computeOverrideChanges leaves a hand-written 'foo@<2.0.0' pin untouched when foo is alerted", () => {
+    const changes = computeOverrideChanges(
+      { "foo@<2.0.0": "2.0.0" },
+      [vuln("foo", "2.5.0", "2.5.1")],
+      new Set(["foo"]),
+    );
+    assert.equal(
+      changes.find((c) => c.packageName === "foo@<2.0.0"),
+      undefined,
+      "the user's pin is preserved",
+    );
+  });
 });
