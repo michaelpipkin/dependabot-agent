@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
-## [Unreleased]
+## [1.3.0]
+
+Adds a `targeted` strategy for teams that don't allow a general `npm update`, with a reusable GitHub Actions workflow. Nothing changes unless you choose it: `compatible`, `latest` and pnpm produce the same overrides as before.
 
 ### Added
 
@@ -22,9 +24,17 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 
 - **A config file's `updateStrategy` is now checked.** A value other than `compatible`, `latest` or `targeted` stops the run at startup, as `UPDATE_STRATEGY` and `--update-strategy` already did. A typo used to run the bulk update without a word, which is exactly what someone asking for `targeted` wants to avoid.
 
+### Security
+
+What a security reviewer needs is in [Security review](README.md#security-review): what runs where, what leaves the machine, and what hasn't been tested. In short:
+
+- **The reusable workflow keeps secrets away from the agent.** The job that runs the agent refers to no secret, because a hosted runner gives steps `sudo`, and a job's runner memory holds the secrets it refers to. A compromised agent package could still put a harmful change to package files in the pull request, and that pull request triggers CI before anyone reviews it.
+- **Lookups go to the public registry.** Package names go to `registry.npmjs.org` whatever `.npmrc` says, which can include a private package's name.
+- **On a public repository, alerts are public for a day,** including fixed and dismissed ones, as a workflow artifact.
+
 ### Status
 
-Targeted mode is new. Use npm 11.3 or newer: npm 10 and 11.0 can fail safely on some trees, so the reusable workflow defaults to Node 24, which ships npm 11, and the log and the report say which npm ran. On a live repository, Dependabot closed every alert it fixed and left open the ones it reported as blocked. Run it with `--dry-run` on a real repository first.
+Targeted mode is new, and has only been run on small test repositories, not a real application. On those, Dependabot closed every alert it fixed and left open the ones it reported as blocked. It has had no independent security audit. Use npm 11.3 or newer: npm 10 and 11.0 can fail safely on some trees, so the reusable workflow defaults to Node 24, which ships npm 11, and the log and the report say which npm ran. See [Trying it safely](README.md#trying-it-safely).
 
 ## [1.2.0]
 

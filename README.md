@@ -2,7 +2,11 @@
 
 An on-demand CLI agent that reconciles dependency **overrides** against open GitHub Dependabot alerts. Works with both **npm** and **pnpm**, in single-package projects and monorepos.
 
+**If your team doesn't allow a general `npm update`,** see [Targeted mode](#targeted-mode-npm): it moves only the packages an alert requires, to the earliest version that fixes it, or reports why it can't. If you're reviewing it for your organisation, start with [Security review](#security-review).
+
 ## What it does
+
+These are the default `compatible` and `latest` strategies. Targeted mode works differently: it makes no bulk update.
 
 1. **Detects** your package manager from the lockfile (`pnpm-lock.yaml` → pnpm, `package-lock.json` → npm), or you can set it explicitly.
 2. **Detects** where overrides live:
@@ -25,9 +29,10 @@ An on-demand CLI agent that reconciles dependency **overrides** against open Git
   - **Classic** — the `security_events` scope (or the broader `repo` scope).
   - **Fine-grained** — the **Dependabot alerts** repository permission, set to **Read**, on the target repo(s).
 
-  **In CI, this must be a real PAT stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
+  **In CI, this must be a real credential stored as a secret** — the automatic `GITHUB_TOKEN` that GitHub
   Actions injects cannot read the Dependabot alerts API under any circumstance. See
-  [CI integration](#ci-integration-github-actions) below.
+  [CI integration](#ci-integration-github-actions) below. Targeted mode's
+  [reusable workflow](#running-it-in-github-actions) also accepts a GitHub App.
 
 ## Install & invoke
 
@@ -158,7 +163,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 
 | Flag | Env fallback | Default | Description |
 |---|---|---|---|
-| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT that can read Dependabot alerts (classic: `security_events` scope; fine-grained: **Dependabot alerts** read — see [Requirements](#requirements)). **Required.** Never read from a config file. |
+| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT that can read Dependabot alerts (classic: `security_events` scope; fine-grained: **Dependabot alerts** read — see [Requirements](#requirements)). **Required**, unless `--alerts-file` supplies the alerts. Never read from a config file. |
 | `--repo <owner/repo>` | `GITHUB_REPO` | — | Target repository. **Required.** |
 | `--package-manager <pnpm\|npm>` | `PACKAGE_MANAGER` | auto-detect | Override lockfile-based detection. |
 | `--workspace-root <path>` | `WORKSPACE_ROOT` | cwd | Project root. |
@@ -421,14 +426,73 @@ Targeted mode is for teams that don't run a general `npm update`: packages move 
 dependabot-agent --update-strategy targeted --dry-run
 ```
 
-> **Status: new.** Targeted mode is recent.
+> **Status: new in 1.3.0, and not yet run on a real application.** See [What hasn't been tested](#what-hasnt-been-tested).
 >
 > - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
-> - On a live repository, Dependabot closed every alert this mode fixed, including those fixed through the [temporary root step](#workspaces), and left open the ones it reported as blocked. Closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports them as awaiting close.
+> - On a test repository, Dependabot closed every alert this mode fixed, including those fixed through the [temporary root step](#workspaces), and left open the ones it reported as blocked. Closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports them as awaiting close.
 >
-> **Run it with `--dry-run` on a real repository first**, read the plan, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
+> **Follow [Trying it safely](#trying-it-safely) on a real repository first**, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
 
 It supports npm only. Run against a pnpm project, it stops at startup with an error, before anything is written. `compatible`, `latest` and everything on pnpm behave as before.
+
+### Trying it safely
+
+Each step needs more access than the one before, so you can stop at any of them. The first two stay on your machine.
+
+**1. A dry run, locally.** You need Node 22 or newer, npm 11.3 or newer, and a token that can read Dependabot alerts on one repository: a fine-grained token with **Dependabot alerts: read** is enough. Use a clean, up-to-date checkout of the default branch, since that's the branch alerts track, and put any limits in `dependabot-agent.config.json` at its root, without committing it. Run this from that checkout, with the report outside it:
+
+```bash
+export GITHUB_TOKEN=<token> # PowerShell: $env:GITHUB_TOKEN = "<token>"
+npx -y dependabot-agent@1.3.0 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
+```
+
+This reads the alerts and the lockfile, and looks up published versions. It needs no `node_modules`, changes nothing in the repository, and writes only the report. Read `report.md`. **A dry run only plans: it never resolves anything with npm,** so it can't show peer dependency conflicts, `legacy-peer-deps` problems or a failed check.
+
+**2. A real run, locally, not pushed.** Run the same command without `--dry-run`. It needs no more access, edits only `package.json` and `package-lock.json` files, and never pushes. Check the result with `git diff`, then `npm ci` and your build and tests. `npm ci` runs your dependencies' install scripts, as it always does, so run it where you'd normally trust that. Undo everything with `git restore .`.
+
+**3. A dry run in GitHub Actions.** Call the [reusable workflow](#running-it-in-github-actions) with `dry-run: true`. The plan goes to the job summary, and no pull request or issue is created. This only needs read access to alerts: a GitHub App with just **Dependabot alerts: read**, or one read-only token passed as both `alerts-token` and `pr-token`.
+
+**4. A real run in GitHub Actions.** Give the credential its write permissions, set `dry-run` to `false`, and review the first pull request closely.
+
+### Security review
+
+The workflow's design and its limits are in [What the agent's code can reach](#what-the-agents-code-can-reach). Credentials are in [Credentials](#credentials), and third-party actions in [What your organisation may need to approve](#what-your-organisation-may-need-to-approve).
+
+#### What runs where
+
+The reusable workflow has three jobs. On GitHub-hosted runners, each gets its own fresh machine.
+
+| Job | What runs | Secrets it refers to | Its `GITHUB_TOKEN` | Talks to |
+|---|---|---|---|---|
+| `alerts` | GitHub's actions, `gh`, `jq` | All of them, though it only uses the App key or `alerts-token` | None | GitHub |
+| `plan` | **The agent and npm** | **None** | `contents: read` | The npm registry in your `.npmrc`, `registry.npmjs.org`, GitHub to fetch and save artifacts |
+| `publish` | GitHub's actions, `peter-evans/create-pull-request`, `git`, `gh` | The App key or `pr-token` | `contents: read`, `issues: write` | GitHub |
+
+Run locally, the agent holds whatever token you give it, and talks to `api.github.com`, `registry.npmjs.org` and your npm registry.
+
+#### What the agent does on the machine
+
+- It runs no project code. Every npm command it runs has `--package-lock-only --ignore-scripts`, and it needs no `node_modules`.
+- It only writes `package.json` and `package-lock.json` files, and the report. If a check fails, it restores them.
+- It has two runtime dependencies, `js-yaml` and `semver`. Releases are published from GitHub Actions with npm provenance, which `npm audit signatures` can check.
+
+#### What leaves the machine
+
+- **To `registry.npmjs.org`:** the names of alerted packages found in your lockfile, to read their published versions. When it's deciding whether an override it wrote can be removed, also the name and version of each installed package that depends on that override's package. **This address is fixed, and doesn't follow `.npmrc`,** so **a private package's name can reach the public registry** if it's in one of those lists. If that registry is blocked, the run fails and changes nothing.
+- **To your npm registry, through npm:** what `npm install --package-lock-only` normally requests.
+- **To GitHub:** the pull request, the issue, the job summary and the artifacts. These hold package names and versions, advisory severities, and what was fixed or blocked, and are as visible as your repository's Actions runs. See the note on public repositories [below](#what-the-agents-code-can-reach).
+- Nothing else: the agent has no telemetry.
+
+#### What hasn't been tested
+
+Be aware of these when deciding how far to go:
+
+- **A real application.** All live runs so far have been on small test repositories. Peer dependency conflicts and `legacy-peer-deps` haven't been seen on a real tree, which is what step 2 of [Trying it safely](#trying-it-safely) is for.
+- **A private npm registry.** Lookups go to the public registry, as above, and the workflow doesn't set up credentials for a private one.
+- **GitHub Enterprise Server.** The agent's API address is fixed at `api.github.com`, and the workflow has only been run on github.com. With `--alerts-file`, the agent itself makes no GitHub call.
+- **A self-hosted runner.** The separation between jobs relies on each getting a fresh machine, and the workflow specifies `ubuntu-latest`. On a long-lived runner, code from `plan` could outlast its job.
+- **A pull request opened with two tokens on the three-job workflow.** Every step up to the push has run, and a pull request with tokens completed on an earlier version of the workflow. The GitHub App path has run in full.
+- **An independent security audit.** It hasn't had one. The memory test described below was one run, on one runner.
 
 ### What it changes, and what it doesn't
 
@@ -572,10 +636,10 @@ jobs:
     permissions: # a called workflow can't hold more than its caller grants
       contents: read
       issues: write
-    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@vX.Y.Z # pin a tag or a commit SHA
+    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@v1.3.0 # pin a tag or a commit SHA
     with:
       base-branch: main
-      agent-version: "X.Y.Z" # the first release that includes targeted mode
+      agent-version: "1.3.0" # keep this in step with the workflow's version
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:
       alerts-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
@@ -587,7 +651,7 @@ To use a GitHub App instead of tokens, replace the two tokens with the App's Cli
 ```yaml
     with:
       base-branch: main
-      agent-version: "X.Y.Z"
+      agent-version: "1.3.0"
       app-client-id: ${{ vars.DEPENDABOT_APP_CLIENT_ID }}
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:
@@ -597,7 +661,7 @@ To use a GitHub App instead of tokens, replace the two tokens with the App's Cli
 | Input | Default | |
 |---|---|---|
 | `base-branch` | required | The branch the run starts from and the pull request targets. |
-| `agent-version` | required | The `dependabot-agent` version to run. Required so every caller pins what it trusts. |
+| `agent-version` | required | The `dependabot-agent` version to run, 1.3.0 or later. Required so every caller pins what it trusts. |
 | `node-version` | `"24"` | Node version for the run, and so the npm that resolves the lockfile: Node 24 ships npm 11. See [Supported npm versions](#supported-npm-versions). |
 | `dry-run` | `false` | Sets `DRY_RUN`. The plan goes to the job summary and nothing is written: no pull request, no issue. This input decides on its own: a `"dryRun"` in your config file doesn't count in this workflow, so it can't stop a real run from opening its pull request. |
 | `app-client-id` | none | A GitHub App's Client ID, used with the `app-private-key` secret instead of `alerts-token` and `pr-token`. See [Credentials](#credentials). |
@@ -639,7 +703,7 @@ If you add a permission to an App after installing it, the installation's owner 
 - **`alerts-token`** reads the Dependabot alerts. Use a fine-grained token limited to the repository, with **Dependabot alerts: read**. A classic personal access token with `security_events` also works, but it reaches every repository its owner can and can also dismiss alerts. It is used only by the step that fetches the alerts.
 - **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. If it belongs to a person, that person can't approve the pull requests, so a service account no reviewer signs in as is better.
 
-**What the agent's code can reach**
+#### What the agent's code can reach
 
 A hosted runner gives steps `sudo`, so code running in a job can read the runner's memory, and that memory holds every secret the job refers to, even in an expression that only asks whether a secret was passed. So the workflow runs in three jobs, each on its own machine, and the one that runs the agent refers to no secret at all:
 
@@ -647,7 +711,7 @@ A hosted runner gives steps `sudo`, so code running in a job can read the runner
 - **`plan`** runs the agent, which reads that file instead of calling GitHub. It refers to no secret, and its `GITHUB_TOKEN` can only read the repository. Its results are a report and a patch of the package files.
 - **`publish`** starts from a clean checkout and runs none of the agent's code. It refuses a patch that does more than edit `package.json` and `package-lock.json` contents, or that disagrees with the report, then uses the write credential to open the pull request and its `GITHUB_TOKEN` to manage the issue.
 
-So a compromised agent package or dependency can't reach your tokens or, with an App, the private key. This was tested on a hosted runner: searching the runner's memory for a test secret found it in a job that only asked whether it was passed, and not in a job of the same workflow that didn't refer to it. It relies on how GitHub delivers secrets to runners, so it's worth keeping `plan` free of them if you copy this workflow.
+So a compromised agent package or dependency shouldn't be able to reach your tokens or, with an App, the private key. This was tested once on a GitHub-hosted runner: searching the runner's memory for a test secret found it in a job that only asked whether it was passed, and not in a job of the same workflow that didn't refer to it. It relies on how GitHub delivers secrets to runners, and on each job getting a fresh machine, so keep `plan` free of secrets if you copy this workflow, and don't run it on a long-lived self-hosted runner.
 
 **It isn't a complete barrier.** Assume such a package could still do these, and pin a version you trust:
 
@@ -660,13 +724,14 @@ The alerts, report and patch are kept as workflow artifacts for one day, and, li
 
 The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents: read`) and to manage the blocked-alerts issue (`issues: write`).
 
-**What your organisation may need to approve**
+#### What your organisation may need to approve
 
+- **Calling this workflow at all.** It lives in a personal repository, `michaelpipkin/dependabot-agent`, so your organisation's Actions policy may need to allow it. If you'd rather not depend on it, pin a commit SHA instead of a tag, or copy the workflow into a repository you control.
 - The third-party action `peter-evans/create-pull-request`, which opens the pull request. The workflow pins it to a full commit SHA (v8.1.1).
 - `actions/create-github-app-token`, from GitHub, pinned the same way (v3.3.0). It runs only if you use a GitHub App, in the `alerts` and `publish` jobs.
 - `actions/upload-artifact` and `actions/download-artifact`, from GitHub, pinned the same way, which carry the alerts, report and patch between the jobs.
 - `actions/checkout` and `actions/setup-node`, from GitHub, which it refers to by tag. If your policy requires commit SHAs for these too, copy the workflow and pin them.
-- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin, in a job that refers to no secrets. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies. Pinning the version still matters: see [What the agent's code can reach](#credentials).
+- The `dependabot-agent` package itself, which the workflow fetches with `npx` at the version you pin, in a job that refers to no secrets. The workflow sets `NPM_CONFIG_IGNORE_SCRIPTS` for that step, so npm runs no install scripts from the package or its dependencies. Pinning the version still matters: see [What the agent's code can reach](#what-the-agents-code-can-reach).
 - The GitHub App or the two tokens above.
 
 The workflow doesn't set up credentials for a private npm registry. If your lockfile depends on one, copy the workflow and add that step.
