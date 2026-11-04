@@ -1,6 +1,7 @@
 import semver from "semver";
-import { declaredRange, lineStart, matchesLimit, overrideKeyName, Plan, selectorCatches } from "./plan.js";
 import { edgesOf, LockEntry, LockIndex, reachableFrom, resolveDep } from "./lockfile.js";
+import { overrideKeyName } from "./override-keys.js";
+import { declaredRange, lineStart, matchesLimit, Plan, selectorCatches } from "./plan.js";
 
 export type CheckName =
   | "fixed"

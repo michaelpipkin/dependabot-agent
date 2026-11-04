@@ -8,9 +8,7 @@ import type { DirectDep } from "../manifest.js";
 import { readNpmOverrides } from "../override-source.js";
 import { detectPackageManager } from "../package-manager/index.js";
 import {
-  baseNameOfOverrideKey,
   highestOverrideFloor,
-  isAgentAuthoredOverride,
   judgeOrphanedOverride,
   loadBearingAlertNames,
   resolvePmForDir,
@@ -24,6 +22,7 @@ import { applyPlan, snapshotFiles, tryRemoveOverride } from "./apply.js";
 import type { NpmRunner, Snapshot } from "./apply.js";
 import { copiesOf, edgesOf, edgesTo, readLockfile } from "./lockfile.js";
 import type { LockEntry, LockIndex } from "./lockfile.js";
+import { isAgentAuthoredOverride, selectorKeyName } from "./override-keys.js";
 import { buildPlan } from "./plan.js";
 import type { ManifestInfo, Plan } from "./plan.js";
 import { computeOutcome, renderMarkdown, writeReport } from "./report.js";
@@ -252,7 +251,7 @@ async function judgeOrphans(group: Group, ctx: OrphanContext): Promise<Removable
   const flat = readNpmOverrides(group.dir).flat;
   const byBase = new Map<string, string[]>();
   for (const [key, spec] of Object.entries(flat)) {
-    const base = baseNameOfOverrideKey(key);
+    const base = selectorKeyName(key);
     if (!isAgentAuthoredOverride(key, spec) || ctx.loadBearing.has(base) || !ctx.everAlerted.has(base)) continue;
     byBase.set(base, [...(byBase.get(base) ?? []), key]);
   }

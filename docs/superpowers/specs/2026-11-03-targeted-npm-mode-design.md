@@ -169,10 +169,10 @@ Verification failure is all-or-nothing for a first version: restore the snapshot
 
 Keep the existing rules: only `fixed` alerts free an override, upstream ranges must have moved on, and hand-written overrides are never removed. In targeted mode, a removal additionally happens only if it moves no lockfile version. Otherwise keep the override and say so in the report. Replacing a key with the new shape follows the rule under "Existing overrides": it happens only when the key matches what a moving copy's dependents will declare, and a key that still holds another dependent's fix blocks the copy instead.
 
-Two existing functions need to learn the new key shape:
+The range-selector rules live in targeted-only helpers (`src/targeted/override-keys.ts`), and `baseNameOfOverrideKey` and the removal check in `computeOverrideChanges` stay as they are, so `compatible` and `latest` behave exactly as before:
 
-- `baseNameOfOverrideKey` only recognises a selector starting with a digit, so `qs@<6.7.3` must also resolve to `qs`.
-- The agent-authored check in `computeOverrideChanges` looks for a value starting with `>=`. Exact values on range-selector keys must count as agent-authored, while an exact value on a plain name or `name@2` key stays hand-written.
+- A selector key names its package whatever the selector's shape, so `qs@>=6.0.0 <6.7.3` resolves to `qs`.
+- An override is agent-authored when its value starts with `>=`, or when its key is exactly `name@>=X.Y.Z <A.B.C` with the value `A.B.C`. Any other exact value, on a plain name, a `name@2` key or a range key whose value isn't its upper bound, stays hand-written.
 
 ### More than one lockfile
 

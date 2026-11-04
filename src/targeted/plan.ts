@@ -1,6 +1,6 @@
 import semver from "semver";
 import { DepField, DirectDep, isExactPin, parseSimpleSpec } from "../manifest.js";
-import { alertScope, isAgentAuthoredOverride } from "../reconcile.js";
+import { alertScope } from "../reconcile.js";
 import {
   compareSemver,
   compatibleCeiling,
@@ -11,6 +11,7 @@ import {
 } from "../semver.js";
 import { DependabotAlert, DepScope } from "../types.js";
 import { copiesOf, Edge, edgesTo, LockEntry, LockIndex, resolveDep } from "./lockfile.js";
+import { isAgentAuthoredOverride, overrideKeyName } from "./override-keys.js";
 
 export type BlockReason =
   | "no-fix"
@@ -113,14 +114,6 @@ export function matchesLimit(name: string, pattern: string): boolean {
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join(".*");
   return new RegExp(`^${source}$`).test(name);
-}
-
-/** The package an override key names, whatever follows the version `@`. */
-export function overrideKeyName(key: string): string {
-  // Not baseNameOfOverrideKey: it deliberately leaves shapes the agent never
-  // writes ("foo@<2.0.0") whole, and those still name foo for a hand-written pin.
-  const at = key.lastIndexOf("@");
-  return at > 0 ? key.slice(0, at) : key;
 }
 
 // ---------------------------------------------------------------------------

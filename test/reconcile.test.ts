@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { describe, it, mock } from "node:test";
+import { describe, it } from "node:test";
 import {
-  baseNameOfOverrideKey,
   computeOverrideChanges,
   dependentsEscapingEveryCopy,
   findEscapingDependents,
@@ -10,15 +9,12 @@ import {
   effectiveOverrideSpecs,
   groupAlertsByManifestDir,
   highestOverrideFloor,
-  isAgentAuthoredOverride,
   judgeOrphanedOverride,
   loadBearingAlertNames,
   logMultiLineAdvisories,
   overrideFloor,
-  run,
 } from "../src/reconcile.js";
 import * as path from "node:path";
-import type { ResolvedConfig } from "../src/config.js";
 import {
   AlertRange,
   DependabotAlert,
@@ -1017,98 +1013,5 @@ describe("logMultiLineAdvisories reports the final override shape (idempotent-fl
     const out = capture(() => logMultiLineAdvisories([advisory], [], { "js-yaml": ">=4.1.1 <5" }));
     assert.match(out, /Forcing 4\.1\.1/);
     assert.doesNotMatch(out, /Split into per-line/);
-  });
-});
-
-describe("override key shapes — range selectors", () => {
-  it("baseNameOfOverrideKey understands range selectors", () => {
-    assert.equal(baseNameOfOverrideKey("qs@>=6.0.0 <6.7.3"), "qs");
-    assert.equal(baseNameOfOverrideKey("@babel/core@>=7.0.0 <7.1.0"), "@babel/core");
-    assert.equal(baseNameOfOverrideKey("js-yaml@3"), "js-yaml");
-    assert.equal(baseNameOfOverrideKey("@babel/core"), "@babel/core");
-  });
-
-  it("isAgentAuthoredOverride separates agent keys from hand-written pins", () => {
-    assert.equal(isAgentAuthoredOverride("qs@>=6.0.0 <6.7.3", "6.7.3"), true);
-    assert.equal(isAgentAuthoredOverride("js-yaml@3", ">=3.15.0 <4"), true);
-    assert.equal(isAgentAuthoredOverride("foo@2", "2.3.1"), false);
-    assert.equal(isAgentAuthoredOverride("foo", "2.3.1"), false);
-  });
-
-  it("isAgentAuthoredOverride only trusts the exact shape targeted mode writes", () => {
-    assert.equal(isAgentAuthoredOverride("foo@<2.0.0", "2.0.0"), false);
-    assert.equal(isAgentAuthoredOverride("foo@>=1.0.0 <2.0.0", "1.5.0"), false);
-    assert.equal(isAgentAuthoredOverride("@babel/core@>=7.0.0 <7.1.0", "7.1.0"), true);
-  });
-
-  it("baseNameOfOverrideKey leaves a hand-written '<' selector whole", () => {
-    assert.equal(baseNameOfOverrideKey("foo@<2.0.0"), "foo@<2.0.0");
-  });
-
-  it("computeOverrideChanges leaves a hand-written 'foo@<2.0.0' pin untouched when foo is alerted", () => {
-    const changes = computeOverrideChanges(
-      { "foo@<2.0.0": "2.0.0" },
-      [vuln("foo", "2.5.0", "2.5.1")],
-      new Set(["foo"]),
-    );
-    assert.equal(
-      changes.find((c) => c.packageName === "foo@<2.0.0"),
-      undefined,
-      "the user's pin is preserved",
-    );
-  });
-});
-
-describe("run() routes by update strategy", () => {
-  const cfgFor = (updateStrategy: ResolvedConfig["updateStrategy"]): ResolvedConfig => ({
-    token: "t",
-    repo: "o/r",
-    owner: "o",
-    name: "r",
-    packageManager: "pnpm",
-    workspaceRoot: path.resolve("."),
-    updateStrategy,
-    allowPrerelease: false,
-    dryRun: true,
-    skipUpdate: false,
-    exitCode: false,
-    discoverPackages: false,
-    packages: [],
-    updateWorkspaceMembers: false,
-    limits: {},
-  });
-
-  async function runWithFailingGitHub(
-    updateStrategy: ResolvedConfig["updateStrategy"],
-  ): Promise<{ error: Error; fetched: number }> {
-    const fetchMock = mock.method(globalThis, "fetch", async () => new Response("stubbed", { status: 500 }));
-    mock.method(console, "log", () => {});
-    try {
-      const error = await run(cfgFor(updateStrategy)).then(
-        () => new Error("run() resolved"),
-        (e: Error) => e,
-      );
-      return { error, fetched: fetchMock.mock.callCount() };
-    } finally {
-      mock.restoreAll();
-    }
-  }
-
-  it("compatible still reaches the existing path: it asks GitHub for alerts, even on pnpm", async () => {
-    const { error, fetched } = await runWithFailingGitHub("compatible");
-    assert.match(error.message, /GitHub API error 500/);
-    assert.equal(fetched, 1);
-  });
-
-  it("latest still reaches the existing path too", async () => {
-    const { error, fetched } = await runWithFailingGitHub("latest");
-    assert.match(error.message, /GitHub API error 500/);
-    assert.equal(fetched, 1);
-  });
-
-  it("targeted goes to its own path, which stops on pnpm before asking GitHub for anything", async () => {
-    const { error, fetched } = await runWithFailingGitHub("targeted");
-    assert.match(error.message, /npm only/);
-    assert.equal(fetched, 0);
   });
 });

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { DirectDep } from "../src/manifest.js";
 import { readNpmOverrides } from "../src/override-source.js";
-import { baseNameOfOverrideKey, isAgentAuthoredOverride } from "../src/reconcile.js";
+import { isAgentAuthoredOverride, selectorKeyName } from "../src/targeted/override-keys.js";
 import { LockIndex } from "../src/targeted/lockfile.js";
 import { buildPlan, lineStart, ManifestInfo, matchesLimit, Plan, selectorKey } from "../src/targeted/plan.js";
 import { DependabotAlert } from "../src/types.js";
@@ -276,7 +276,7 @@ describe("sorting", () => {
       { flat: { qs: "6.7.3" } },
       { flat: { "qs@6": "6.7.3" } },
       { flat: { "qs@5": "5.2.1" } }, // applies to the package, not only to the alerted line
-      { flat: { "qs@<6.7.3": "6.7.3" } }, // baseNameOfOverrideKey leaves this shape whole
+      { flat: { "qs@<6.7.3": "6.7.3" } }, // selectorKeyName leaves this shape whole
       { flat: { "qs@>=6.0.0 <6.7.3": "6.8.0" } }, // value isn't the range's upper bound
       { nested: { webpack: { qs: "6.7.3" } } },
       { nested: { "webpack@4": { express: { "qs@6": "6.7.3" } } } },
@@ -650,7 +650,7 @@ describe("override keys", () => {
     assert.equal(key, "@babel/core@>=7.0.0 <7.2.0");
     assert.equal(value, "7.2.0");
     assert.equal(isAgentAuthoredOverride(key, value), true);
-    assert.equal(baseNameOfOverrideKey(key), "@babel/core");
+    assert.equal(selectorKeyName(key), "@babel/core");
   });
 
   it("converts GitHub's range form, including the lower-bound shapes", () => {
