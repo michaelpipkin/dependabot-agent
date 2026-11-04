@@ -829,34 +829,93 @@ describe("selector conflicts", () => {
     assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.7.3": "6.7.3" });
   });
 
-  it("an edge whose spec isn't a valid semver range doesn't intersect, and doesn't throw", () => {
-    for (const spec of ["latest", "file:../qs", "github:a/b", "workspace:*"]) {
-      const p = plan({
-        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
-        lock: makeLock({
-          "": { dependencies: { a: "^1.0.0", express: "^4.0.0" } },
-          "node_modules/a": { version: "1.0.0", dependencies: { qs: spec } },
-          "node_modules/a/node_modules/qs": { version: "6.9.4" },
-          "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.0" } },
-          "node_modules/qs": { version: "6.7.0" },
-        }),
-      });
+  /** A plan where dependent `a` declares qs with `spec` and resolves to safe 6.9.4, beside a fixable copy. */
+  function withSafeCopyDeclaring(spec: string): Plan {
+    return plan({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { dependencies: { a: "^1.0.0", express: "^4.0.0" } },
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: spec } },
+        "node_modules/a/node_modules/qs": { version: "6.9.4" },
+        "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+    });
+  }
+
+  function assertConflict(spec: string): void {
+    const p = withSafeCopyDeclaring(spec);
+    assert.equal(p.alerts[0].status, "blocked", spec);
+    assert.equal(p.alerts[0].copies[0].action, "blocked", spec);
+    assert.equal(p.alerts[0].copies[0].reason, "selector-conflict", spec);
+    assert.ok(p.alerts[0].copies[0].detail?.includes(spec), spec);
+    assertNoWrites(p);
+  }
+
+  it("a dependent declaring a tag on a safe copy conflicts: npm accepts the override for any tag", () => {
+    assertConflict("latest");
+  });
+
+  it("an alias on a safe copy conflicts: npm intersects on what the alias points to", () => {
+    assertConflict("npm:qs@^6.5.0");
+  });
+
+  it("a file: spec on a safe copy conflicts: npm accepts the override for any path", () => {
+    assertConflict("file:../qs");
+  });
+
+  it("a git spec with no semver range never matches, as npm skips the rule for it", () => {
+    for (const spec of ["github:a/b", "a/b#main", "git+https://example.com/a/b.git", "https://github.com/a/b.git"]) {
+      const p = withSafeCopyDeclaring(spec);
       assert.equal(p.alerts[0].status, "fixed", spec);
       assert.deepEqual(p.addOverrides, { "qs@>=6.0.0 <6.7.3": "6.7.3" }, spec);
       assert.equal(p.targets.has("node_modules/a/node_modules/qs"), false, spec);
     }
   });
 
-  it("blocks when a copy staying put sits inside the selector, even with no readable edge", () => {
+  it("a git spec's #semver: range is intersected like any other", () => {
+    assertConflict("github:a/b#semver:^6.5.0");
+    assert.equal(withSafeCopyDeclaring("github:a/b#semver:^6.9.0").alerts[0].status, "fixed");
+  });
+
+  // Replayed from npm 11.16: real OverrideSet.getEdgeRule on the key "qs@>=6.0.0 <6.7.3".
+  it("agrees with arborist on every spec shape", () => {
+    const caught = [
+      "^6.5.0", ">=6.0.0", "*", "", "6.x",
+      "latest", "beta-1",
+      "file:../qs", "../qs", "./qs", "/abs/qs", "~/qs", "qs.tgz", "file:qs.tgz", "a/b/c",
+      "npm:qs@^6.5.0", "npm:qs@latest", "npm:qs", "NPM:qs@^6.5.0", "npm:@s/qs@^6.5.0", "npm:@s/qs",
+      "github:a/b#semver:^6.5.0", "a/b#semver:^6.5.0", "git+https://example.com/a/b.git#semver:^6.5.0",
+      "https://github.com/a/b.git#semver:^6.5.0",
+      "https://github.com/a/b/archive/x.tgz", "https://codeload.github.com/a/b/tar.gz/x", "https://example.com/qs.tgz",
+    ];
+    const missed = [
+      "^6.9.0", "6.9.4", "^5.0.0",
+      "npm:qs@^6.9.0", "npm:qs@6.9.4", "npm:@s/qs@^6.9.0",
+      "github:a/b", "github:a/b#main", "github:a/b#semver:^6.9.0", "a/b", "a/b#main", "gitlab:a/b", "bitbucket:a/b",
+      "gist:abc123", "git+https://example.com/a/b.git", "git+https://example.com/a/b.git#semver:^6.9.0",
+      "git+ssh://git@example.com/a/b.git", "git://example.com/a/b.git", "git+file:///tmp/b",
+      "git@github.com:a/b.git", "git@example.com:a/b.git", "ssh://git@github.com/a/b.git",
+      "https://github.com/a/b", "https://github.com/a/b.git",
+    ];
+    for (const spec of caught) assert.equal(withSafeCopyDeclaring(spec).alerts[0].copies[0].reason, "selector-conflict", spec);
+    for (const spec of missed) assert.equal(withSafeCopyDeclaring(spec).alerts[0].status, "fixed", spec);
+  });
+
+  it("a spec npm can't parse is reported as a conflict, and doesn't throw", () => {
+    assertConflict("workspace:*");
+  });
+
+  it("blocks when a copy staying put sits inside the selector, even if npm wouldn't match its spec", () => {
     const p = plan({
       alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
       lock: makeLock({
-        "": { dependencies: { qs: "npm:qs@6.7.0", express: "^4.0.0" } },
+        "": { dependencies: { qs: "github:a/qs", express: "^4.0.0" } },
         "node_modules/qs": { version: "6.7.0" },
         "node_modules/express": { version: "4.0.0", dependencies: { qs: "6.7.1" } },
         "node_modules/express/node_modules/qs": { version: "6.7.1" },
       }),
-      manifests: [root(dep("qs", "npm:qs@6.7.0"), dep("express", "^4.0.0"))],
+      manifests: [root(dep("qs", "github:a/qs"), dep("express", "^4.0.0"))],
     });
     const byPath = new Map(p.alerts[0].copies.map((c) => [c.path, c]));
     assert.equal(byPath.get("node_modules/qs")?.reason, "unrewritable-spec");

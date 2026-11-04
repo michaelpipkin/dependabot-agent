@@ -361,17 +361,58 @@ function raiseTarget(
   }
 }
 
+const LOOSE = { loose: true };
+
+// The specs npm-package-arg classifies as git: protocols and hosts' shorthands,
+// `owner/repo`, scp-style `git@host:path`, and a hosted repo's own https URL (a
+// deeper path on the same host, like a tarball, is a plain remote).
+const GIT_SPECS = [
+  /^(?:git(?:\+[a-z]+)?|ssh|github|gitlab|bitbucket|gist):/i,
+  /^[^/@:.~\s][^/@:\s]*\/[^/@:\s#]+(?:#|$)/,
+  /^[^@/\s]+@[^:/\s]+:/,
+  /^https?:\/\/(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)\/[^/]+\/[^/#]+(?:#|$)/i,
+];
+
+function rangesIntersect(spec: string, range: string): boolean {
+  return semver.validRange(spec, LOOSE) !== null && semver.intersects(spec, range, LOOSE);
+}
+
 /**
- * Step 5: what the selector would catch that isn't being fixed on this line. npm
- * matches a key against each dependent's declared range with semver.intersects,
- * not against the version it resolved to, so a safe copy's range can be caught
- * even though the copy's own version falls outside the selector.
+ * Whether npm would apply an override with this range to a dependent declaring
+ * `spec`. Follows OverrideSet.getEdgeRule in @npmcli/arborist: it never looks at
+ * the version a dependent resolved to, only at what it declares.
+ *   - range or version: semver.intersects.
+ *   - alias: the same, on what's after `npm:name@` (a bare `npm:name` means `*`).
+ *   - git: intersects on its `#semver:` range; with no such range, never matches.
+ *   - anything else (tag, file, directory, remote): always matches.
+ * A spec npm can't parse at all (`workspace:*`) lands in that last group: npm
+ * would stop on it, and reporting a block is better than failing the whole run.
+ */
+function selectorCatches(spec: string, range: string): boolean {
+  const declared = spec.trim();
+  if (GIT_SPECS.some((git) => git.test(declared))) {
+    const attrs = declared.split("#")[1]?.split("::") ?? [];
+    const gitRange = attrs.find((attr) => attr.startsWith("semver:"))?.slice("semver:".length);
+    return gitRange !== undefined && rangesIntersect(gitRange, range);
+  }
+  let inner = declared;
+  if (/^npm:/i.test(declared)) {
+    const at = declared.indexOf("@", "npm:".length + 1);
+    inner = at > 0 ? declared.slice(at + 1) : "*";
+  }
+  return semver.validRange(inner, LOOSE) === null || rangesIntersect(inner, range);
+}
+
+/**
+ * Step 5: what the selector would catch that isn't being fixed on this line. A
+ * safe copy can be caught even though its own version falls outside the selector,
+ * because npm matches on the dependent's declared spec (see selectorCatches).
  */
 function findConflict(ctx: PackageContext, range: string, fixing: LockEntry[]): string | null {
   const moving = new Set(fixing.map((c) => c.path));
   for (const edge of ctx.edges) {
     if (!edge.resolved || moving.has(edge.resolved.path)) continue;
-    if (semver.validRange(edge.spec) !== null && semver.intersects(edge.spec, range)) {
+    if (selectorCatches(edge.spec, range)) {
       return (
         `${dependentName(ctx, edge)} declares ${ctx.name} "${edge.spec}", resolved to ${edge.resolved.version}, ` +
         `which the override "${range}" would also catch.`
@@ -379,7 +420,7 @@ function findConflict(ctx: PackageContext, range: string, fixing: LockEntry[]): 
     }
   }
   // Also the spec's rule as written: the selector must exclude every copy staying
-  // put, including one no readable range leads to (an alias, say).
+  // put, including one npm wouldn't match by its spec (a git dependency, say).
   for (const copy of copiesOf(ctx.input.lock, ctx.name)) {
     if (!moving.has(copy.path) && copy.version && semver.satisfies(copy.version, range)) {
       return `${ctx.name}@${copy.version} at ${copy.path} stays put, but the override "${range}" would also catch it.`;
