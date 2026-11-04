@@ -430,6 +430,95 @@ describe("sorting", () => {
     });
   });
 
+  describe("a copy nested in a workspace member's own node_modules", () => {
+    const nested = {
+      "": {},
+      "packages/b": { name: "b", dependencies: { glob: "^8.0.0" } },
+      "node_modules/b": { link: true, resolved: "packages/b" },
+      "packages/b/node_modules/glob": { version: "8.1.0", dependencies: { minimatch: "^5.0.1" } },
+      "packages/b/node_modules/minimatch": { version: "5.1.6" },
+    };
+    const manifests = [root(), member("packages/b", dep("glob", "^8.0.0"))];
+    const FIVE = alert(1, "minimatch", ">= 5.0.0, < 5.1.7", "5.1.7");
+
+    it("needing an override → blocked selector-conflict, saying npm can't reach it", () => {
+      const p = plan({ alerts: [FIVE], lock: makeLock(nested), manifests });
+      const copy = p.alerts[0].copies[0];
+      assert.equal(p.alerts[0].status, "blocked");
+      assert.equal(copy.path, "packages/b/node_modules/minimatch");
+      assert.equal(copy.reason, "selector-conflict");
+      assert.match(copy.detail ?? "", /nested in a workspace member/);
+      assert.match(copy.detail ?? "", /override can't reach/);
+      assertNoWrites(p);
+    });
+
+    it("deeper under the member, the same", () => {
+      const { "packages/b/node_modules/minimatch": _moved, ...rest } = nested;
+      const p = plan({
+        alerts: [FIVE],
+        lock: makeLock({ ...rest, "packages/b/node_modules/glob/node_modules/minimatch": { version: "5.1.6" } }),
+        manifests,
+      });
+      assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+      assertNoWrites(p);
+    });
+
+    it("doesn't stop a copy on another line, under the root, from being fixed", () => {
+      const p = plan({
+        alerts: [FIVE, alert(2, "minimatch", "< 3.1.3", "3.1.3")],
+        lock: makeLock({
+          ...nested,
+          "packages/a": { name: "a", dependencies: { glob: "^7.1.6" } },
+          "node_modules/a": { link: true, resolved: "packages/a" },
+          "node_modules/glob": { version: "7.2.3", dependencies: { minimatch: "^3.1.1" } },
+          "node_modules/minimatch": { version: "3.1.2" },
+        }),
+        manifests: [...manifests, member("packages/a", dep("glob", "^7.1.6"))],
+      });
+      assert.deepEqual(
+        p.alerts.map((a) => a.status),
+        ["blocked", "fixed"],
+      );
+      assert.deepEqual(p.addOverrides, { "minimatch@>=3.0.0 <3.1.3": "3.1.3" });
+      assert.deepEqual([...p.targets], [["node_modules/minimatch", "3.1.3"]]);
+    });
+
+    it("a direct bump needs no override, so it still goes ahead", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+        lock: makeLock({
+          "": {},
+          "packages/a": { name: "a", dependencies: { qs: "^6.5.0" } },
+          "node_modules/a": { link: true, resolved: "packages/a" },
+          "packages/a/node_modules/qs": { version: "6.7.0" },
+        }),
+        manifests: [root(), member("packages/a", dep("qs", "^6.5.0"))],
+      });
+      assert.equal(p.alerts[0].status, "fixed");
+      assert.deepEqual(
+        p.bumps.map((b) => [b.memberPath, b.name, b.target]),
+        [["packages/a", "qs", "6.7.3"]],
+      );
+      assert.deepEqual(p.addOverrides, {});
+    });
+
+    it("a direct bump that would also need an override is blocked", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+        lock: makeLock({
+          "": {},
+          "packages/a": { name: "a", dependencies: { qs: "^6.5.0", b: "^1.0.0" } },
+          "node_modules/a": { link: true, resolved: "packages/a" },
+          "packages/a/node_modules/qs": { version: "6.7.0" },
+          "packages/a/node_modules/b": { version: "1.0.0", dependencies: { qs: "6.7.0" } },
+        }),
+        manifests: [root(), member("packages/a", dep("qs", "^6.5.0"), dep("b", "^1.0.0"))],
+      });
+      assert.equal(p.alerts[0].copies[0].reason, "selector-conflict");
+      assertNoWrites(p);
+    });
+  });
+
   it("updateWorkspaceMembers false → member's direct copy blocked unrewritable-spec", () => {
     const setup: Setup = {
       alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],

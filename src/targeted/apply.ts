@@ -101,9 +101,10 @@ function renderOverrides(overrides: Record<string, unknown>, indent: string, eol
  * The manifest's text with its top-level `overrides` replaced, added or removed, and
  * nothing else touched: indentation, line endings and any trailing newline all stay,
  * so a PR's diff shows only what changed. (override-source.ts reformats the whole
- * file, which the other strategies keep.)
+ * file, which the other strategies keep.) No overrides left means no block, unless
+ * asked to `keepEmpty`, which holds its place in the file for keys still to come.
  */
-function withOverridesBlock(text: string, overrides: Record<string, unknown>): string {
+function withOverridesBlock(text: string, overrides: Record<string, unknown>, keepEmpty = false): string {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const indent = /\n([ \t]+)\S/.exec(text)?.[1] ?? "  ";
   const isEmpty = Object.keys(overrides).length === 0;
@@ -111,7 +112,7 @@ function withOverridesBlock(text: string, overrides: Record<string, unknown>): s
 
   if (range) {
     const [start, end] = range;
-    if (!isEmpty) return text.slice(0, start) + renderOverrides(overrides, indent, eol) + text.slice(end);
+    if (!isEmpty || keepEmpty) return text.slice(0, start) + renderOverrides(overrides, indent, eol) + text.slice(end);
     const before = text.slice(0, text.lastIndexOf('"overrides"', start));
     const after = text.slice(end);
     const commaBefore = /,\s*$/.exec(before);
@@ -128,19 +129,40 @@ function withOverridesBlock(text: string, overrides: Record<string, unknown>): s
 }
 
 /** Write the root's flat overrides, sorted, with its nested ones preserved. */
-function writeRootOverrides(dir: string, flat: Record<string, string>, nested: Record<string, unknown>): void {
+function writeRootOverrides(
+  dir: string,
+  flat: Record<string, string>,
+  nested: Record<string, unknown>,
+  keepEmpty = false,
+): void {
   const file = join(dir, "package.json");
-  writeFileSync(file, withOverridesBlock(readFileSync(file, "utf-8"), sortObjectKeys({ ...nested, ...flat })));
+  writeFileSync(file, withOverridesBlock(readFileSync(file, "utf-8"), sortObjectKeys({ ...nested, ...flat }), keepEmpty));
 }
 
-function writeOverrides(dir: string, plan: Plan): void {
-  const adding = Object.keys(plan.addOverrides).length > 0;
-  if (!adding && plan.removeOverrideKeys.length === 0) return;
-  // Read now, not earlier: a root bump has just rewritten this file.
+/**
+ * Before the bumps: npm resolves a bump through any override still live, so a
+ * floating key being replaced would carry the bump past its target.
+ */
+function removeReplacedOverrides(dir: string, plan: Plan): void {
+  if (plan.removeOverrideKeys.length === 0) return;
   const { flat, nested } = readNpmOverrides(dir);
   for (const key of plan.removeOverrideKeys) delete flat[key];
+  writeRootOverrides(dir, flat, nested, Object.keys(plan.addOverrides).length > 0);
+}
+
+/** After the bumps: npm refuses (EOVERRIDE) a key matching a root edge the bump hasn't rewritten yet. */
+function addOverrides(dir: string, plan: Plan): void {
+  if (Object.keys(plan.addOverrides).length === 0) return;
+  // Read now, not earlier: a root bump has just rewritten this file.
+  const { flat, nested } = readNpmOverrides(dir);
   writeRootOverrides(dir, { ...flat, ...plan.addOverrides }, nested);
 }
+
+const hasNoChanges = (plan: Plan): boolean =>
+  plan.bumps.length === 0 &&
+  Object.keys(plan.addOverrides).length === 0 &&
+  plan.removeOverrideKeys.length === 0 &&
+  plan.targets.size === 0;
 
 /** The packages with a planned copy still not at its target: at its path, or reappeared at another. */
 function namesNotMoved(before: LockIndex, now: LockIndex, plan: Plan): string[] {
@@ -262,6 +284,8 @@ export function applyPlan(
   plan: Plan,
   opts: { limits: Record<string, string>; manifests: ManifestInfo[]; run?: NpmRunner },
 ): VerificationFailure[] {
+  // Nothing to do needs neither the registry nor a resolve that could fail.
+  if (hasNoChanges(plan)) return [];
   const run = opts.run ?? defaultRunner;
   const lockFile = join(dir, "package-lock.json");
   try {
@@ -270,8 +294,9 @@ export function applyPlan(
     const pins = pinsOf(before, opts.manifests);
     const manifestsBefore = readManifests(dir, opts.manifests);
 
+    removeReplacedOverrides(dir, plan);
     for (const command of commands) run(command, dir);
-    writeOverrides(dir, plan);
+    addOverrides(dir, plan);
     run(resolveCommand(), dir);
 
     const resolved = readLockfile(dir);

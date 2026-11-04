@@ -597,6 +597,41 @@ describe("verify: review findings", () => {
   });
 });
 
+describe("verify: a project's own version", () => {
+  const withVersion = (rootVersion: string, memberVersion: string): Packages => ({
+    "": { name: "fx", version: rootVersion, workspaces: ["packages/*"] },
+    "packages/a": { name: "a", version: memberVersion, dependencies: { glob: "^7.1.6" } },
+    "node_modules/a": { link: true, resolved: "packages/a" },
+    "node_modules/glob": { version: "7.1.6", dependencies: { minimatch: "^3.0.4" } },
+    "node_modules/minimatch": { version: "3.0.4" },
+  });
+  const fixed = (packages: Packages): Packages => ({ ...packages, "node_modules/minimatch": { version: "3.0.5" } });
+  const targets = { "node_modules/minimatch": "3.0.5" };
+
+  it("a root manifest's version ahead of the lock isn't a move", () => {
+    assert.deepEqual(run(withVersion("1.0.0", "1.0.0"), fixed(withVersion("1.0.1", "1.0.0")), targets), []);
+  });
+
+  it("a member manifest's version ahead of the lock isn't a move", () => {
+    assert.deepEqual(run(withVersion("1.0.0", "1.0.0"), fixed(withVersion("1.0.0", "2.0.0")), targets), []);
+  });
+
+  it("an installed package's version still is", () => {
+    const after = fixed(withVersion("1.0.0", "1.0.0"));
+    after["node_modules/glob"] = { version: "7.2.0", dependencies: { minimatch: "^3.0.4" } };
+    const failures = run(withVersion("1.0.0", "1.0.0"), after, targets);
+    assert.deepEqual(checks(failures), ["nothing-else-moved"]);
+    assert.equal(failures[0].path, "node_modules/glob");
+  });
+
+  it("a member turned into something else still is", () => {
+    const after = fixed(withVersion("1.0.0", "1.0.0"));
+    after["packages/a"] = { name: "other", version: "1.0.0", dependencies: { glob: "^7.1.6" } };
+    const failures = run(withVersion("1.0.0", "1.0.0"), after, targets);
+    assert.ok(failures.some((f) => f.check === "nothing-else-moved" && f.path === "packages/a"), JSON.stringify(failures));
+  });
+});
+
 describe("verify: re-review findings", () => {
   it("R1. ignores an edge from a package that survives but no longer declares the dependency", () => {
     const before: Packages = {

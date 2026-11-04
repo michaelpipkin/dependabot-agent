@@ -514,6 +514,11 @@ function unreachableReason(
   range: string,
   others: AgentKey[],
 ): string | null {
+  // Nothing at the root can lead to it: the temporary-root step gives a package only
+  // one range, and testing found no way to reach a copy under the range that lost.
+  if (!copy.path.startsWith("node_modules/")) {
+    return `${ctx.name}@${copy.version} at ${copy.path} is nested in a workspace member, and npm's override can't reach a copy there.`;
+  }
   const edges = edgesStayingPut(ctx, copy);
   if (edges.length === 0 && declarationsOf(ctx, copy).length === 0) {
     return `Nothing declares ${ctx.name}@${copy.version} at ${copy.path}, so an override can't reach it.`;

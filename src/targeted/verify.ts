@@ -141,6 +141,10 @@ function checkFixed({ before, after, plan }: VerifyInput): VerificationFailure[]
 // 2. Nothing else moved
 // ---------------------------------------------------------------------------
 
+/** The root or a member: its version is the project's own, and a resolve only copies it from the manifest. */
+const isSameProject = (path: string, a: LockEntry, b: LockEntry): boolean =>
+  !path.includes("node_modules/") && a.name === b.name && a.link === b.link;
+
 function checkNothingElseMoved({ before, after, plan }: VerifyInput): VerificationFailure[] {
   const targetPaths = [...plan.targets.keys()];
   // name -> every version a target of that name is meant to end at
@@ -186,7 +190,7 @@ function checkNothingElseMoved({ before, after, plan }: VerifyInput): Verificati
   const out: VerificationFailure[] = [];
   for (const [path, entry] of after.entries) {
     const old = before.entries.get(path);
-    if (old && sameEntry(old, entry)) continue;
+    if (old && (sameEntry(old, entry) || isSameProject(path, old, entry))) continue;
     if (plan.targets.get(path) === entry.version) continue;
     if (relocated.has(path)) continue;
     if (closureAfter.has(path)) {

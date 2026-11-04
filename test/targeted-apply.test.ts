@@ -245,13 +245,51 @@ describe("applyPlan", () => {
     });
   });
 
-  it("leaves the root manifest's bytes alone when the plan writes no override", () => {
+  it("a plan with no changes runs no npm command and touches nothing", () => {
     const project = memberProject();
     const text = '{\n\t"name": "fx",\n\t"workspaces": ["packages/*"]\n}\n';
     writeFileSync(project.rootFile, text);
-    const failures = applyPlan(project.dir, emptyPlan(), { limits: {}, manifests: project.manifests, run: () => {} });
-    assert.equal(readFileSync(project.rootFile, "utf-8"), text);
+    const { run, commands } = fakeNpm(project);
+    const failures = applyPlan(project.dir, emptyPlan(), { limits: {}, manifests: project.manifests, run });
+    assert.deepEqual(commands, []);
     assert.deepEqual(failures, []);
+    assert.equal(readFileSync(project.rootFile, "utf-8"), text);
+  });
+
+  it("a plan with no changes doesn't need a lockfile it can read", () => {
+    const project = memberProject();
+    writeFileSync(project.lockFile, "{ not json");
+    assert.deepEqual(applyPlan(project.dir, emptyPlan(), { limits: {}, manifests: project.manifests, run: () => {} }), []);
+  });
+
+  it("a plan with targets alone still runs, writing no override", () => {
+    const project = memberProject();
+    const text = readFileSync(project.rootFile, "utf-8");
+    const { run, commands } = fakeNpm(project, { reachable: true });
+    const plan = emptyPlan({ targets: new Map([["node_modules/minimatch", "3.0.5"]]) });
+    const failures = applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run });
+    assert.equal(resolves(commands), 2);
+    assert.deepEqual(failures, []);
+    assert.equal(readFileSync(project.rootFile, "utf-8"), text);
+  });
+
+  it("deletes the keys being replaced before the bumps, and adds new keys after them", () => {
+    const project = memberProject({ root: { overrides: { debug: ">=4.0.0", ms: "2.1.3" } } });
+    const seen: Array<[string, unknown]> = [];
+    const run: NpmRunner = (command) => {
+      seen.push([command === resolveCommand() ? "resolve" : "bump", readJson(project.rootFile).overrides]);
+    };
+    const plan = emptyPlan({
+      bumps: [bump({ memberPath: "packages/a" })],
+      addOverrides: { "debug@>=4.0.0 <4.3.1": "4.3.1" },
+      removeOverrideKeys: ["debug"],
+    });
+    applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run });
+    assert.deepEqual(seen, [
+      ["bump", { ms: "2.1.3" }],
+      ["resolve", { "debug@>=4.0.0 <4.3.1": "4.3.1", ms: "2.1.3" }],
+      ["resolve", { "debug@>=4.0.0 <4.3.1": "4.3.1", ms: "2.1.3" }],
+    ]);
   });
 
   it("uses the temporary-root step only for copies that did not move", () => {
@@ -558,6 +596,28 @@ describe("writing overrides keeps the manifest's formatting", () => {
       written(text, { ...overridePlan(), removeOverrideKeys: ["minimatch"] }),
       `${head}\t\t${KEY},\r\n\t\t"ms": "2.1.3",\r\n${nested}${tail}`,
     );
+  });
+
+  it("replacing the only key keeps the block where it is in the file", () => {
+    const text = '{\r\n\t"name": "fx",\r\n\t"overrides": {\r\n\t\t"minimatch": ">=3.0.0"\r\n\t},\r\n\t"workspaces": [ "packages/*" ]\r\n}';
+    const seen: string[] = [];
+    const project = memberProject();
+    writeFileSync(project.rootFile, text);
+    const plan = { ...overridePlan(), removeOverrideKeys: ["minimatch"], bumps: [bump({ memberPath: "packages/a" })] };
+    const run: NpmRunner = (command) => {
+      if (command !== resolveCommand()) seen.push(readFileSync(project.rootFile, "utf-8"));
+    };
+    applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run });
+    assert.equal(seen[0], '{\r\n\t"name": "fx",\r\n\t"overrides": {},\r\n\t"workspaces": [ "packages/*" ]\r\n}');
+    assert.equal(
+      readFileSync(project.rootFile, "utf-8"),
+      `{\r\n\t"name": "fx",\r\n\t"overrides": {\r\n\t\t${KEY}\r\n\t},\r\n\t"workspaces": [ "packages/*" ]\r\n}`,
+    );
+  });
+
+  it("removing the only key with nothing to add drops the block", () => {
+    const text = '{\n  "name": "fx",\n  "overrides": {\n    "minimatch": ">=3.0.0"\n  },\n  "workspaces": ["packages/*"]\n}\n';
+    assert.equal(written(text, emptyPlan({ removeOverrideKeys: ["minimatch"] })), '{\n  "name": "fx",\n  "workspaces": ["packages/*"]\n}\n');
   });
 
   it("four spaces and LF with a trailing newline", () => {

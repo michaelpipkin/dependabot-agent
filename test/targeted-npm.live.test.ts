@@ -367,7 +367,9 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       assert.equal(plan.alerts[0].status, "blocked");
       assert.equal(plan.alerts[0].copies[0].reason, "pin");
 
-      applied(dir, plan);
+      const { run, commands } = counting();
+      applied(dir, plan, run);
+      assert.deepEqual(commands, [], "a plan with no changes runs no npm command");
       assert.deepEqual(movedBetween(before, versions(dir)), []);
       assert.deepEqual(json(dir, "packages", "a", "package.json").dependencies, { minimatch: "3.0.4" });
     });
@@ -418,6 +420,25 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       assert.deepEqual(movedBetween(before, versions(dir)), MOVED_ONE);
       npm(dir, `ci ${QUIET}`);
     });
+
+    for (const key of ["chalk", "chalk@4"]) {
+      it(`replaces ${key}: ">=4.0.0" while bumping a member's direct dependency, which it must not steer`, () => {
+        const dir = project("2020-05-01", { members: { a: { dependencies: { chalk: "^4.0.0" } } } });
+        const rootManifest = json(dir, "package.json");
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ ...rootManifest, overrides: { [key]: ">=4.0.0" } }, null, 2) + "\n");
+        const before = versions(dir);
+        const plan = planFor(dir, [alert(1, "chalk", "<4.1.2", "4.1.2")]);
+        assert.deepEqual(plan.removeOverrideKeys, [key]);
+        assert.equal(plan.bumps.length, 1);
+
+        applied(dir, plan);
+
+        assert.deepEqual(movedBetween(before, versions(dir)), ["node_modules/chalk: 4.0.0 -> 4.1.2"]);
+        assert.deepEqual(json(dir, "packages", "a", "package.json").dependencies, { chalk: "^4.1.2" });
+        assert.deepEqual(json(dir, "package.json").overrides, plan.addOverrides);
+        npm(dir, `ci ${QUIET}`);
+      });
+    }
 
     it("writes a selector beside an existing selector for the same package", () => {
       const dir = project("2023-06-01", { root: { dependencies: { glob: "^7.1.6", filelist: "^1.0.4" } } });
@@ -516,6 +537,69 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     });
   });
 
+  describe("a target nested in a member, under the range that lost", () => {
+    const shape = { members: { a: { dependencies: { glob: "^7.1.6" } }, b: { dependencies: { glob: "^8.0.0" } } } };
+
+    it("the plan blocks that copy, fixes the one it can reach, and applying finds no failures", () => {
+      const dir = project("2023-06-01", shape);
+      const before = versions(dir);
+      const nestedCopy = "packages/b/node_modules/minimatch";
+      assert.equal(before.get(nestedCopy), "5.1.6");
+      assert.equal(before.get("node_modules/minimatch"), "3.1.2");
+
+      const plan = planFor(dir, [alert(2, "minimatch", ">=5.0.0, <5.1.7", "5.1.7"), alert(1, "minimatch", "<3.1.3", "3.1.3")]);
+      assert.deepEqual(
+        plan.alerts.map((a) => a.status),
+        ["blocked", "fixed"],
+      );
+      assert.equal(plan.alerts[0].copies[0].path, nestedCopy);
+      assert.equal(plan.alerts[0].copies[0].reason, "selector-conflict");
+      assert.deepEqual(plan.addOverrides, { "minimatch@>=3.0.0 <3.1.3": "3.1.3" });
+
+      applied(dir, plan);
+
+      assert.deepEqual(movedBetween(before, versions(dir)), ["node_modules/minimatch: 3.1.2 -> 3.1.3"]);
+      npm(dir, `ci ${QUIET}`);
+    });
+
+    it("with only the blocked alert open, there's nothing to run", () => {
+      const dir = project("2023-06-01", shape);
+      const before = versions(dir);
+      const plan = planFor(dir, [alert(2, "minimatch", ">=5.0.0, <5.1.7", "5.1.7")]);
+      assert.equal(plan.alerts[0].status, "blocked");
+
+      const { run, commands } = counting();
+      applied(dir, plan, run);
+      assert.deepEqual(commands, []);
+      assert.deepEqual(movedBetween(before, versions(dir)), []);
+    });
+  });
+
+  describe("a manifest's version ahead of the lock", () => {
+    const ahead = (dir: string, ...path: string[]): void => {
+      const manifest = json(dir, ...path);
+      writeFileSync(join(dir, ...path), JSON.stringify({ ...manifest, version: "1.0.1" }, null, 2) + "\n");
+    };
+
+    it("root, with a real fix to apply", () => {
+      const dir = project("2020-06-01", { members: { a: { dependencies: { glob: "^7.1.6" } } } });
+      const before = versions(dir);
+      const plan = planFor(dir, [MINIMATCH_ALERT]);
+      ahead(dir, "package.json");
+      applied(dir, plan);
+      assert.deepEqual(movedBetween(before, versions(dir)), [": 1.0.0 -> 1.0.1", ...MOVED_ONE]);
+    });
+
+    it("member, with a real fix to apply", () => {
+      const dir = project("2020-06-01", { members: { a: { dependencies: { glob: "^7.1.6" } } } });
+      const before = versions(dir);
+      const plan = planFor(dir, [MINIMATCH_ALERT]);
+      ahead(dir, "packages", "a", "package.json");
+      applied(dir, plan);
+      assert.deepEqual(movedBetween(before, versions(dir)), [...MOVED_ONE, "packages/a: 1.0.0 -> 1.0.1"]);
+    });
+  });
+
   it("a real non-zero exit from npm comes back as a failure", () => {
     const dir = project("2020-05-01", { root: { dependencies: { chalk: "^4.0.0" } } });
     const plan = planFor(dir, [alert(1, "chalk", "<4.1.2", "4.1.2")]);
@@ -536,7 +620,9 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     assert.equal(plan.alerts[0].copies[0].reason, "unrewritable-spec");
     assert.deepEqual(plan.bumps, []);
 
-    applied(dir, plan);
+    const { run, commands } = counting();
+    applied(dir, plan, run);
+    assert.deepEqual(commands, [], "a plan with no changes runs no npm command");
     assert.equal(text(dir, "package.json"), rootText);
     assert.deepEqual(movedBetween(before, versions(dir)), []);
 
