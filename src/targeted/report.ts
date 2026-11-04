@@ -37,12 +37,22 @@ const SCOPE_LABEL: Record<DepScope, string> = {
   unknown: "undetermined",
 };
 
-// Spans left exactly as written: code, and the destination of a markdown link.
-const PROTECTED = /`[^`]*`|\]\([^)\s]*\)/g;
-// An @name outside those spans. Not preceded by a word character, so a@b.com stays an email.
-const MENTION = /(?<![\w`])@\w[^\s`]*/g;
+// Left as written: a code span (paired backticks, matched left to right as markdown does)
+// or a link, whose text is cleaned separately and whose destination is kept.
+const SPAN = /`[^`]*`|\[([^\][]+)\]\(([^)\s]*)\)/g;
+// A bare @name. Not preceded by a word character, so a@b.com stays an email.
+const MENTION = /(?<!\w)@\w[^\s`]*/g;
 // Punctuation that ends a sentence, not a name.
 const TRAILING = ".,;:!?)]}'\"";
+
+/** Text outside any span. A backtick left here is unpaired: it becomes ' so it can't open a span later. */
+function plain(text: string): string {
+  return text.replaceAll("`", "'").replace(MENTION, (token) => {
+    let end = token.length;
+    while (end > 1 && TRAILING.includes(token[end - 1])) end--;
+    return `\`${token.slice(0, end)}\`${token.slice(end)}`;
+  });
+}
 
 /**
  * Free text made safe for a bullet or table cell. Line breaks become spaces, so text
@@ -51,20 +61,14 @@ const TRAILING = ".,;:!?)]}'\"";
  */
 export function inline(text: string): string {
   const flat = text.replace(/\r?\n|\r/g, " ");
-  const wrap = (plain: string): string =>
-    plain.replace(MENTION, (token) => {
-      let end = token.length;
-      while (end > 1 && TRAILING.includes(token[end - 1])) end--;
-      const name = token.slice(0, end);
-      return `\`${name}\`${token.slice(name.length)}`;
-    });
   let out = "";
   let last = 0;
-  for (const m of flat.matchAll(PROTECTED)) {
-    out += wrap(flat.slice(last, m.index)) + m[0];
+  for (const m of flat.matchAll(SPAN)) {
+    out += plain(flat.slice(last, m.index));
+    out += m[0].startsWith("`") ? m[0] : `[${inline(m[1])}](${m[2]})`;
     last = m.index + m[0].length;
   }
-  return out + wrap(flat.slice(last));
+  return out + plain(flat.slice(last));
 }
 
 /** A table cell: safe free text, and no pipes that would split the row. */

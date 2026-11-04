@@ -297,8 +297,27 @@ describe("inline", () => {
     assert.equal(inline("write to a@b.com about qs@6.0.0"), "write to a@b.com about qs@6.0.0");
   });
 
-  it("leaves a link destination alone", () => {
+  it("leaves a real link's destination alone, and cleans its text", () => {
     assert.equal(inline("[#1](https://example.com/@user/x)"), "[#1](https://example.com/@user/x)");
+    assert.equal(inline("[text](https://x/@a)"), "[text](https://x/@a)");
+    assert.equal(inline("[@a/b](https://x)"), "[`@a/b`](https://x)");
+  });
+
+  it("does not protect a destination that has no [text] before it", () => {
+    assert.equal(inline("not found](@babel/core)"), "not found](`@babel/core`)");
+    assert.equal(inline("see (@babel/core) and [](@x/y)"), "see (`@babel/core`) and [](`@x/y`)");
+  });
+
+  it("treats an unpaired backtick as plain text, so the @name after it is still wrapped", () => {
+    assert.equal(inline("copy `@babel/core@7.1.0 isn't published"), "copy '`@babel/core@7.1.0` isn't published");
+  });
+
+  it("turns a stray backtick into an apostrophe even with no @ near it", () => {
+    assert.equal(inline("it`s fine"), "it's fine");
+    // Paired backticks are code, even when the pairing looks accidental.
+    assert.equal(inline("a `b` c ` d @x/y ` e"), "a `b` c ` d @x/y ` e");
+    // Three backticks: the first two pair, the third is stray.
+    assert.equal(inline("`a` b ` c @x/y"), "`a` b ' c `@x/y`");
   });
 
   it("turns line breaks into spaces", () => {
@@ -326,8 +345,11 @@ describe("inline", () => {
     assert.ok(md.includes("needed by `@nestjs/core`"));
     assert.ok(md.includes("`@types/node` missing"));
     assert.deepEqual(headings(md), ["Failures", "Fixed", "Blocked", "Other changes", "Overrides kept"]);
-    const outsideCode = md.replace(/`[^`]*`/g, "").replace(/\]\([^)]*\)/g, "");
-    assert.doesNotMatch(outsideCode, /@\w/);
+    const lines = md.split("\n");
+    assert.ok(lines.includes("- **fixed** on `@types/node` (`node_modules/@types/node`): `@types/node` missing ## evil"));
+    assert.ok(lines.some((l) => l.endsWith("`@babel/core@7.1.0` isn't published. ## evil")));
+    assert.ok(lines.includes("- `node_modules/@scope/x ## evil`: 1.0.0 → 1.1.0"));
+    assert.ok(lines.includes("- `qs@>=6.0.0 <6.7.3`: needed by `@nestjs/core` # also evil"));
   });
 });
 
