@@ -159,7 +159,7 @@ const git = (cwd: string, ...args: string[]): string => {
   return result.stdout;
 };
 
-describe("targeted workflow: two jobs, so nothing that can write shares a machine with the agent", () => {
+describe("targeted workflow: two jobs, so the agent can't reach the writing step through hooks or the environment", () => {
   const { plan, publish } = wf.jobs;
   const inPlan = withoutPresenceChecks(plan.steps);
   const inPublish = withoutPresenceChecks(publish.steps);
@@ -169,7 +169,8 @@ describe("targeted workflow: two jobs, so nothing that can write shares a machin
     assert.ok(!/dependabot-agent@|npx|setup-node/.test(inPublish));
   });
 
-  it("keeps every credential that can write out of plan", () => {
+  // Not out of the runner's memory: see "What the agent's code can reach" in the README.
+  it("keeps every credential that can write out of the environment of plan's steps", () => {
     for (const value of ["secrets.pr-token", "steps.app-pr", "create-pull-request", "create-github-app-token", "github.token"]) assert.ok(!inPlan.includes(value), value);
   });
 
@@ -233,8 +234,8 @@ describe("targeted workflow: the patch between the jobs", { skip: !(have("git") 
     git(root, "clone", "-q", "-c", "core.autocrlf=false", plan, publish);
     return { plan, publish, report, done: () => rmSync(root, { recursive: true, force: true }) };
   };
-  const inRepo = (step: string, cwd: string, report: string) =>
-    spawnSync("bash", ["-e", "-c", `export AGENT_REPORT_DIR='${toBash(report)}'\n${findStep(step).run}`], { cwd, encoding: "utf-8" });
+  const inRepo = (step: string, cwd: string, report: string, outcome = "changes") =>
+    spawnSync("bash", ["-e", "-c", `export AGENT_REPORT_DIR='${toBash(report)}' OUTCOME='${outcome}'\n${findStep(step).run}`], { cwd, encoding: "utf-8" });
   const changed = (cwd: string): string[] => git(cwd, "diff", "--name-only").split("\n").filter(Boolean).sort();
 
   it("carries every package file, and nothing else, to a fresh checkout", () => {
@@ -268,12 +269,71 @@ describe("targeted workflow: the patch between the jobs", { skip: !(have("git") 
     try {
       assert.equal(inRepo("patch", plan, report).status, 0);
       assert.equal(readFileSync(join(report, "fixes.patch"), "utf-8"), "");
-      assert.equal(inRepo("apply", publish, report).status, 0);
+      for (const outcome of ["clean", "blocked-only"]) assert.equal(inRepo("apply", publish, report, outcome).status, 0);
       assert.deepEqual(changed(publish), []);
     } finally {
       done();
     }
   });
+
+  it("refuses a report that claims changes with an empty patch, rather than a green run with no PR", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      assert.equal(inRepo("patch", plan, report).status, 0);
+      const got = inRepo("apply", publish, report);
+      assert.equal(got.status, 1);
+      assert.match(got.stdout, /::error/);
+    } finally {
+      done();
+    }
+  });
+
+  for (const outcome of ["clean", "blocked-only"]) {
+    it(`refuses a patch when the report says ${outcome}`, () => {
+      const { plan, publish, report, done } = repos();
+      try {
+        writeFileSync(join(plan, "package.json"), "after\n");
+        assert.equal(inRepo("patch", plan, report).status, 0);
+        assert.equal(inRepo("apply", publish, report, outcome).status, 1);
+        assert.deepEqual(changed(publish), []);
+      } finally {
+        done();
+      }
+    });
+  }
+
+  it("refuses a patch whose only edits are to other files, which would otherwise apply as nothing", () => {
+    const { plan, publish, report, done } = repos();
+    try {
+      writeFileSync(join(plan, "src/index.js"), "after\n");
+      writeFileSync(join(report, "fixes.patch"), git(plan, "diff", "--binary"));
+      assert.equal(inRepo("apply", publish, report).status, 1);
+      assert.deepEqual(changed(publish), []);
+    } finally {
+      done();
+    }
+  });
+
+  const crafted: Array<[string, string]> = [
+    ["a rename onto a package file", "diff --git a/src/index.js b/x/package.json\nsimilarity index 100%\nrename from src/index.js\nrename to x/package.json\n"],
+    ["a copy onto a package file", "diff --git a/src/index.js b/x/package.json\nsimilarity index 100%\ncopy from src/index.js\ncopy to x/package.json\n"],
+    ["a mode change", "diff --git a/package.json b/package.json\nold mode 100644\nnew mode 100755\n"],
+    ["a symlink", "diff --git a/package.json b/package.json\ndeleted file mode 100644\n--- a/package.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-before\ndiff --git a/package.json b/package.json\nnew file mode 120000\n--- /dev/null\n+++ b/package.json\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n"],
+  ];
+  for (const [label, patch] of crafted) {
+    it(`refuses ${label}, leaving the checkout as it was`, () => {
+      const { publish, report, done } = repos();
+      try {
+        writeFileSync(join(report, "fixes.patch"), patch);
+        const got = inRepo("apply", publish, report);
+        assert.equal(got.status, 1, got.stdout + got.stderr);
+        assert.match(got.stdout, /more than edit/);
+        assert.deepEqual(changed(publish), []);
+      } finally {
+        done();
+      }
+    });
+  }
 
   it("fails if the patch doesn't apply, rather than opening a PR without it", () => {
     const { plan, publish, report, done } = repos();
@@ -457,7 +517,13 @@ describe("targeted workflow: gates", () => {
     assert.match(condition(last), /outputs\.outcome == 'failed'/);
     assert.match(last.run ?? "", /exit 1/);
     assert.ok(planSteps.indexOf(findStep("actions/upload-artifact")) < planSteps.length - 1);
-    assert.equal(condition(findStep("issue")), "");
+    assert.equal(condition(findStep("issue")), "${{ !cancelled() }}");
+  });
+
+  it("bounds both jobs, so a hung step can't hold a runner for six hours", () => {
+    const { plan, publish } = wf.jobs as unknown as Record<string, { "timeout-minutes"?: number }>;
+    assert.equal(plan["timeout-minutes"], 60);
+    assert.equal(publish["timeout-minutes"], 15);
   });
 });
 
@@ -729,11 +795,11 @@ describe("targeted workflow: reading the report", { skip: !canRun && "needs bash
 
 describe("targeted workflow: the blocked issue", { skip: !canRun && "needs bash and jq" }, () => {
   const step = findStep("issue");
-  const act = (outcome: string, blockedCount: string, open: string) => {
+  const act = (outcome: string, blockedCount: string, open: string, jobStatus = "success") => {
     const box = sandbox();
     try {
       box.write("report.md", "body\n");
-      return runStep(step, box, { OUTCOME: outcome, BLOCKED_COUNT: blockedCount, ISSUE_OPEN: open });
+      return runStep(step, box, { OUTCOME: outcome, BLOCKED_COUNT: blockedCount, ISSUE_OPEN: open, JOB_STATUS: jobStatus });
     } finally {
       rmSync(box.dir, { recursive: true, force: true });
     }
@@ -774,6 +840,18 @@ describe("targeted workflow: the blocked issue", { skip: !canRun && "needs bash 
 
   it("creates no issue when a PR was opened and some copies are still blocked: the PR lists them", () => {
     assert.ok(!act("changes", "2", "").gh.some((line) => /^issue (close|edit|create)/.test(line)));
+  });
+
+  it("runs after a failed step, and reports the failure whatever the plan's outcome was", () => {
+    assert.equal(condition(step), "${{ !cancelled() }}");
+    for (const outcome of ["changes", "clean", "blocked-only"]) {
+      const got = act(outcome, "0", "", "failure");
+      assert.ok(verbs(got.gh).includes("issue create"), outcome);
+      assert.match(got.report, /Publishing these results failed/);
+    }
+    const got = act("clean", "0", "17", "failure");
+    assert.ok(got.gh.some((line) => line.startsWith("issue edit 17")));
+    assert.ok(!got.gh.some((line) => line.startsWith("issue close")));
   });
 
   it("does nothing when clean and no issue is open", () => {

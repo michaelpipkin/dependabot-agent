@@ -41,12 +41,14 @@ on:
         description: "Opens the pull request. Not GITHUB_TOKEN: PRs it opens don't trigger your CI. Needs contents and pull requests write."
         required: false
 
-# Two jobs, so that nothing able to write ever shares a machine with the agent's code.
-# plan runs the agent, with a token that can only read alerts, and saves its results.
-# publish starts clean, runs none of the agent's code, and is the only job that can write.
+# Two jobs, so the agent's code can't reach the step that writes through git hooks or the
+# job's environment. plan runs the agent, with a token that can only read alerts, and saves
+# its results. publish starts clean, runs none of the agent's code, and does the writing.
+# The README says what this doesn't protect against.
 jobs:
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     outputs:
@@ -54,7 +56,7 @@ jobs:
       blocked-count: ${{ steps.report.outputs.blocked-count }}
       restore-error: ${{ steps.report.outputs.restore-error }}
     steps:
-      # Only whether each was passed: no value reaches this step.
+      # Only whether each was passed: no value reaches this step's environment.
       - name: Check the credentials
         id: credentials
         env:
@@ -113,7 +115,7 @@ jobs:
           b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
           # Prints the body, and a last line holding the status.
           api() {
-            curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+            curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
           }
 
           now=$(date +%s)
@@ -224,7 +226,7 @@ jobs:
         id: patch
         env:
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
-        run: git diff --binary -- package.json package-lock.json ':(glob)**/package.json' ':(glob)**/package-lock.json' > "$AGENT_REPORT_DIR/fixes.patch"
+        run: git diff --binary -- ':(glob)**/package.json' ':(glob)**/package-lock.json' > "$AGENT_REPORT_DIR/fixes.patch"
 
       - name: Keep the results for the next job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -249,6 +251,11 @@ jobs:
     needs: plan
     if: ${{ !cancelled() && !inputs.dry-run && needs.plan.outputs.outcome != '' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A schedule and a manual run would otherwise race on the one branch and one issue.
+    concurrency:
+      group: dependabot-agent-targeted-${{ inputs.base-branch }}
+      cancel-in-progress: false
     # GITHUB_TOKEN only checks out the repository and manages the issue. The pull request
     # is opened with its own token, which carries its own permissions.
     permissions:
@@ -268,15 +275,32 @@ jobs:
           name: dependabot-agent-results
           path: ${{ runner.temp }}/agent-report
 
-      # The patch came from the job that ran the agent, so nothing but package files is taken from it.
+      # The patch came from the job that ran the agent, so it's checked before it's trusted:
+      # edits to package files only, and a result that agrees with what the report claims.
       - name: Apply the changes
         id: apply
         if: ${{ needs.plan.outputs.outcome != 'failed' && needs.plan.outputs.restore-error != 'true' }}
         env:
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+          OUTCOME: ${{ needs.plan.outputs.outcome }}
         run: |
-          if [ -s "$AGENT_REPORT_DIR/fixes.patch" ]; then
-            git apply --include='package.json' --include='package-lock.json' --include='*/package.json' --include='*/package-lock.json' "$AGENT_REPORT_DIR/fixes.patch"
+          fail() {
+            echo "::error title=dependabot-agent patch::$1"
+            exit 1
+          }
+          patch="$AGENT_REPORT_DIR/fixes.patch"
+          if [ ! -s "$patch" ]; then
+            [ "$OUTCOME" != "changes" ] || fail "The report says files changed, but the patch is empty."
+            exit 0
+          fi
+          [ "$OUTCOME" = "changes" ] || fail "The report's outcome is $OUTCOME, but the patch isn't empty."
+          # Header lines only: everything inside a hunk starts with a space, + or -.
+          if grep -qE '^(rename |copy |similarity |dissimilarity |old mode |new mode |new file |deleted file |GIT binary patch)' "$patch"; then
+            fail "The patch does more than edit file contents."
+          fi
+          git apply --include='package.json' --include='package-lock.json' --include='*/package.json' --include='*/package-lock.json' "$patch"
+          if git diff --quiet; then
+            fail "The patch changed no package file."
           fi
 
       - name: Create a token to open the pull request
@@ -298,11 +322,10 @@ jobs:
           token: ${{ steps.app-pr.outputs.token || secrets.pr-token }}
           base: ${{ inputs.base-branch }}
           branch: dependabot-agent/targeted
-          # Only the fix: nothing else in the checkout may be committed. Git's default pathspec
-          # needs a "/" for "**", so the root files are named, and the rest are globs.
+          # Only the fix: nothing else in the checkout may be committed. These match the root's
+          # files too. A literal name that matched nothing would fail the whole git add, which
+          # this action ignores, leaving a green run with no pull request.
           add-paths: |
-            package.json
-            package-lock.json
             :(glob)**/package.json
             :(glob)**/package-lock.json
           commit-message: "fix(deps): resolve Dependabot alerts with targeted changes"
@@ -312,17 +335,25 @@ jobs:
 
       - name: Update the blocked-alerts issue
         id: issue
+        # After a failed step too, so a failure to publish doesn't leave the issue saying all is well.
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           OUTCOME: ${{ needs.plan.outputs.outcome }}
           BLOCKED_COUNT: ${{ needs.plan.outputs.blocked-count }}
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
           label="dependabot-agent-blocked"
           title="Dependabot alerts the agent could not fix"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$JOB_STATUS" != "success" ]; then
+            mkdir -p "$AGENT_REPORT_DIR"
+            printf '\n\n> **Publishing these results failed**, so no pull request reflects them. See the [workflow run](%s).\n' "$run_url" >> "$AGENT_REPORT_DIR/report.md"
+            OUTCOME=failed
+          fi
           open=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
 
           case "$OUTCOME" in

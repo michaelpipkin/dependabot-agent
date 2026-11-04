@@ -633,17 +633,24 @@ If you add a permission to an App after installing it, the installation's owner 
 
 **Two tokens:**
 
-- **`alerts-token`** reads the Dependabot alerts. Use a classic personal access token with `security_events`, or a fine-grained token with **Dependabot alerts: read**. It is given to the agent step only.
+- **`alerts-token`** reads the Dependabot alerts. Use a fine-grained token limited to the repository, with **Dependabot alerts: read**. A classic personal access token with `security_events` also works, but it reaches every repository its owner can and can also dismiss alerts, so it's a worse thing for the agent's code to hold. It is given to the agent step only.
 - **`pr-token`** opens the pull request, and needs **contents: write** and **pull requests: write** on the repository. These come from the token itself, not from the workflow's `permissions:`, which is why the workflow asks `GITHUB_TOKEN` for less. If it belongs to a person, that person can't approve the pull requests, so a service account no reviewer signs in as is better.
 
 **What the agent's code can reach**
 
-The workflow runs in two jobs, each on its own machine, so that the agent's code never shares a machine with anything that can write:
+The workflow runs in two jobs, each on its own machine:
 
-- **`plan`** runs the agent. All it holds is the credential that reads alerts, and its `GITHUB_TOKEN` can only read the repository. With an App, the read token is made by a script that has finished before the agent starts, because `create-github-app-token`'s cleanup step would get the private key back after the agent had run. Its results are a report and a patch of the package files.
-- **`publish`** starts from a clean checkout and runs none of the agent's code. It takes only `package.json` and `package-lock.json` changes from the patch, then holds the write credential to open the pull request, and manages the issue with its `GITHUB_TOKEN`.
+- **`plan`** runs the agent. The write credentials are never in its steps' environments, and its `GITHUB_TOKEN` can only read the repository. Its results are a report and a patch of the package files.
+- **`publish`** starts from a clean checkout and runs none of the agent's code. It refuses a patch that does more than edit `package.json` and `package-lock.json` contents, or that disagrees with the report, then uses the write credential to open the pull request and its `GITHUB_TOKEN` to manage the issue.
 
-So a compromised agent package or dependency could read your alerts, and could put a bad change to those package files in the pull request, which is what your review and CI are there to catch. It can't reach the write credential or, with an App, the private key. Pin a version you trust either way. The report and patch are kept as a workflow artifact for one day, and, like the job summary, can be read by anyone who can read the repository's Actions runs.
+That stops a compromised agent package or dependency from reaching a later step through git hooks or the job's environment. **It isn't a complete barrier.** Assume such a package could do these, and pin a version you trust:
+
+- **Read secrets the `plan` job refers to.** A hosted runner gives steps `sudo`, so code running there can read the runner's memory, which holds every secret the job refers to. In `plan` that includes the App's private key, or `pr-token`.
+- **Put a harmful change to package files in the pull request.** That includes adding a script or pointing the lockfile at another tarball. Pull requests from this workflow trigger your CI before anyone reviews them, so CI that runs `npm ci` with secrets available could run that code. Consider keeping secrets out of the jobs that run on them.
+- **Write to your Actions cache,** which `permissions:` doesn't limit. If your CI restores caches on other branches, it could read what was written.
+- **Post misleading text,** since the report becomes the pull request's description and the issue's body.
+
+The report and patch are kept as a workflow artifact for one day, and, like the job summary, can be read by anyone who can read the repository's Actions runs.
 
 The job's own `GITHUB_TOKEN` is used only to check out the repository (`contents: read`) and to manage the blocked-alerts issue (`issues: write`).
 
