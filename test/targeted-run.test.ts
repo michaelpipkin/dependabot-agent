@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import semver from "semver";
 import type { ResolvedConfig } from "../src/config.js";
 import { NpmRunner, resolveCommand } from "../src/targeted/apply.js";
 import type { RunReport } from "../src/targeted/report.js";
-import { assertTargetedSupported, runTargeted, type TargetedDeps } from "../src/targeted/run.js";
+import { assertTargetedSupported, groupAlertsByNearestLockfile, isWorkspaceMember, runTargeted, type TargetedDeps } from "../src/targeted/run.js";
 import type { DependabotAlert } from "../src/types.js";
 import { AgentError } from "../src/util.js";
 
@@ -44,6 +45,8 @@ const writeLock = (dir: string, raw: Json): void => writeJson(join(dir, "package
 interface ProjectSpec {
   root?: Json;
   members?: Record<string, Json>;
+  /** Packages at any path (path -> manifest), each linked from node_modules, as a workspace member or a file: dependency is. */
+  placed?: Record<string, Json>;
   /** Lock entries below node_modules, by path. */
   packages: Record<string, Json>;
 }
@@ -71,6 +74,13 @@ function writeProject(dir: string, spec: ProjectSpec): void {
     writeJson(join(dir, "packages", name, "package.json"), memberManifest);
     packages[`packages/${name}`] = entry(memberManifest);
     packages[`node_modules/${name}`] = { resolved: `packages/${name}`, link: true };
+  }
+  for (const [at, m] of Object.entries(spec.placed ?? {})) {
+    const placedManifest: Json = { version: "1.0.0", ...m };
+    mkdirSync(join(dir, at), { recursive: true });
+    writeJson(join(dir, at, "package.json"), placedManifest);
+    packages[at] = entry(placedManifest);
+    packages[`node_modules/${placedManifest.name}`] = { resolved: at, link: true };
   }
   Object.assign(packages, spec.packages);
   writeLock(dir, { name: manifest.name, version: manifest.version, lockfileVersion: 3, requires: true, packages });
@@ -101,12 +111,15 @@ interface FakeOptions {
   onResolve?: (dir: string) => void;
   /** Fail any resolve run in this directory. */
   failIn?: string;
+  /** Apply overrides only while the root declares this package, as npm does for a copy reachable only through members. */
+  reachableVia?: string;
 }
 
 const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies"];
 
-function fakeNpm(opts: FakeOptions = {}): { run: NpmRunner; commands: string[] } {
+function fakeNpm(opts: FakeOptions = {}): { run: NpmRunner; commands: string[]; roots: Json[] } {
   const commands: string[] = [];
+  const roots: Json[] = [];
   const run: NpmRunner = (command, cwd) => {
     commands.push(command);
 
@@ -137,7 +150,11 @@ function fakeNpm(opts: FakeOptions = {}): { run: NpmRunner; commands: string[] }
     if (opts.failIn && cwd === opts.failIn) {
       throw Object.assign(new Error(`Command failed: ${command}`), { stderr: "npm error code ETARGET\nnpm error notarget No matching version" });
     }
-    const overrides = (readJson(join(cwd, "package.json")).overrides ?? {}) as Record<string, string>;
+    const rootManifest = readJson(join(cwd, "package.json"));
+    roots.push(rootManifest);
+    const declared = { ...rootManifest.dependencies, ...rootManifest.devDependencies };
+    const reaches = opts.reachableVia === undefined || declared[opts.reachableVia] !== undefined;
+    const overrides = (reaches ? (rootManifest.overrides ?? {}) : {}) as Record<string, string>;
     const lock = readLock(cwd);
     for (const [key, value] of Object.entries(overrides)) {
       const at = key.lastIndexOf("@");
@@ -151,7 +168,7 @@ function fakeNpm(opts: FakeOptions = {}): { run: NpmRunner; commands: string[] }
     writeLock(cwd, lock);
     opts.onResolve?.(cwd);
   };
-  return { run, commands };
+  return { run, commands, roots };
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +223,7 @@ const PUBLISHED: Record<string, string[]> = {
   qs: ["6.5.0", "6.5.3"],
   ms: ["2.0.0", "2.0.5", "2.1.3"],
   pinned: ["1.0.0", "1.0.1"],
+  minimatch: ["3.0.4", "3.0.5"],
 };
 
 function cfgFor(dir: string, over: Partial<ResolvedConfig> = {}): ResolvedConfig {
@@ -448,6 +466,12 @@ describe("removing orphaned overrides", () => {
     assert.equal(report.outcome, "changes", "the manifest changed");
     assert.deepEqual(report.keptOverrides, []);
     assert.equal(result.overrideChanges, 1);
+    // The report says so: its body must not contradict the diff.
+    assert.deepEqual(report.removedOverrides.map((r) => r.key), [QS_KEY]);
+    const md = reportMd(reportDir);
+    assert.match(md, /^## Overrides removed$/m);
+    assert.match(md, new RegExp(`\`${QS_KEY}\``));
+    assert.match(md, /\*\*1\*\* override removed as no longer needed/);
   });
 
   it("keeps it and lists it when removing it would move a version", async () => {
@@ -478,9 +502,10 @@ describe("removing orphaned overrides", () => {
   it("keeps it and lists it when removing it would leave a dependent outside its range", async () => {
     const dir = tempDir();
     const reportDir = tempDir();
-    // a declares ~6.4.0 and holds 6.5.3 only because of the override. The registry says a
-    // has since moved on, so the verdict is remove, and nothing moves. The tree would break.
-    writeProject(dir, fixedQsProject({ aWants: "~6.4.0" }));
+    // a declares a union that reads as safe to the floor check, which only looks at the first number, but
+    // 6.5.3 satisfies neither half: only the override explains it. The verdict is remove,
+    // nothing moves, and the tree would break.
+    writeProject(dir, fixedQsProject({ aWants: "6.5.3-beta.1 || 6.4.0" }));
     const before = treeOf(dir);
 
     await runTargeted(cfgFor(dir, { reportDir }), depsFor(FIXED, fakeNpm(), async () => SAFE));
@@ -488,7 +513,7 @@ describe("removing orphaned overrides", () => {
     assert.deepEqual(treeOf(dir), before);
     const kept = reportIn(reportDir).keptOverrides;
     assert.deepEqual(kept.map((k) => k.key), [QS_KEY]);
-    assert.match(kept[0].reason, /node_modules\/a -> qs@~6\.4\.0/);
+    assert.match(kept[0].reason, /node_modules\/a -> qs@6\.5\.3-beta\.1 \|\| 6\.4\.0/);
   });
 
   it("does not try when a dependent could still resolve below the floor", async () => {
@@ -634,5 +659,356 @@ describe("end to end, offline", () => {
     await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), msAlert()], npm));
 
     assert.deepEqual(reportIn(reportDir).otherChanges, [{ path: "functions/node_modules/baz", to: "1.0.0" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Members are whatever the lockfile holds, not whatever a glob reader can see
+// ---------------------------------------------------------------------------
+
+const MM_ALERT = alert(1, "minimatch", "< 3.0.5", "3.0.5");
+const MM_KEY = "minimatch@>=3.0.0 <3.0.5";
+
+/** Root reaches minimatch through glob; a package at apps/web/site declares it as `declared`. */
+const siteProject = (workspaces: unknown, declared: string, over: Partial<ProjectSpec> = {}): ProjectSpec => ({
+  root: { workspaces, dependencies: { glob: "^7.1.6" } },
+  placed: { "apps/web/site": { name: "site", dependencies: { minimatch: declared } } },
+  packages: {
+    "node_modules/glob": { version: "7.1.6", dependencies: { minimatch: "^3.0.4" } },
+    "node_modules/minimatch": { version: "3.0.4" },
+  },
+  ...over,
+});
+
+async function expectBlocked(dir: string, reason: string, detail: RegExp): Promise<void> {
+  const reportDir = tempDir();
+  const before = treeOf(dir);
+  const npm = fakeNpm();
+  await runTargeted(cfgFor(dir, { reportDir }), depsFor([MM_ALERT], npm));
+  const report = reportIn(reportDir);
+  assert.equal(report.alerts[0].status, "blocked", JSON.stringify(report.alerts[0].copies));
+  assert.equal(report.alerts[0].copies[0].reason, reason);
+  assert.match(report.alerts[0].copies[0].detail ?? "", detail);
+  assert.equal(report.outcome, "blocked-only");
+  assert.deepEqual(npm.commands, [], "nothing to run: no override, no bump");
+  assert.deepEqual(treeOf(dir), before);
+}
+
+describe("workspace members the lockfile holds", () => {
+
+  it("an exact pin in a member under apps/** blocks the alert, though no workspace reader lists it", async () => {
+    const dir = tempDir();
+    writeProject(dir, siteProject(["apps/**"], "3.0.4"));
+    await expectBlocked(dir, "pin", /Pinned at "3\.0\.4" in apps\/web\/site\/package\.json/);
+  });
+
+  it("an exact pin in a member under apps/*/*, in the object form of `workspaces`", async () => {
+    const dir = tempDir();
+    writeProject(dir, siteProject({ packages: ["apps/*/*"] }, "3.0.4"));
+    await expectBlocked(dir, "pin", /apps\/web\/site\/package\.json/);
+  });
+
+  it("an exact pin in a file: dependency blocks the alert", async () => {
+    const dir = tempDir();
+    writeProject(dir, siteProject(undefined, "3.0.4", { root: { dependencies: { glob: "^7.1.6", site: "file:apps/web/site" } } }));
+    await expectBlocked(dir, "pin", /apps\/web\/site\/package\.json/);
+  });
+
+  it("a range in a file: dependency is blocked as unrewritable, not bumped with -w", async () => {
+    const dir = tempDir();
+    writeProject(dir, siteProject(undefined, "^3.0.4", { root: { dependencies: { glob: "^7.1.6", site: "file:apps/web/site" } } }));
+    await expectBlocked(dir, "unrewritable-spec", /file: dependency and not a workspace member/);
+  });
+
+  it("a member-only ^3.0.4 under apps/** gets a bump through -w, not an override", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { workspaces: ["apps/**"] },
+      placed: { "apps/web/site": { name: "site", dependencies: { minimatch: "^3.0.4" } } },
+      packages: { "node_modules/minimatch": { version: "3.0.4" } },
+    });
+    const npm = fakeNpm();
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([MM_ALERT], npm));
+
+    assert.ok(npm.commands.some((c) => c.startsWith("npm install minimatch@3.0.5 -w apps/web/site ")), npm.commands.join("\n"));
+    assert.deepEqual(readJson(join(dir, "apps", "web", "site", "package.json")).dependencies, { minimatch: "^3.0.5" });
+    assert.equal(readJson(join(dir, "package.json")).overrides, undefined);
+    assert.equal(readLock(dir).packages["node_modules/minimatch"].version, "3.0.5");
+    assert.equal(reportIn(reportDir).alerts[0].copies[0].action, "bump");
+  });
+
+  it("a copy reached only through a member under apps/** gets the temporary-root owners", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { workspaces: ["apps/**"] },
+      placed: { "apps/web/site": { name: "site", dependencies: { glob: "^7.1.6" } } },
+      packages: {
+        "node_modules/glob": { version: "7.1.6", dependencies: { minimatch: "^3.0.4" } },
+        "node_modules/minimatch": { version: "3.0.4" },
+      },
+    });
+    const npm = fakeNpm({ reachableVia: "glob" });
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([MM_ALERT], npm));
+
+    assert.ok(npm.roots.some((r) => r.devDependencies?.glob === "^7.1.6"), "glob was declared at the root for one resolve");
+    const root = readJson(join(dir, "package.json"));
+    assert.equal(root.devDependencies, undefined, "and taken away again");
+    assert.deepEqual(root.overrides, { [MM_KEY]: "3.0.5" });
+    assert.equal(readLock(dir).packages["node_modules/minimatch"].version, "3.0.5");
+    assert.deepEqual(reportIn(reportDir).failures, []);
+  });
+
+  it("a confirmable member whose package.json is missing stops the run at startup", async () => {
+    const dir = tempDir();
+    writeProject(dir, siteProject(["apps/**"], "3.0.4"));
+    rmSync(join(dir, "apps", "web", "site"), { recursive: true });
+    await assert.rejects(
+      runTargeted(cfgFor(dir), depsFor([MM_ALERT], fakeNpm())),
+      (e: Error) => e instanceof AgentError && /apps\/web\/site is a workspace member/.test(e.message),
+    );
+  });
+
+  it("isWorkspaceMember reads patterns as npm does", () => {
+    const patterns = (include: string[], exclude: string[] = []) => ({ include, exclude });
+    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/**"])), true);
+    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/*/*"])), true);
+    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/*"])), false);
+    assert.equal(isWorkspaceMember("packages/a", patterns(["packages/*"])), true);
+    assert.equal(isWorkspaceMember("packages/a", patterns(["./packages/*"])), true);
+    assert.equal(isWorkspaceMember("packages/a", patterns(["packages/**"], ["packages/a"])), false);
+    assert.equal(isWorkspaceMember("libs/site", patterns([])), false);
+    assert.equal(isWorkspaceMember("a/x/b", patterns(["a/**/b"])), true);
+    assert.equal(isWorkspaceMember("a/b", patterns(["a/**/b"])), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the lockfile says about dependents
+// ---------------------------------------------------------------------------
+
+describe("judging an orphaned override by the lockfile's own ranges", () => {
+  const FIXED = [alert(1, "qs", "< 6.5.3", "6.5.3", { state: "fixed" })];
+
+  it("a member under apps/** that still declares ^6.0.0 holds the override", async () => {
+    const dir = tempDir();
+    writeProject(dir, {
+      root: { workspaces: ["apps/**"], dependencies: { a: "^1.0.0" }, overrides: { [QS_KEY]: "6.5.3" } },
+      placed: { "apps/web/site": { name: "site", dependencies: { qs: "^6.0.0" } } },
+      packages: {
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+        "node_modules/qs": { version: "6.5.3" },
+      },
+    });
+    const before = treeOf(dir);
+    const npm = fakeNpm();
+    await runTargeted(cfgFor(dir), depsFor(FIXED, npm, async () => SAFE));
+    assert.deepEqual(npm.commands, []);
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("a dependent the registry can't answer for still counts, by the range the lockfile holds", async () => {
+    const dir = tempDir();
+    writeProject(dir, {
+      root: { dependencies: { "@corp/lib": "^1.0.0", a: "^1.0.0" }, overrides: { [QS_KEY]: "6.5.3" } },
+      packages: {
+        "node_modules/@corp/lib": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+        "node_modules/qs": { version: "6.5.3" },
+      },
+    });
+    const before = treeOf(dir);
+    const npm = fakeNpm();
+    await runTargeted(
+      cfgFor(dir),
+      depsFor(FIXED, npm, async (dependent) =>
+        dependent === "a" ? SAFE : { installedRange: null, latestRange: null, latestKnown: false },
+      ),
+    );
+    assert.deepEqual(npm.commands, []);
+    assert.deepEqual(treeOf(dir), before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dry run and real run agree; removals show in the report
+// ---------------------------------------------------------------------------
+
+describe("dry run and real run", () => {
+  const FIXED = [alert(1, "qs", "< 6.5.3", "6.5.3", { state: "fixed" })];
+
+  it("a dry run reports the overrides it would try to remove, and counts them", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, fixedQsProject({ aWants: "^6.5.3" }));
+    const before = treeOf(dir);
+    const npm = fakeNpm();
+
+    const result = await runTargeted(cfgFor(dir, { dryRun: true, reportDir }), depsFor(FIXED, npm, async () => SAFE));
+
+    assert.deepEqual(treeOf(dir), before);
+    assert.deepEqual(npm.commands, []);
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "changes");
+    assert.equal(result.overrideChanges, 1);
+    assert.deepEqual(report.removedOverrides.map((r) => r.key), [QS_KEY]);
+    const md = reportMd(reportDir);
+    assert.match(md, /would try to remove/);
+    assert.match(md, /\*\*1\*\* override would be removed/);
+  });
+
+  it("a stale lockfile with the key already written gives the same outcome and count either way", async () => {
+    const results: Array<[number, string]> = [];
+    for (const dryRun of [true, false]) {
+      const dir = tempDir();
+      const reportDir = tempDir();
+      writeProject(dir, {
+        root: { dependencies: { a: "^1.0.0" }, overrides: { [QS_KEY]: "6.5.3" } },
+        packages: { "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } }, "node_modules/qs": { version: "6.5.0" } },
+      });
+      const result = await runTargeted(cfgFor(dir, { dryRun, reportDir }), depsFor([qsAlert()], fakeNpm()));
+      results.push([result.overrideChanges, reportIn(reportDir).outcome]);
+    }
+    assert.deepEqual(results[0], results[1]);
+    assert.deepEqual(results[1], [1, "changes"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A report on any failure
+// ---------------------------------------------------------------------------
+
+describe("a failed run reports, whatever failed", () => {
+  it("a GitHub error: report.json says failed, with a run failure and the reason", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), {
+        fetchAlerts: async () => {
+          throw new AgentError("GitHub API error 401: Bad credentials");
+        },
+      }),
+      /401/,
+    );
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "failed");
+    assert.deepEqual(report.failures.map((f) => f.check), ["run"]);
+    assert.match(report.failures[0].detail, /GitHub API error 401/);
+    assert.match(reportMd(reportDir), /## Failures/);
+    assert.doesNotMatch(reportMd(reportDir), /No open alerts needed attention/);
+  });
+
+  it("a pnpm stop writes a report too", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    await assert.rejects(runTargeted(cfgFor(dir, { reportDir }), depsFor([], fakeNpm())), /npm only/);
+    assert.match(reportIn(reportDir).failures[0].detail, /npm only/);
+  });
+
+  it("an unreadable lockfile writes a report too", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeJson(join(dir, "package.json"), { name: "fx", version: "1.0.0" });
+    await assert.rejects(runTargeted(cfgFor(dir, { packageManager: "npm", reportDir }), depsFor([], fakeNpm())), /No package-lock\.json/);
+    assert.equal(reportIn(reportDir).outcome, "failed");
+  });
+
+  it("a throw after the fixes were applied restores every file, and still reports", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { dependencies: { a: "^1.0.0", b: "^1.0.0" }, overrides: { "ms@>=2.0.0 <2.0.5": "2.0.5" } },
+      packages: {
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/qs": { version: "6.5.0" },
+        "node_modules/b": { version: "1.0.0", dependencies: { ms: "^2.0.5" } },
+        "node_modules/ms": { version: "2.0.5" },
+      },
+    });
+    const before = treeOf(dir);
+    await assert.rejects(
+      runTargeted(
+        cfgFor(dir, { reportDir }),
+        depsFor([qsAlert(), alert(2, "ms", "< 2.0.5", "2.0.5", { state: "fixed" })], fakeNpm(), async () => {
+          throw new Error("boom in the orphan phase");
+        }),
+      ),
+      /boom/,
+    );
+    assert.deepEqual(treeOf(dir), before);
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "failed");
+    assert.match(report.failures[0].detail, /boom in the orphan phase/);
+    assert.equal(report.alerts[0].packageName, "qs", "the plan is in the report");
+  });
+
+  it("a report that can't be written restores the tree and says why", async () => {
+    const dir = tempDir();
+    const reportDir = join(tempDir(), "taken");
+    writeFileSync(reportDir, "a file, not a directory");
+    writeProject(dir, qsProject());
+    const before = treeOf(dir);
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], fakeNpm())),
+      (e: Error) => e instanceof AgentError && /Could not write the report to .*Every file was restored/.test(e.message),
+    );
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("a report that can't be written doesn't hide a verification failure", async () => {
+    const dir = tempDir();
+    const reportDir = join(tempDir(), "taken");
+    writeFileSync(reportDir, "a file, not a directory");
+    writeProject(dir, qsProject());
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], fakeNpm({ failIn: dir }))),
+      /failed verification in root: stable/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An alert on a member of an isolated package
+// ---------------------------------------------------------------------------
+
+describe("grouping alerts by the nearest lockfile", () => {
+  it("an alert keyed to a member of an isolated package is fixed in that package's lockfile", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, { root: { dependencies: { a: "^1.0.0" } }, packages: { "node_modules/a": { version: "1.0.0" } } });
+    writeProject(join(dir, "functions"), {
+      root: { name: "functions", workspaces: ["pkg/*"] },
+      placed: { "pkg/x": { name: "x", dependencies: { b: "^1.0.0" } } },
+      packages: {
+        "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/qs": { version: "6.5.0" },
+      },
+    });
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert({ manifest: "functions/pkg/x/package.json" })], fakeNpm()));
+
+    assert.equal(reportIn(reportDir).alerts[0].status, "fixed");
+    assert.equal(readLock(join(dir, "functions")).packages["node_modules/qs"].version, "6.5.3");
+    assert.deepEqual(readJson(join(dir, "functions", "package.json")).overrides, { [QS_KEY]: "6.5.3" });
+  });
+
+  it("groupAlertsByNearestLockfile picks the deepest owner and keeps empty groups", () => {
+    const root = path.resolve("/repo");
+    const a = (manifest: string): DependabotAlert => alert(1, "qs", "<1", "1", { manifest });
+    const groups = groupAlertsByNearestLockfile(
+      [a("package.json"), a("package-lock.json"), a("functions/package.json"), a("functions/pkg/x/package.json"), a("apps/web/package.json")],
+      root,
+      [path.join(root, "functions"), path.join(root, "other")],
+    );
+    assert.deepEqual(
+      [...groups].map(([dir, list]) => [path.relative(root, dir), list.length]),
+      [["", 3], ["functions", 2], ["other", 0]],
+    );
   });
 });

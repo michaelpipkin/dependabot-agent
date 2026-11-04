@@ -13,6 +13,8 @@ export interface RunReport {
   alerts: AlertOutcome[];
   otherChanges: Array<{ path: string; from?: string; to?: string }>;
   keptOverrides: Array<{ key: string; reason: string }>;
+  /** Overrides taken out of package.json as no longer needed (or, in a dry run, that would be tried). */
+  removedOverrides: Array<{ key: string; reason: string }>;
   failures: VerificationFailure[];
 }
 
@@ -209,7 +211,7 @@ function buildSections(report: RunReport): Section[] {
 
   sections.push({
     heading: "Failures",
-    intro: ["The run failed verification, so no changes were kept. Each line names the check that failed and where.", ""],
+    intro: ["The run failed, so no changes were kept. Each line names the check that failed and where.", ""],
     items: report.failures.map(failureItem),
   });
 
@@ -274,6 +276,17 @@ function buildSections(report: RunReport): Section[] {
   });
 
   sections.push({
+    heading: "Overrides removed",
+    intro: [
+      planned
+        ? "Planned, not applied: a dry run judged these overrides no longer needed and would try to remove them. A removal is kept only if it moves no locked version."
+        : "These overrides were removed from package.json: their alert is fixed, every dependent now asks for a safe version, and removing them moved no locked version.",
+      "",
+    ],
+    items: report.removedOverrides.map((o) => `- \`${o.key}\`: ${o.reason}`),
+  });
+
+  sections.push({
     heading: "Overrides kept",
     intro: ["These existing overrides were left in place.", ""],
     items: report.keptOverrides.map((o) => `- \`${o.key}\`: ${o.reason}`),
@@ -292,7 +305,15 @@ function headerBlock(report: RunReport): string {
   if (report.outcome === "failed") {
     lines.push("> **The run failed.** No changes were kept.", "");
   }
-  lines.push(summaryLine(report.alerts, report.outcome === "failed" || report.dryRun));
+  // A failed run that never got as far as planning has no alerts to summarise.
+  if (report.outcome !== "failed" || report.alerts.length > 0) {
+    lines.push(summaryLine(report.alerts, report.outcome === "failed" || report.dryRun));
+  }
+  const removed = report.removedOverrides.length;
+  if (removed > 0) {
+    const verb = report.dryRun ? "would be removed" : "removed";
+    lines.push("", `**${removed}** override${removed === 1 ? "" : "s"} ${verb} as no longer needed.`);
+  }
   return lines.join("\n");
 }
 
@@ -304,6 +325,7 @@ const PRIORITY = [
   "Failures",
   "Blocked",
   "Applied past a declared range — review these",
+  "Overrides removed",
   "Partly fixed",
   "Fixed",
   "Awaiting close or not found",

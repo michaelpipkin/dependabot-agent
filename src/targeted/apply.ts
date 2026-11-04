@@ -222,7 +222,7 @@ function resolveThroughRoot(dir: string, lock: LockIndex, targetNames: string[],
   const rootFile = join(dir, "package.json");
   const saved = readFileSync(rootFile, "utf-8");
   const root = JSON.parse(saved) as Record<string, unknown>;
-  const memberPaths = manifests.map((m) => m.lockPath).filter((path) => path !== "");
+  const memberPaths = manifests.filter((m) => !m.notWorkspace).map((m) => m.lockPath).filter((path) => path !== "");
   const entries = temporaryRootEntries(lock, memberPaths, targetNames, root);
   if (Object.keys(entries).length === 0) return;
 

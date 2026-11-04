@@ -56,6 +56,8 @@ export interface ManifestInfo {
   dir: string;
   lockPath: string;
   deps: DirectDep[];
+  /** A package the lockfile holds at its own path that isn't a workspace member (a `file:` dependency): npm can't `-w` it. */
+  notWorkspace?: boolean;
 }
 export interface PlanInput {
   alerts: DependabotAlert[];
@@ -290,6 +292,12 @@ function declarationBlock(ctx: PackageContext, copy: LockEntry): Block | null {
   }
 
   for (const { manifest, dep } of declarations) {
+    if (manifest.notWorkspace) {
+      return {
+        reason: "unrewritable-spec",
+        detail: `"${dep.spec}" in ${manifestFile(manifest)}, which is a file: dependency and not a workspace member, so npm can't rewrite it with -w.`,
+      };
+    }
     const operator = parseSimpleSpec(dep.spec)?.operator;
     if (operator !== "^" && operator !== "~") {
       return {

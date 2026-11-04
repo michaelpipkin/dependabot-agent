@@ -9,7 +9,9 @@ export type CheckName =
   | "limits-held"
   | "tree-complete"
   | "manifests"
-  | "stable";
+  | "stable"
+  /** Not a verification check: the run itself failed (GitHub, the lockfile, a throw), before or apart from verifying. */
+  | "run";
 export interface VerificationFailure {
   check: CheckName;
   path?: string;

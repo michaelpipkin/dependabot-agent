@@ -655,6 +655,63 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       mock.restoreAll();
     });
 
+    /** A member at apps/web/site under a glob no workspace reader resolves, with its own manifest. */
+    function unseenMemberProject(rootDeps: Record<string, string>, memberDeps: Record<string, string>, workspaces: string[] = ["apps/**"]): string {
+      const dir = mkdtempSync(join(tmpdir(), "targeted-live-"));
+      dirs.push(dir);
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fx", version: "1.0.0", private: true, workspaces, dependencies: rootDeps }, null, 2) + "\n");
+      mkdirSync(join(dir, "apps", "web", "site"), { recursive: true });
+      writeFileSync(join(dir, "apps", "web", "site", "package.json"), JSON.stringify({ name: "site", version: "1.0.0", dependencies: memberDeps }, null, 2) + "\n");
+      npm(dir, `install --before=2020-06-01 --package-lock-only ${QUIET}`);
+      return dir;
+    }
+
+    it("a member under apps/** that pins the copy keeps it, though the root reaches the same copy", async () => {
+      const dir = unseenMemberProject({ glob: "^7.1.6" }, { minimatch: "3.0.4" });
+      const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+      dirs.push(reportDir);
+      const lockBefore = text(dir, "package-lock.json");
+      const memberBefore = text(dir, "apps", "web", "site", "package.json");
+
+      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+
+      const r = report(reportDir);
+      assert.equal(r.outcome, "blocked-only");
+      assert.equal(r.alerts[0].status, "blocked");
+      assert.equal(r.alerts[0].copies[0].reason, "pin");
+      assert.equal(json(dir, "package.json").overrides, undefined);
+      assert.equal(text(dir, "package-lock.json"), lockBefore);
+      assert.equal(text(dir, "apps", "web", "site", "package.json"), memberBefore);
+    });
+
+    it("a member-only ^3.0.4 under apps/** is bumped with -w", async () => {
+      const dir = unseenMemberProject({}, { minimatch: "^3.0.4" });
+      const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+      dirs.push(reportDir);
+
+      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+
+      assert.equal(report(reportDir).outcome, "changes");
+      assert.deepEqual(json(dir, "apps", "web", "site", "package.json").dependencies, { minimatch: "^3.0.5" });
+      assert.equal(json(dir, "package.json").overrides, undefined);
+      assert.equal(versions(dir).get("node_modules/minimatch"), "3.0.5");
+      npm(dir, `ci ${QUIET}`);
+    });
+
+    it("a copy reached only through a member under apps/** goes through the temporary-root step", async () => {
+      const dir = unseenMemberProject({}, { glob: "^7.1.6" });
+      const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+      dirs.push(reportDir);
+      const rootBefore = json(dir, "package.json");
+
+      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+
+      assert.deepEqual(report(reportDir).failures, []);
+      assert.deepEqual(json(dir, "package.json"), { ...rootBefore, overrides: { [MINIMATCH_KEY]: "3.0.5" } });
+      assert.equal(versions(dir).get("node_modules/minimatch"), "3.0.5");
+      npm(dir, `ci ${QUIET}`);
+    });
+
     function cfg(dir: string, reportDir: string): ResolvedConfig {
       return {
         token: "",

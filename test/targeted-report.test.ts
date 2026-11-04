@@ -31,6 +31,7 @@ function report(over: Partial<RunReport> = {}): RunReport {
     alerts: [alert()],
     otherChanges: [],
     keptOverrides: [],
+    removedOverrides: [],
     failures: [],
     ...over,
   };
@@ -238,6 +239,40 @@ describe("renderMarkdown", () => {
     // Sections still appear in document order.
     assert.ok(md.indexOf("## Fixed") < md.indexOf("## Applied past"));
     assert.ok(md.indexOf("## Applied past") < md.indexOf("## Blocked"));
+  });
+
+  it("lists removed overrides, and the summary says so even with no alerts", () => {
+    const md = renderMarkdown(
+      report({
+        alerts: [],
+        removedOverrides: [{ key: "qs@>=6.0.0 <6.5.3", reason: "Its alert is fixed and every dependent now asks for 6.5.3 or later." }],
+      }),
+    );
+    assert.deepEqual(headings(md), ["Overrides removed"]);
+    assert.ok(md.includes("- `qs@>=6.0.0 <6.5.3`: Its alert is fixed"));
+    assert.ok(md.includes("**1** override removed as no longer needed."));
+    assert.ok(md.includes("No open alerts needed attention."));
+  });
+
+  it("labels removed overrides as a plan in a dry run", () => {
+    const md = renderMarkdown(report({ dryRun: true, alerts: [], removedOverrides: [{ key: "qs", reason: "x" }] }));
+    assert.match(md, /would try to remove/);
+    assert.ok(md.includes("**1** override would be removed"));
+  });
+
+  it("keeps removed overrides when the report is cut down, ahead of the fixed list", () => {
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
+    const md = renderMarkdown(report({ alerts: many, removedOverrides: [{ key: "qs@>=6.0.0 <6.5.3", reason: "gone" }] }));
+    assert.ok(md.length <= MAX_BODY_CHARS);
+    assert.ok(md.includes("- `qs@>=6.0.0 <6.5.3`: gone"));
+  });
+
+  it("a failed run that never planned says nothing about alerts", () => {
+    const md = renderMarkdown(
+      report({ outcome: "failed", alerts: [], failures: [{ check: "run", detail: "GitHub API error 401" }] }),
+    );
+    assert.doesNotMatch(md, /No open alerts/);
+    assert.ok(md.includes("- **run**: GitHub API error 401"));
   });
 
   it("does not truncate a report that fits", () => {
