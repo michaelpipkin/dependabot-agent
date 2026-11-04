@@ -423,7 +423,7 @@ dependabot-agent --update-strategy targeted --dry-run
 > **Status: new.** Targeted mode is recent.
 >
 > - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
-> - On a live repository, Dependabot closed every alert this mode fixed, within seconds of the push, including those fixed through the [temporary root step](#workspaces). Alerts it reported as blocked stayed open.
+> - On a live repository, Dependabot closed every alert this mode fixed, including those fixed through the [temporary root step](#workspaces), and left open the ones it reported as blocked. Closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports them as awaiting close.
 >
 > **Run it with `--dry-run` on a real repository first**, read the plan, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
 
