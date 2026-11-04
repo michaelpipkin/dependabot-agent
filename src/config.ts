@@ -135,8 +135,11 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
 
   const packageManager = args.packageManager ?? parsePmEnv(env.PACKAGE_MANAGER) ?? config.packageManager;
 
+  // Checked whatever else sets the strategy: an unknown one must never fall through
+  // to a package manager's update, which is what the targeted strategy exists to avoid.
+  const configStrategy = parseStrategyConfig(config.updateStrategy);
   const updateStrategy: UpdateStrategy =
-    args.updateStrategy ?? parseStrategyEnv(env.UPDATE_STRATEGY) ?? config.updateStrategy ?? "compatible";
+    args.updateStrategy ?? parseStrategyEnv(env.UPDATE_STRATEGY) ?? configStrategy ?? "compatible";
 
   // Default false: the update pass follows the `latest` dist-tag, and a
   // maintainer publishing a release candidate without `--tag` moves that tag
@@ -161,17 +164,15 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
 
   // Targeted-mode version ceilings (config-file only). Validated up front so a
   // typo fails the run immediately instead of silently limiting nothing.
-  const limits = config.limits ?? {};
-  for (const [pattern, range] of Object.entries(limits)) {
-    if (typeof range !== "string" || semver.validRange(range) === null) {
-      exitWithError(`Invalid "limits" entry for "${pattern}": "${String(range)}" is not a valid semver range.`);
-    }
-  }
+  const limits = parseLimits(config.limits);
 
   const reportDir = args.reportDir || env.REPORT_DIR || undefined;
 
   if (Object.keys(limits).length > 0 && updateStrategy !== "targeted") {
     warn(`"limits" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
+  }
+  if (reportDir && updateStrategy !== "targeted") {
+    warn(`"--report" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
   }
   if (updateStrategy === "targeted" && skipUpdate) {
     warn(`"skipUpdate" has no effect with --update-strategy targeted (it never runs the bulk update).`);
@@ -216,6 +217,35 @@ function parsePmEnv(value: string | undefined): PackageManagerId | undefined {
     exitWithError(`Invalid PACKAGE_MANAGER: "${value}" (expected "pnpm" or "npm")`);
   }
   return value;
+}
+
+function parseStrategyConfig(value: unknown): UpdateStrategy | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "compatible" && value !== "latest" && value !== "targeted") {
+    exitWithError(`Invalid "updateStrategy" in the config file: ${JSON.stringify(value)} (expected "compatible", "latest" or "targeted")`);
+  }
+  return value;
+}
+
+/**
+ * The config file's `limits`, which semver alone wouldn't catch: it reads a blank range
+ * as "anything", and a value that isn't an object would otherwise limit nothing at all.
+ */
+function parseLimits(value: unknown): Record<string, string> {
+  if (value === undefined) return {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    exitWithError(`Invalid "limits" in the config file: ${JSON.stringify(value)} is not an object mapping package names to semver ranges, such as {"@angular/*": "<22"}.`);
+  }
+  const limits = value as Record<string, unknown>;
+  for (const [pattern, range] of Object.entries(limits)) {
+    if (pattern.trim() === "") {
+      exitWithError(`Invalid "limits" entry ${JSON.stringify(pattern)}: the package name or glob is empty.`);
+    }
+    if (typeof range !== "string" || range.trim() === "" || semver.validRange(range) === null) {
+      exitWithError(`Invalid "limits" entry for "${pattern}": ${JSON.stringify(range)} is not a valid semver range.`);
+    }
+  }
+  return limits as Record<string, string>;
 }
 
 function parseStrategyEnv(value: string | undefined): UpdateStrategy | undefined {

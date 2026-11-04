@@ -19,6 +19,8 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 
 - **The npm guidance after a run is corrected.** The README, the runbook and the agent's own output said a plain `npm install` doesn't apply a changed `overrides` entry. It does for packages reachable from the root `package.json`; it doesn't for packages reachable only through workspace members. A clean reinstall re-resolves the whole tree, so it applies every override but also moves whatever else the declared ranges allow. The agent still prints the clean-reinstall command, now with that explanation. `compatible`, `latest` and pnpm behave as before.
 
+- **A config file's `updateStrategy` is now checked.** A value other than `compatible`, `latest` or `targeted` stops the run at startup, as `UPDATE_STRATEGY` and `--update-strategy` already did. A typo used to run the bulk update without a word, which is exactly what someone asking for `targeted` wants to avoid.
+
 ### Status
 
 Targeted mode is new. It has been tested on npm 11.16 on Windows; Linux and npm 10 are still to be confirmed. It has not yet been confirmed on a live repository that Dependabot closes the alerts after the overrides it writes. Run it with `--dry-run` on a real repository first.

@@ -35,7 +35,7 @@ Options:
                                    targeted: npm only; fix alerts with the smallest
                                    change instead of updating everything.
   --report <dir>                   Write a report of the run to this directory
-                                   (or env REPORT_DIR).
+                                   (or env REPORT_DIR). Targeted strategy only.
   --allow-prerelease               Let the update pass settle on a pre-release version
                                    (or ALLOW_PRERELEASE=true). Off by default: a package
                                    whose "latest" dist-tag points at an rc is otherwise

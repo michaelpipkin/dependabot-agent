@@ -167,7 +167,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--dry-run` | `DRY_RUN=true` | `false` | Print planned changes without writing. |
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
-| `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory. |
+| `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory. Targeted strategy only: under `compatible` or `latest` it prints a warning and writes nothing. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
 Precedence: **flags > environment variables > config file > defaults.**
@@ -243,6 +243,8 @@ The agent runs a dependency update before reconciling, so legitimately-fixed pac
 - **`compatible`** (default) — stay within existing semver ranges; does not cross majors automatically. pnpm: `pnpm update`; npm: `npm update --save`.
 - **`latest`** — allow crossing majors. pnpm: `pnpm update --latest`; npm: `npm install <alerted-pkg>@latest` for the alerted direct dependencies.
 - **`targeted`** (npm only) — no bulk update at all. Each alert gets the smallest change that resolves it, or is reported as blocked. See [Targeted mode (npm)](#targeted-mode-npm).
+
+A config file's `updateStrategy` that isn't one of these stops the run at startup, whatever a flag or environment variable says.
 
 Under either strategy the update pass leaves two things alone: [exact pins](#exact-pins-are-never-rewritten) and, unless you opt in, [pre-releases](#pre-releases).
 
@@ -489,7 +491,7 @@ A blocked copy is left exactly as it is, and the report names the copy and the r
 }
 ```
 
-A fix whose target is outside a matching limit is blocked with the reason `limit`, so a fix that needs Angular 22 stays a hard no. If several alerts hit one release line and the highest patch would break a limit, the highest patch that doesn't is used, the alert that needs the higher one is blocked, and the lower one is still fixed. Limits are also checked after the run on every version that changed, including packages that moved as a side effect, so a limit can't be crossed indirectly. A malformed limit stops the run at startup. `limits` under another strategy prints a warning and has no effect.
+A fix whose target is outside a matching limit is blocked with the reason `limit`, so a fix that needs Angular 22 stays a hard no. If several alerts hit one release line and the highest patch would break a limit, the highest patch that doesn't is used, the alert that needs the higher one is blocked, and the lower one is still fixed. Limits are also checked after the run on every version that changed, including packages that moved as a side effect, so a limit can't be crossed indirectly. A malformed limit stops the run at startup, naming the key: `limits` that isn't an object, an empty package name or glob, or a blank or invalid range. `limits` under another strategy prints a warning and has no effect.
 
 ### Overrides already in `package.json`
 

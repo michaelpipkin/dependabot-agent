@@ -107,7 +107,7 @@ Details:
 
 - `limits` maps a package name or `*` glob to a semver range. Config file only.
 - A limit applies to every version the run would write or cause: direct bumps, overrides, and packages moved as a side effect.
-- A malformed limit stops the run at startup.
+- A malformed limit stops the run at startup, naming the key: `limits` that isn't a plain object, an empty pattern, or a blank or invalid range.
 - `limits` set on another strategy prints a warning that it has no effect.
 
 ### Applying fixes
