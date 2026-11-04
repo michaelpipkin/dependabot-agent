@@ -109,6 +109,16 @@ function nearestLockfileDir(root: string, from: string, owners: Set<string>): st
   return root;
 }
 
+/** What an alert's manifest may be called for this run to answer it. pnpm-lock.yaml goes on to the pnpm check, which stops the run. */
+const MANIFEST_FILES = new Set(["package.json", "package-lock.json", "pnpm-lock.yaml"]);
+
+/** Whether the lockfile in `dir` holds `at`, a directory below it, as a workspace member or `file:` package. */
+function lockfileHolds(dir: string, at: string): boolean {
+  // Nothing to look in: the group's own read of this directory stops the run and says why.
+  if (!existsSync(path.join(dir, "package-lock.json")) || hasOldLockfile(dir)) return true;
+  return readLockfile(dir).entries.has(posix(path.relative(dir, at)));
+}
+
 interface PlacedAlerts {
   /** The alerts some lockfile in this run answers for. */
   processed: DependabotAlert[];
@@ -140,16 +150,21 @@ function placeAlerts(open: DependabotAlert[], cfg: ResolvedConfig, extraDirs: st
       refuse(`The directory holding ${manifest} no longer exists, so no lockfile here answers for this alert. Check that GitHub has rescanned, or dismiss the alert.`);
       continue;
     }
+    if (!MANIFEST_FILES.has(path.basename(manifest))) {
+      refuse(`${manifest} is a lockfile this run doesn't read: it fixes package-lock.json only, so a change here wouldn't close this alert.`);
+      continue;
+    }
     const dir = nearestLockfileDir(root, at, owners);
-    if (owners.has(dir)) {
-      placed.processed.push(alert);
-    } else if (!existsSync(path.join(dir, "package.json"))) {
+    const isOwner = owners.has(dir);
+    if (!isOwner && !existsSync(path.join(dir, "package.json"))) {
       refuse(`${manifest} is covered by a lockfile in ${posix(path.relative(root, dir))}, which has no package.json, so this run can't read it.`);
-    } else if (!cfg.discoverPackages) {
+    } else if (!isOwner && !cfg.discoverPackages) {
       refuse(`${manifest} is covered by the lockfile in ${posix(path.relative(root, dir))}, which this run doesn't process because discoverPackages is off. Turn it on, or list that directory under "packages".`);
+    } else if (at !== dir && !lockfileHolds(dir, at)) {
+      refuse(`${manifest} has no package-lock.json of its own, and the lockfile in ${posix(path.relative(root, dir)) || "the root"} doesn't hold that directory as a package, so nothing this run reads answers for this alert.`);
     } else {
       placed.processed.push(alert);
-      if (!placed.addedDirs.includes(dir)) placed.addedDirs.push(dir);
+      if (!isOwner && !placed.addedDirs.includes(dir)) placed.addedDirs.push(dir);
     }
   }
   return placed;

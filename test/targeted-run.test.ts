@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import semver from "semver";
 import type { ResolvedConfig } from "../src/config.js";
@@ -1279,9 +1279,11 @@ describe("an alert on a lockfile discovery doesn't find", () => {
     });
   }
 
-  it("a manifest below that directory, with no lockfile of its own, answers to the nearest one", async () => {
-    const dir = prunedProject();
-    mkdirSync(join(dir, X, "sub"));
+  it("a member of that directory's lockfile answers to it", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    const project = functionsProject();
+    writeProject(join(dir, X), { ...project, root: { ...project.root, workspaces: ["sub"] }, placed: { sub: { name: "sub" } } });
     const reportDir = tempDir();
     await runTargeted(cfgFor(dir, { reportDir }), depsFor([xMs({ manifest: `${X}/sub/package.json` })], fakeNpm()));
     assert.equal(readLock(join(dir, X)).packages["node_modules/ms"].version, "2.0.5");
@@ -1410,6 +1412,141 @@ describe("an alert whose manifest directory is gone", () => {
     const reportDir = tempDir();
     await runTargeted(cfgFor(dir, { reportDir }), depsFor([alert(2, "qs", "< 6.5.3", "6.5.3", { manifest: "../elsewhere/package.json" })], fakeNpm()));
     assert.equal(reportIn(reportDir).alerts[0].copies[0].reason, "manifest-not-processed");
+  });
+});
+
+describe("an alert on a manifest that no lockfile in the run answers for", () => {
+  const writeFiles = (dir: string, files: string[]): void => {
+    for (const file of files) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), "{}\n");
+    }
+  };
+  const assertBlocked = (reportDir: string, manifest: string): void => {
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "blocked-only");
+    assert.equal(report.blockedCount, 1);
+    assert.equal(report.alerts[0].status, "blocked");
+    assert.equal(report.alerts[0].copies[0].reason, "manifest-not-processed");
+    assert.ok(report.alerts[0].copies[0].detail?.includes(manifest));
+    assert.ok(reportMd(reportDir).includes(manifest));
+  };
+
+  const shapes = [
+    { name: "a package.json with no lockfile", manifest: "examples/demo/package.json", files: ["examples/demo/package.json"] },
+    { name: "a yarn project", manifest: "web/yarn.lock", files: ["web/package.json", "web/yarn.lock"] },
+    { name: "an npm-shrinkwrap.json", manifest: "web/npm-shrinkwrap.json", files: ["web/package.json", "web/npm-shrinkwrap.json"] },
+    { name: "a sub-project whose lockfile was deleted", manifest: "functions/package.json", files: ["functions/package.json"] },
+  ];
+  const rootStates: { name: string; project: ProjectSpec }[] = [
+    { name: "a vulnerable copy at the root", project: qsProject() },
+    {
+      name: "a safe copy at the root",
+      project: { root: { dependencies: { a: "^1.0.0" } }, packages: { "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } }, "node_modules/qs": { version: "6.5.3" } } },
+    },
+    { name: "no copy at the root", project: { root: { dependencies: { a: "^1.0.0" } }, packages: { "node_modules/a": { version: "1.0.0" } } } },
+  ];
+
+  for (const shape of shapes) {
+    for (const state of rootStates) {
+      it(`${shape.name}, with ${state.name}, is blocked and writes nothing`, async () => {
+        const dir = tempDir();
+        writeProject(dir, state.project);
+        writeFiles(dir, shape.files);
+        const reportDir = tempDir();
+        const before = treeOf(dir);
+        const npm = fakeNpm();
+
+        await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert({ manifest: shape.manifest })], npm));
+
+        assertBlocked(reportDir, shape.manifest);
+        assert.deepEqual(npm.commands, []);
+        assert.deepEqual(treeOf(dir), before);
+      });
+    }
+  }
+
+  for (const manifest of ["yarn.lock", "npm-shrinkwrap.json", "packages/web/yarn.lock"]) {
+    it(`${manifest} is blocked even where a package-lock.json covers the directory`, async () => {
+      const dir = tempDir();
+      writeProject(dir, { ...qsProject(), members: { web: {} } });
+      writeFiles(dir, [manifest]);
+      const reportDir = tempDir();
+      const before = treeOf(dir);
+
+      await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert({ manifest })], fakeNpm()));
+
+      assertBlocked(reportDir, manifest);
+      assert.deepEqual(treeOf(dir), before);
+    });
+  }
+
+  it("a yarn.lock beside an isolated package's own package-lock.json is blocked", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeProject(join(dir, "functions"), functionsProject());
+    writeFiles(dir, ["functions/yarn.lock"]);
+    const reportDir = tempDir();
+    const before = treeOf(dir);
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([alert(2, "ms", "< 2.0.5", "2.0.5", { manifest: "functions/yarn.lock" })], fakeNpm()));
+
+    assertBlocked(reportDir, "functions/yarn.lock");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("a folder below an isolated package that its lockfile doesn't hold is blocked", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeProject(join(dir, "functions"), functionsProject());
+    writeFiles(dir, ["functions/tools/x/package.json"]);
+    const reportDir = tempDir();
+    const before = treeOf(dir);
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([alert(2, "ms", "< 2.0.5", "2.0.5", { manifest: "functions/tools/x/package.json" })], fakeNpm()));
+
+    assertBlocked(reportDir, "functions/tools/x/package.json");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("a folder below a directory discovery skips, that its lockfile doesn't hold, is blocked", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeProject(join(dir, ".github/actions/x"), functionsProject());
+    writeFiles(dir, [".github/actions/x/sub/package.json"]);
+    const reportDir = tempDir();
+    const before = treeOf(dir);
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([alert(2, "ms", "< 2.0.5", "2.0.5", { manifest: ".github/actions/x/sub/package.json" })], fakeNpm()));
+
+    assertBlocked(reportDir, ".github/actions/x/sub/package.json");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("the rest of the run carries on, and the blocked alert is counted", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeFiles(dir, ["examples/demo/package.json"]);
+    const reportDir = tempDir();
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), alert(2, "qs", "< 6.5.3", "6.5.3", { manifest: "examples/demo/package.json" })], fakeNpm()));
+
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "changes");
+    assert.equal(report.blockedCount, 1);
+    assert.deepEqual(report.alerts.map((a) => [a.number, a.status]), [[1, "fixed"], [2, "blocked"]]);
+    assert.equal(readLock(dir).packages["node_modules/qs"].version, "6.5.3");
+  });
+
+  it("a dry run reports it the same way", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsProject());
+    writeFiles(dir, ["examples/demo/package.json"]);
+    const reportDir = tempDir();
+
+    await runTargeted(cfgFor(dir, { reportDir, dryRun: true }), depsFor([qsAlert({ manifest: "examples/demo/package.json" })], fakeNpm()));
+
+    assertBlocked(reportDir, "examples/demo/package.json");
   });
 });
 
