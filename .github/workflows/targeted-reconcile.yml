@@ -90,10 +90,13 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
-      # The agent's code runs with this token, so it can only read alerts. The token
-      # that can write is made just before the step that uses it, and never reaches the agent.
+      # The agent's code runs with this token, so it can only read alerts. The token that
+      # can write is made later, just before the step that uses it, and is never in the
+      # agent step's environment. If this fails the agent stops with no token and no report,
+      # which the steps below report as failed, so a dead key still reaches the issue.
       - name: Create a token to read alerts
         id: app-alerts
+        continue-on-error: true
         if: ${{ inputs.app-client-id != '' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:

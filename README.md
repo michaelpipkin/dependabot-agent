@@ -626,7 +626,9 @@ Pass **a GitHub App or two tokens**. If it gets anything else, the workflow's fi
 2. Generate a private key, and install the App on the repository. Creating an App doesn't install it: if the token step fails with `Not Found`, the App isn't installed on this repository.
 3. Store the Client ID as a variable and the private key as a secret, then pass them as `app-client-id` and `app-private-key`, as in the example above.
 
-The workflow makes two short-lived tokens from these on each run: one that can only read alerts, for the agent step, and one that can write, made just before the pull request step. The agent's code never holds the one that can write.
+The workflow makes short-lived tokens from these: one that can only read alerts, for the agent step, and, when there's a pull request to open, one that can write, made just before that step. The write token is never in the agent step's environment. That limits what the agent is handed, but isn't a complete barrier: the steps share a job, so a compromised agent package could still interfere with the later steps. As with any token here, pin a version you trust.
+
+If you add a permission to an App after installing it, the installation's owner has to accept it. Until then, creating a token fails, and the run is reported as failed.
 
 **Two tokens:**
 

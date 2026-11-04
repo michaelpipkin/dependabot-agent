@@ -50,10 +50,14 @@ const findStep = (needle: string): Step => {
 };
 const condition = (step: Step): string => String(step.if ?? "");
 
-/** The ids of the steps handed a secret's value. Asking only whether one was passed hands over a true or false. */
-const holdersOf = (secret: string): string[] =>
+/**
+ * The ids of the steps that mention a value anywhere, run scripts included. A whole
+ * expression asking only whether a secret was passed hands over true or false, so it
+ * doesn't count, but anything more in that expression does.
+ */
+const holdersOf = (value: string): string[] =>
   steps
-    .filter((s) => [...Object.values(s.env ?? {}), ...Object.values(s.with ?? {})].some((v) => String(v).includes(secret) && !String(v).includes("!= ''")))
+    .filter((s) => JSON.stringify(s).replace(/\$\{\{ secrets\.[a-z-]+ != '' \}\}/g, "").includes(value))
     .map((s) => s.id ?? s.name ?? "?");
 
 describe("targeted workflow: shape", () => {
@@ -110,6 +114,16 @@ describe("targeted workflow: tokens", () => {
     assert.equal(findStep("agent").env?.GITHUB_TOKEN, "${{ steps.app-alerts.outputs.token || secrets.alerts-token }}");
   });
 
+  it("gives the pull request token to the pull request step and nowhere else", () => {
+    const pr = findStep("peter-evans/create-pull-request").name ?? "";
+    assert.deepEqual(holdersOf("secrets.pr-token"), [pr]);
+    assert.deepEqual(holdersOf("steps.app-pr.outputs.token"), [pr]);
+  });
+
+  it("gives the App's read token to the agent step and nowhere else", () => {
+    assert.deepEqual(holdersOf("steps.app-alerts.outputs.token"), ["agent"]);
+  });
+
   it("never gives the agent step a token that can write", () => {
     const agent = JSON.stringify(findStep("agent"));
     for (const secret of ["pr-token", "app-private-key", "app-pr"]) assert.ok(!agent.includes(secret), secret);
@@ -155,6 +169,12 @@ describe("targeted workflow: a GitHub App", () => {
     assert.ok(indexOf("app-alerts") < indexOf("agent"));
   });
 
+  it("carries on if that token can't be made, so a dead key is reported as a failed run", () => {
+    assert.equal(findStep("app-alerts")["continue-on-error"], true);
+    assert.equal(condition(findStep("agent")), "");
+    assert.equal(condition(findStep("report")), "");
+  });
+
   it("makes the token that can write only for the pull request step, and only when that step will run", () => {
     const step = findStep("app-pr");
     const permissions = Object.entries(step.with ?? {}).filter(([key]) => key.startsWith("permission-")).sort();
@@ -182,8 +202,13 @@ describe("targeted workflow: which credentials were passed", { skip: !have("bash
   const APP = { HAS_APP_CLIENT_ID: true, HAS_APP_PRIVATE_KEY: true };
   const TOKENS = { HAS_ALERTS_TOKEN: true, HAS_PR_TOKEN: true };
 
-  it("takes step env as booleans, so no step sees a value just to check it", () => {
-    for (const value of Object.values(findStep("credentials").env ?? {})) assert.match(String(value), /!= ''/);
+  it("asks each credential only whether it was passed, and under its own name", () => {
+    assert.deepEqual(findStep("credentials").env, {
+      HAS_APP_CLIENT_ID: "${{ inputs.app-client-id != '' }}",
+      HAS_APP_PRIVATE_KEY: "${{ secrets.app-private-key != '' }}",
+      HAS_ALERTS_TOKEN: "${{ secrets.alerts-token != '' }}",
+      HAS_PR_TOKEN: "${{ secrets.pr-token != '' }}",
+    });
   });
 
   it("accepts an App", () => assert.equal(check(APP).status, 0));
