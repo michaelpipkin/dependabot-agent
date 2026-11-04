@@ -112,7 +112,7 @@ export function matchesLimit(name: string, pattern: string): boolean {
 }
 
 /** The package an override key names, whatever follows the version `@`. */
-function overrideKeyName(key: string): string {
+export function overrideKeyName(key: string): string {
   // Not baseNameOfOverrideKey: it deliberately leaves shapes the agent never
   // writes ("foo@<2.0.0") whole, and those still name foo for a hand-written pin.
   const at = key.lastIndexOf("@");
@@ -425,7 +425,7 @@ const isGitSpec = (spec: string): boolean => GIT_SPECS.some((git) => git.test(sp
  * `npm:name@range` (a bare `npm:name` means `*`), or a git spec's `#semver:`
  * range. Null when it declares none: a tag, a path, a URL, a plain git spec.
  */
-function declaredRange(spec: string): string | null {
+export function declaredRange(spec: string): string | null {
   let declared = spec.trim();
   if (isGitSpec(declared)) {
     const attrs = declared.split("#")[1]?.split("::") ?? [];
@@ -450,7 +450,7 @@ function declaredRange(spec: string): string | null {
  * would stop on it, and reporting a block is better than failing the whole run.
  * A flat key's `*` matches everything, ahead of all of those.
  */
-function selectorCatches(spec: string, range: string): boolean {
+export function selectorCatches(spec: string, range: string): boolean {
   if (range === "*") return true;
   const declared = declaredRange(spec);
   if (declared !== null) return rangesIntersect(declared, range);
