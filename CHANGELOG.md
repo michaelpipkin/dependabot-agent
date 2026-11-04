@@ -23,7 +23,7 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 
 ### Status
 
-Targeted mode is new. It has been tested on npm 11.16 on Windows; Linux and npm 10 are still to be confirmed. It has not yet been confirmed on a live repository that Dependabot closes the alerts after the overrides it writes. Run it with `--dry-run` on a real repository first.
+Targeted mode is new. It has been tested on npm 11.16 on Windows; Linux is still to be confirmed. npm 10 can fail safely on some workspace trees, so the reusable workflow defaults to Node 24, which ships npm 11, and the log and the report say which npm ran. It has not yet been confirmed on a live repository that Dependabot closes the alerts after the overrides it writes. Run it with `--dry-run` on a real repository first.
 
 ## [1.2.0]
 

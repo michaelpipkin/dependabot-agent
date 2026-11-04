@@ -17,9 +17,9 @@ on:
         type: string
         required: true
       node-version:
-        description: "Node.js version to run the agent with."
+        description: "Node.js version to run the agent with. Its bundled npm is the npm that resolves the lockfile: Node 24 ships npm 11, which targeted mode is tested on."
         type: string
-        default: "22"
+        default: "24"
       dry-run:
         description: "Print the plan to the job summary. Writes nothing: no pull request, no issue."
         type: boolean
@@ -62,7 +62,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.alerts-token }}
           AGENT_VERSION: ${{ inputs.agent-version }}
-          AGENT_DRY_RUN: ${{ inputs.dry-run }}
+          # From the input either way, so a repository's "dryRun": true can't quietly stop a real run from opening its PR.
+          DRY_RUN: ${{ inputs.dry-run }}
           AGENT_REPOSITORY: ${{ github.repository }}
           # Outside the checkout, so create-pull-request can't commit the report.
           AGENT_REPORT_DIR: ${{ runner.temp }}/agent-report
@@ -70,12 +71,7 @@ jobs:
           NPM_CONFIG_IGNORE_SCRIPTS: "true"
           # A caller's exitCode setting would make a run with changes exit 2, which would read as failed.
           EXIT_CODE: "false"
-        run: |
-          args=(--update-strategy targeted --repo "$AGENT_REPOSITORY" --report "$AGENT_REPORT_DIR")
-          if [ "$AGENT_DRY_RUN" = "true" ]; then
-            args+=(--dry-run)
-          fi
-          npx -y "dependabot-agent@${AGENT_VERSION}" "${args[@]}"
+        run: npx -y "dependabot-agent@${AGENT_VERSION}" --update-strategy targeted --repo "$AGENT_REPOSITORY" --report "$AGENT_REPORT_DIR"
 
       # No report.json means the run never got as far as writing one (a crash at
       # startup, or npx couldn't fetch the package). That counts as failed.
@@ -143,7 +139,7 @@ jobs:
       # a stale PR from an earlier run instead of leaving it open.
       - name: Open or update the pull request
         if: ${{ steps.report.outputs.outcome != 'failed' && steps.report.outputs.restore-error != 'true' && !inputs.dry-run }}
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.pr-token }}
           base: ${{ inputs.base-branch }}
@@ -186,11 +182,14 @@ jobs:
               fi
               ;;
             clean | changes)
-              # With a PR open and some copies still blocked, the PR's report lists them. Leave the issue alone.
-              if [ "$OUTCOME" = "clean" ] || [ "$BLOCKED_COUNT" = "0" ]; then
-                if [ -n "$open" ]; then
-                  gh issue close "$open" --comment "Nothing is blocked as of [this run]($run_url)."
-                fi
+              if [ -z "$open" ]; then
+                :
+              elif [ "$OUTCOME" = "clean" ] || [ "$BLOCKED_COUNT" = "0" ]; then
+                gh issue close "$open" --comment "Nothing is blocked as of [this run]($run_url)."
+              else
+                # With a PR open and some copies still blocked, the PR's report lists them, so no
+                # issue is created. One already open is brought up to date: it may say a run failed.
+                gh issue edit "$open" --title "$title" --body-file "$AGENT_REPORT_DIR/report.md"
               fi
               ;;
           esac

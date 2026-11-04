@@ -61,7 +61,7 @@ describe("targeted workflow: shape", () => {
     const { inputs } = wf.on.workflow_call;
     assert.equal(inputs["base-branch"].required, true);
     assert.equal(inputs["agent-version"].required, true);
-    assert.equal(inputs["node-version"].default, "22");
+    assert.equal(inputs["node-version"].default, "24");
     assert.equal(inputs["dry-run"].type, "boolean");
     assert.equal(inputs["dry-run"].default, false);
   });
@@ -89,6 +89,11 @@ describe("targeted workflow: tokens", () => {
     assert.equal(step.with?.token, "${{ secrets.pr-token }}");
     assert.equal(step.with?.["body-path"]?.endsWith("report.md"), true);
     assert.ok(!text.includes("secrets.GITHUB_TOKEN"));
+  });
+
+  it("pins the third-party action to a full commit, with the version in a comment", () => {
+    assert.match(findStep("peter-evans/create-pull-request").uses ?? "", /^peter-evans\/create-pull-request@[0-9a-f]{40}$/);
+    assert.match(text, /uses: peter-evans\/create-pull-request@[0-9a-f]{40} # v\d+\.\d+\.\d+\n/);
   });
 
   it("gives the alerts token to the agent step and nowhere else", () => {
@@ -170,7 +175,12 @@ describe("targeted workflow: the agent step", () => {
     assert.match(run, /dependabot-agent@\$\{?AGENT_VERSION/);
     assert.match(run, /--update-strategy targeted/);
     assert.match(run, /--report "\$AGENT_REPORT_DIR"/);
-    assert.match(run, /--dry-run/);
+  });
+
+  it("takes dry-run from the input alone, so a repository's \"dryRun\": true can't turn a real run into one that opens no PR", () => {
+    const step = findStep("agent");
+    assert.equal(step.env?.DRY_RUN, "${{ inputs.dry-run }}");
+    assert.doesNotMatch(step.run ?? "", /--dry-run/);
   });
 
   it("runs no install scripts, and ignores a caller's exitCode setting", () => {
@@ -424,9 +434,14 @@ describe("targeted workflow: the blocked issue", { skip: !canRun && "needs bash 
     assert.ok(act("changes", "0", "17").gh.some((line) => line.startsWith("issue close 17")));
   });
 
-  it("leaves the issue alone when a PR was opened and some copies are still blocked", () => {
+  it("updates an open issue when a PR was opened and some copies are still blocked, so it can't keep saying the last run failed", () => {
     const got = act("changes", "2", "17");
-    assert.ok(!got.gh.some((line) => /^issue (close|edit|create)/.test(line)));
+    assert.ok(got.gh.some((line) => line.startsWith("issue edit 17") && line.includes("report.md")), got.gh.join("\n"));
+    assert.ok(!got.gh.some((line) => /^issue (close|create)/.test(line)));
+  });
+
+  it("creates no issue when a PR was opened and some copies are still blocked: the PR lists them", () => {
+    assert.ok(!act("changes", "2", "").gh.some((line) => /^issue (close|edit|create)/.test(line)));
   });
 
   it("does nothing when clean and no issue is open", () => {

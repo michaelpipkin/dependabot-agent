@@ -53,6 +53,16 @@ describe("resolveConfig — reportDir", () => {
   });
 });
 
+describe("resolveConfig — what the workflow's DRY_RUN does", () => {
+  it("false beats a repository's \"dryRun\": true", () => {
+    assert.equal(resolveConfig({}, baseEnv(workspace({ dryRun: true }), { DRY_RUN: "false" })).dryRun, false);
+  });
+
+  it("true beats a repository's \"dryRun\": false", () => {
+    assert.equal(resolveConfig({}, baseEnv(workspace({ dryRun: false }), { DRY_RUN: "true" })).dryRun, true);
+  });
+});
+
 describe("resolveConfig — targeted strategy", () => {
   it("accepts UPDATE_STRATEGY=targeted", () => {
     const cfg = resolveConfig({}, baseEnv(workspace(), { UPDATE_STRATEGY: "targeted" }));

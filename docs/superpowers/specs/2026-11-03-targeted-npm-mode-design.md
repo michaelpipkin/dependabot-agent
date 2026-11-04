@@ -1,6 +1,6 @@
 # Targeted npm mode: design
 
-**Status:** awaiting approval. **Date:** 2026-11-03. **Base version:** 1.2.0.
+**Status:** approved. **Date:** 2026-11-03. **Base version:** 1.2.0.
 
 ## Why
 
@@ -75,6 +75,7 @@ The unit of decision is each **copy** of the package in the lockfile, not the al
 
 | Condition | Outcome |
 |---|---|
+| Alert's manifest isn't covered by a lockfile this run reads (see "More than one lockfile") | Blocked: names the manifest |
 | Package isn't in the lockfile | Not found: nothing to do, listed in the report |
 | Package is in the lockfile, but no copy is in the alert's vulnerable range | Awaiting close: nothing to do, any override is kept, listed in the report |
 
@@ -85,6 +86,7 @@ Then, for each copy inside the vulnerable range, in this order:
 | No `first_patched_version` | Blocked: no fix published |
 | Target version not published on npm, or is a pre-release | Blocked: target unavailable |
 | Target outside a matching limit | Blocked: names the limit |
+| Copy is bundled inside another package (`inBundle` in the lockfile) | Blocked: fixing it needs an upgrade of the package that bundles it |
 | Copy is a direct dependency with an exact pin | Blocked: names the pin and manifest |
 | Copy is a direct dependency with a spec that can't be safely rewritten (compound range, tag, git) | Blocked: names the spec |
 | Target crosses a major from this copy | Blocked: major version crossing |
@@ -96,6 +98,7 @@ Details:
 
 - **A registry failure isn't a blocked alert:** only a 404 reads as target unavailable. Any other failure reading the published versions fails the run, since a `blocked-only` result would close an open PR over an outage.
 - **Partial fixes:** fixable copies are fixed even if another copy of the same package is blocked. The report shows that alert as partly fixed, and it stays open until every copy is resolved. *(Builder's call.)*
+- **Bundled copies are out of reach:** a bundled copy comes out of its parent's tarball, so neither a bump nor an override moves it. Its parents' edges, and edges landing on it, aren't counted as something an override would catch, so a hoisted copy beside it is still fixed. Verification doesn't treat a bundled package's edges as problems. A fix landing past a range a bundled package declares is still flagged in the report.
 - **Overrides must not catch copies that stay put:** a selector's range must exclude every copy that's blocked or safe. If it can't, for example because a pinned copy and a transitive copy share one version, the transitive copy is blocked too, naming the reason. No override is ever written that could move a pinned copy. *(Builder's call.)*
 - **Limits on a shared release line:** if several alerts hit one line and the highest target breaks a limit, use the highest target that doesn't. The alert needing the higher one is reported as blocked, and the lower one is still fixed. *(Builder's call.)*
 - **Major crossing follows the tool's existing caret rules.** Under `0.x`, the minor is the breaking position, as `escapesCompatibleRange` already treats it. So `0.5.0` → `0.7.0` counts as crossing.
@@ -136,7 +139,7 @@ Snapshot `package-lock.json` and every manifest first. Then:
 3. **Resolve:** `npm install --package-lock-only --ignore-scripts`. This is enough for anything reachable from the root `package.json`.
 4. **For copies that didn't move,** which means they're reachable only through workspace members, npm needs the temporary-root step:
    - Using the lockfile, find each member's direct dependencies that lead to the target. Exclude the alerted package itself.
-   - Add them, with their declared ranges, to the root `devDependencies`. Root entries that already exist win.
+   - Add them, with their declared ranges, to the root `devDependencies`. Root entries that already exist win. Where an override matches one, its value is the spec instead, because npm refuses (`EOVERRIDE`) a root dependency that an override contradicts, and accepts one that says the same, on an exact or a range value.
    - Resolve.
    - Restore the root `devDependencies` exactly, and resolve again.
 5. **Verify** (see below). On any failure, restore every snapshot.
@@ -157,7 +160,7 @@ Apply these checks to the result. `npm ci` alone is not evidence: it passed on t
 6. **Manifests:** only the expected `package.json` changes exist. No temporary `devDependencies` remain.
 7. **Stable:** another `npm install --package-lock-only --ignore-scripts` changes nothing.
 
-Verification failure is all-or-nothing for a first version: restore the snapshots, exit 1, and report which check failed and on which package. It never produces a partial PR.
+Verification failure is all-or-nothing for a first version: restore the snapshots, exit 1, and report which check failed and on which package. It never produces a partial PR. An npm command that fails (`EOVERRIDE`, `ERESOLVE`, `E404`) goes the same way, reported as check `run`, not as one of these.
 
 ### Existing overrides
 
@@ -177,18 +180,20 @@ The range-selector rules live in targeted-only helpers (`src/targeted/override-k
 
 ### More than one lockfile
 
-Isolated sub-packages with their own lockfile, such as a `functions/` folder, are in scope, because skipping their alerts silently is an anti-goal. The existing grouping in `run()` still applies: alerts on workspace members fold into the root, and each isolated directory is its own group with its own root `package.json` and lockfile. *(Builder's calls:)*
+Isolated sub-packages with their own lockfile, such as a `functions/` folder, are in scope, because skipping their alerts silently is an anti-goal. An alert's manifest decides which lockfile answers for it, the nearest at or above the manifest: alerts on workspace members fold into the root, and each isolated directory is its own group with its own root `package.json` and lockfile. An alert whose manifest directory has its own lockfile but which discovery prunes (a dot-directory, `dist`, `build` and so on) becomes its own group too, with the pnpm check. It is never folded into the root, which would report nothing to change, or fix a copy the alert isn't about, while the real alert stayed open. With `discoverPackages` off, or if the directory no longer exists, the alert is blocked, naming the manifest. *(Builder's calls:)*
 
 - All groups share one report, one PR, and one `outcome`.
 - All-or-nothing covers the whole run: a failure in any group restores every snapshot.
 - If any group resolves to pnpm, the run stops at startup with a clear error.
+- An isolated directory with no alerts and a `lockfileVersion` 1 lockfile is warned about and skipped. With an alert on it, the run stops.
+- A copy reported from an isolated directory carries that directory in its path and detail, so a pin in `functions/package.json` can't read as the root's.
 
 ### The report
 
 With `--report <dir>`, the tool writes:
 
-- **`report.md`:** the PR or issue body. Sections are "Fixed", "Partly fixed", "Applied past a declared range — review these", "Blocked", "Awaiting close or not found", and "Other changes". Fixed entries give the alert number and link, severity, package, version from and to, and whether it was a range bump or an override, along with the existing production or dev classification. "Other changes" lists packages moved only because a fixed package needs them.
-- **`report.json`:** the same data plus `outcome`, which the workflow reads to decide what to do:
+- **`report.md`:** the PR or issue body. Sections are "Fixed", "Partly fixed", "Applied past a declared range — review these", "Blocked", "Awaiting close or not found", and "Other changes". Fixed entries give the alert number and link, severity, package, version from and to, and whether it was a range bump or an override, along with the existing production or dev classification. Every alert's line names its manifest, and the report says which npm ran. "Other changes" lists entries that also changed because a fixed package needs them, or because npm relocated a fixed copy to another path.
+- **`report.json`:** the same data plus `outcome`, which the workflow reads to decide what to do. A config error or an undetected package manager stops the tool before a report can be written, which the workflow treats as `failed`:
   - `failed`: the run failed.
   - `changes`: at least one file changed.
   - `blocked-only`: nothing changed, and at least one copy is blocked.
@@ -198,11 +203,11 @@ A dry run produces the same report, labelled as a plan, with no writes.
 
 ### The workflow
 
-Provide a reusable workflow (`workflow_call`) in this repo. Consumers call it on their own `schedule` and `workflow_dispatch`, passing the base branch and the PAT.
+Provide a reusable workflow (`workflow_call`) in this repo. Consumers call it on their own `schedule` and `workflow_dispatch`, passing the base branch and the PAT. It defaults to Node 24, which ships npm 11. Its `dry-run` input alone decides a dry run: a repo's `"dryRun"` config can't turn a real run into one that opens no PR.
 
 | `outcome` | Action |
 |---|---|
-| `changes` | Create or update a PR from a fixed branch, using `peter-evans/create-pull-request` with `body-path: report.md`. Close the blocked issue if nothing is blocked |
+| `changes` | Create or update a PR from a fixed branch, using `peter-evans/create-pull-request` with `body-path: report.md`. Close the blocked issue if nothing is blocked. If some copies are blocked, update an open issue with `report.md`, so it can't keep saying an earlier run failed, but don't create one |
 | `blocked-only` | Create or update one labelled issue with `report.md`. No PR |
 | `clean` | Job summary only. Close the issue if open |
 | `failed` | Fail the job and update the issue with the failure. A missing `report.json` counts as `failed`: the job summary and issue say that no report was produced and link to the run |
@@ -242,7 +247,7 @@ The Angular build packages pin some dependencies exactly: `@angular/build` decla
 The temporary-root technique relies on behaviour npm doesn't document. These must be tested, and a release should not go out until the first is confirmed:
 
 1. **Real alerts close.** On a live fixture repo, Dependabot closes alerts after a selector override, including one applied by the temporary-root step. The agent's earlier fixtures confirmed this for `name@major` keys only.
-2. **It holds on npm 10.** Only plain overrides and direct bumps have been tested there. Find the supported minimum and state it.
+2. **It holds on npm 10.** It doesn't always: on npm 10.9.9 an Angular 19 tree reachable only through a workspace member fails verification on a `nanoid` alert (`fixed on node_modules/nanoid: nanoid is at 3.3.8`), whichever npm wrote the lockfile, where npm 11.16 passes. The failure is safe: every file is restored. So the workflow defaults to Node 24 (npm 11), and the log and report print `npm --version`.
 3. **A later `npm install` with `node_modules` present keeps the versions.** Only lockfile-only reruns have been tested.
 4. **A member's exact pin overlapping a selector.** Not tested. The sorting rules should prevent this from being written, and verification check 3 is the backstop. A test should confirm the run stops rather than moving it.
 5. **Replacing an agent-written floating override with the new key shape.** Not tested, and neither is a selector beside an existing override for the same package.
