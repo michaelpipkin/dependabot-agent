@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { DependabotAlert } from "./types.js";
 import { exitWithError, log } from "./util.js";
 
@@ -5,6 +6,46 @@ export interface GitHubRepoConfig {
   owner: string;
   name: string;
   token: string;
+}
+
+// ---------------------------------------------------------------------------
+// Read npm Dependabot alerts that something else fetched
+// ---------------------------------------------------------------------------
+
+function isAlert(value: unknown): boolean {
+  const alert = value as Partial<DependabotAlert> | null;
+  return (
+    typeof alert?.number === "number" &&
+    typeof alert.state === "string" &&
+    typeof alert.dependency?.package?.ecosystem === "string" &&
+    typeof alert.dependency.manifest_path === "string" &&
+    typeof alert.security_vulnerability?.package?.name === "string"
+  );
+}
+
+/**
+ * The alerts in a file holding what GitHub's API returned, so the run needs no token.
+ * Anything else is refused: taken for an empty list, it would read as nothing to fix.
+ */
+export function readDependabotAlertsFile(file: string): DependabotAlert[] {
+  log(`📄 Reading Dependabot alerts from ${file}...`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf-8"));
+  } catch (e) {
+    exitWithError(`Could not read the alerts file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    exitWithError(`The alerts file ${file} is not a list of alerts, as GitHub's API returns them.`);
+  }
+  const bad = parsed.findIndex((entry) => !isAlert(entry));
+  if (bad !== -1) {
+    exitWithError(`The alerts file ${file} isn't what GitHub's API returns: entry ${bad} isn't a Dependabot alert.`);
+  }
+  const alerts = (parsed as DependabotAlert[]).filter((a) => a.dependency.package.ecosystem === "npm");
+  const openCount = alerts.filter((a) => a.state === "open").length;
+  log(`   Found ${openCount} open npm Dependabot alert(s) (${alerts.length} across all states).`);
+  return alerts;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { ResolvedConfig } from "../config.js";
 import { discoverIsolatedManifestDirs, hasOwnLockfile } from "../discover.js";
-import { fetchDependabotAlerts } from "../github.js";
+import { fetchDependabotAlerts, readDependabotAlertsFile } from "../github.js";
 import { readDirectDependencies } from "../manifest.js";
 import type { DirectDep } from "../manifest.js";
 import { readNpmOverrides } from "../override-source.js";
@@ -42,7 +42,8 @@ export interface TargetedDeps {
 }
 
 const defaultDeps: TargetedDeps = {
-  fetchAlerts: (cfg) => fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
+  fetchAlerts: async (cfg) =>
+    cfg.alertsFile ? readDependabotAlertsFile(cfg.alertsFile) : fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
   fetchPublished: readPublishedVersions,
   fetchDependents: fetchDependentRanges,
   npmVersion,

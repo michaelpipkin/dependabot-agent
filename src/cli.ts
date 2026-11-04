@@ -12,6 +12,7 @@ export interface CliArgs {
   workspaceRoot?: string;
   updateStrategy?: UpdateStrategy;
   reportDir?: string;
+  alertsFile?: string;
   allowPrerelease?: boolean;
   dryRun?: boolean;
   skipUpdate?: boolean;
@@ -25,7 +26,8 @@ Usage:
   dependabot-agent [options]
 
 Options:
-  --token <token>                  GitHub token (or env GITHUB_TOKEN). Required.
+  --token <token>                  GitHub token (or env GITHUB_TOKEN). Required, unless
+                                   --alerts-file supplies the alerts.
   --repo <owner/repo>              Target repository (or env GITHUB_REPO). Required.
   --package-manager <pnpm|npm>     Override auto-detection (or env PACKAGE_MANAGER).
   --workspace-root <path>          Project root (or env WORKSPACE_ROOT). Default: cwd.
@@ -36,6 +38,9 @@ Options:
                                    change instead of updating everything.
   --report <dir>                   Write a report of the run to this directory
                                    (or env REPORT_DIR). Targeted strategy only.
+  --alerts-file <path>             Read alerts from this JSON file instead of GitHub, with
+                                   no token (or env ALERTS_FILE). It holds what GitHub's
+                                   alerts API returns, across all states. Targeted only.
   --allow-prerelease               Let the update pass settle on a pre-release version
                                    (or ALLOW_PRERELEASE=true). Off by default: a package
                                    whose "latest" dist-tag points at an rc is otherwise
@@ -112,6 +117,9 @@ export function parseArgs(argv: string[], version: string): CliArgs {
         break;
       case "--report":
         args.reportDir = takeValue();
+        break;
+      case "--alerts-file":
+        args.alertsFile = takeValue();
         break;
       case "--config":
         args.config = takeValue();

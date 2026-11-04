@@ -23,6 +23,7 @@ export interface ResolvedConfig {
   updateWorkspaceMembers: boolean; // let the update pass rewrite workspace members' manifests
   limits: Record<string, string>; // targeted mode: package-name glob → semver range it must stay within
   reportDir?: string; // write a run report here (flag/env only)
+  alertsFile?: string; // targeted mode: read alerts from this file, with no token (flag/env only)
 }
 
 interface ConfigFile {
@@ -174,6 +175,11 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   if (reportDir && updateStrategy !== "targeted") {
     warn(`"--report" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
   }
+  const requestedAlertsFile = args.alertsFile || env.ALERTS_FILE || undefined;
+  if (requestedAlertsFile && updateStrategy !== "targeted") {
+    warn(`"--alerts-file" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
+  }
+  const alertsFile = updateStrategy === "targeted" ? requestedAlertsFile : undefined;
   if (updateStrategy === "targeted" && skipUpdate) {
     warn(`"skipUpdate" has no effect with --update-strategy targeted (it never runs the bulk update).`);
   }
@@ -182,7 +188,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   }
 
   // Validate required fields with friendly, actionable messages.
-  if (!token) {
+  if (!token && !alertsFile) {
     exitWithError("GitHub token is required. Pass --token or set GITHUB_TOKEN.");
   }
   if (!repo.includes("/")) {
@@ -208,6 +214,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     updateWorkspaceMembers,
     limits,
     reportDir,
+    alertsFile,
   };
 }
 
