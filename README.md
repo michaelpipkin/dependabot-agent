@@ -693,7 +693,7 @@ The agent prints the right command for your package manager after it writes the 
 > least-privilege still applies everywhere except the one operation that structurally requires one.
 >
 > A GitHub App works too, but its tokens are short-lived, so create one in a step instead of storing
-> it. Its App needs "Dependabot alerts: read":
+> it. The App needs "Dependabot alerts: read":
 > ```yaml
 > - uses: actions/create-github-app-token@v3
 >   id: app
