@@ -153,7 +153,8 @@ export function reachableFrom(lock: LockIndex, startPaths: string[]): Set<string
 /**
  * For each workspace member, the direct dependencies (name -> declared range) through which a copy
  * of one of `targetNames` is reachable. A target declared directly by a member is not its own owner.
- * When members declare different ranges for the same owner, the first one wins.
+ * An aliased copy doesn't count, since an override can't reach it. When members declare different
+ * ranges for the same owner, the first one wins.
  */
 export function memberOwnersOf(lock: LockIndex, memberPaths: string[], targetNames: string[]): Record<string, string> {
   const targets = new Set(targetNames);
@@ -164,7 +165,11 @@ export function memberOwnersOf(lock: LockIndex, memberPaths: string[], targetNam
     for (const edge of edgesFrom(lock, member)) {
       if (targets.has(edge.name) || !edge.resolved || edge.name in owners) continue;
       const reached = reachableFrom(lock, [edge.resolved.path]);
-      if ([...reached].some((p) => targets.has(lock.entries.get(p)!.name))) owners[edge.name] = edge.spec;
+      const leadsToTarget = [...reached].some((p) => {
+        const entry = lock.entries.get(p)!;
+        return targets.has(entry.name) && entry.installedAs === entry.name;
+      });
+      if (leadsToTarget) owners[edge.name] = edge.spec;
     }
   }
   return owners;

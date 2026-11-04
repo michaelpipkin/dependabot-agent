@@ -221,6 +221,46 @@ describe("lockfile index", () => {
     assert.deepEqual(memberOwnersOf(lock, ["packages/a", "packages/b"], ["minimatch"]), { glob: "^7.1.0" });
   });
 
+  it("memberOwnersOf: a member's alias of the target isn't an owner, as overrides can't reach it", () => {
+    const lock = makeLock({
+      "": {},
+      "packages/a": { dependencies: { foo: "npm:qs@6.7.0" } },
+      "node_modules/foo": { name: "qs", version: "6.7.0" },
+    });
+    assert.deepEqual(memberOwnersOf(lock, ["packages/a"], ["qs"]), {});
+  });
+
+  it("memberOwnersOf: a dep whose only path to the target is an alias isn't an owner", () => {
+    const lock = makeLock({
+      "": {},
+      "packages/a": { dependencies: { x: "^1.0.0" } },
+      "node_modules/x": { version: "1.0.0", dependencies: { foo: "npm:qs@6.7.0" } },
+      "node_modules/foo": { name: "qs", version: "6.7.0" },
+    });
+    assert.deepEqual(memberOwnersOf(lock, ["packages/a"], ["qs"]), {});
+  });
+
+  it("memberOwnersOf: a dep reaching the target by its own name as well still is", () => {
+    const lock = makeLock({
+      "": {},
+      "packages/a": { dependencies: { x: "^1.0.0" } },
+      "node_modules/x": { version: "1.0.0", dependencies: { foo: "npm:qs@6.7.0", qs: "^6.0.0" } },
+      "node_modules/foo": { name: "qs", version: "6.7.0" },
+      "node_modules/qs": { version: "6.7.0" },
+    });
+    assert.deepEqual(memberOwnersOf(lock, ["packages/a"], ["qs"]), { x: "^1.0.0" });
+  });
+
+  it("memberOwnersOf: a package installed under the target's name that isn't it doesn't count", () => {
+    const lock = makeLock({
+      "": {},
+      "packages/a": { dependencies: { x: "^1.0.0" } },
+      "node_modules/x": { version: "1.0.0", dependencies: { qs: "npm:other@1.0.0" } },
+      "node_modules/qs": { name: "other", version: "1.0.0" },
+    });
+    assert.deepEqual(memberOwnersOf(lock, ["packages/a"], ["qs"]), {});
+  });
+
   describe("readLockfile", () => {
     function withLockfile(contents: object | null, run: (dir: string) => void): void {
       const dir = mkdtempSync(join(tmpdir(), "targeted-lock-"));

@@ -448,8 +448,10 @@ function declaredRange(spec: string): string | null {
  *   - anything else (tag, file, directory, remote): always matches.
  * A spec npm can't parse at all (`workspace:*`) lands in that last group: npm
  * would stop on it, and reporting a block is better than failing the whole run.
+ * A flat key's `*` matches everything, ahead of all of those.
  */
 function selectorCatches(spec: string, range: string): boolean {
+  if (range === "*") return true;
   const declared = declaredRange(spec);
   if (declared !== null) return rangesIntersect(declared, range);
   return !isGitSpec(spec);
@@ -486,17 +488,54 @@ function heldByAwaitingClose(ctx: PackageContext, key: AgentKey, raised: Set<Dep
   });
 }
 
+/** What the dependents of `copy` will declare once any bump has run. */
+function specsAfterFix(ctx: PackageContext, copy: LockEntry, target: string): string[] {
+  const bumped = declarationsOf(ctx, copy).map((d) => `${parseSimpleSpec(d.dep.spec)!.operator}${target}`);
+  return [...edgesStayingPut(ctx, copy).map((edge) => edge.spec), ...bumped];
+}
+
 /** Why the override can't move `copy`, or null if every dependent holding it would get the new key. */
-function unreachableReason(ctx: PackageContext, copy: LockEntry, range: string, others: AgentKey[]): string | null {
+function unreachableReason(
+  ctx: PackageContext,
+  copy: LockEntry,
+  target: string,
+  range: string,
+  others: AgentKey[],
+): string | null {
   const edges = edgesStayingPut(ctx, copy);
   if (edges.length === 0 && declarationsOf(ctx, copy).length === 0) {
     return `Nothing declares ${ctx.name}@${copy.version} at ${copy.path}, so an override can't reach it.`;
   }
   for (const edge of edges) {
-    const dependent = `${dependentName(ctx, edge)} declares ${ctx.name} "${edge.spec}"`;
-    if (!selectorCatches(edge.spec, range)) return `${dependent}, which the override "${range}" wouldn't match.`;
-    const other = others.find((k) => selectorCatches(edge.spec, k.selector));
-    if (other) return `${dependent}, which the existing override "${other.key}" also matches; npm applies only one.`;
+    if (!selectorCatches(edge.spec, range)) {
+      return `${dependentName(ctx, edge)} declares ${ctx.name} "${edge.spec}", which the override "${range}" wouldn't match.`;
+    }
+  }
+  for (const spec of specsAfterFix(ctx, copy, target)) {
+    const other = others.find((k) => selectorCatches(spec, k.selector));
+    if (other) return `A dependent declaring "${spec}" also matches the existing override "${other.key}"; npm applies only one.`;
+  }
+  return null;
+}
+
+/**
+ * A dependent that a key being removed is holding past what it declares, and that
+ * the new key won't take over: without the old key it would drop back. A dependent
+ * whose own range admits what it resolved to isn't held, so removal moves nothing.
+ */
+function findDroppedHold(ctx: PackageContext, removing: AgentKey[], range: string, fixing: LockEntry[]): string | null {
+  const moving = new Set(fixing.map((c) => c.path));
+  for (const edge of ctx.edges) {
+    if (!edge.resolved || moving.has(edge.resolved.path) || selectorCatches(edge.spec, range)) continue;
+    const held = removing.find((k) => selectorCatches(edge.spec, k.selector));
+    if (!held) continue;
+    const declared = declaredRange(edge.spec);
+    const version = edge.resolved.version;
+    if (declared !== null && version && semver.satisfies(version, declared, LOOSE)) continue;
+    return (
+      `The existing override "${held.key}" has to be replaced for the fix to apply, but it also holds ` +
+      `${dependentName(ctx, edge)}'s ${ctx.name} "${edge.spec}" at ${version}, which "${range}" wouldn't cover.`
+    );
   }
   return null;
 }
@@ -551,16 +590,19 @@ function solveLine(ctx: PackageContext, copies: LockEntry[]): SolvedLine {
   const fixing = candidates.filter((copy) => compare(copy.version!, target) < 0);
   if (fixing.length === 0) return emptyLine();
 
-  // npm takes the first key matching a dependent's declared spec, so keys whose
-  // version ranges don't overlap can still compete. Every key of ours on the line
-  // is replaced, and the new one starts low enough to catch what they caught. Keys
-  // that stay can't be left matching a dependent the new key has to reach.
-  const span = lineSpan(target);
+  // npm applies the first key matching a dependent's declared spec, so an existing
+  // key competes with the new one exactly when it matches a dependent of a moving
+  // copy, whatever its version range. Those are replaced, and the new key starts low
+  // enough to catch what they caught. Every other key stays: it can't get in the new
+  // key's way, and it may be holding an earlier fix. Only an awaiting-close alert's
+  // key can stay and still compete, which unreachableReason blocks.
+  const specs = fixing.flatMap((copy) => specsAfterFix(ctx, copy, target));
   const replaced = ctx.agentKeys.filter(
-    (k) => rangesIntersect(k.selector, span) && !heldByAwaitingClose(ctx, k, raised),
+    (k) => specs.some((spec) => selectorCatches(spec, k.selector)) && !heldByAwaitingClose(ctx, k, raised),
   );
   const range = selectorRange(carriedLowerBound(included, replaced), target);
   const key = `${ctx.name}@${range}`;
+  const removing = replaced.filter((k) => k.key !== key);
   const others = ctx.agentKeys.filter((k) => !replaced.includes(k) && k.key !== key);
   const line: SolvedLine = { ...emptyLine(), fixing, target, included, raised };
 
@@ -571,18 +613,18 @@ function solveLine(ctx: PackageContext, copies: LockEntry[]): SolvedLine {
       declarationsOf(ctx, copy).length === 0 ||
       replaced.length > 0 ||
       edgesRejecting(ctx, copy, target).length > 0 ||
-      edgesStayingPut(ctx, copy).some((edge) => others.some((k) => selectorCatches(edge.spec, k.selector))),
+      specsAfterFix(ctx, copy, target).some((spec) => others.some((k) => selectorCatches(spec, k.selector))),
   );
   if (needSelector.length === 0) return line;
 
   const staying = new Map<string, string>();
   for (const copy of needSelector) {
-    const reason = unreachableReason(ctx, copy, range, others);
+    const reason = unreachableReason(ctx, copy, target, range, others);
     if (reason) staying.set(copy.path, reason);
   }
   if (staying.size === 0) {
-    const conflict = findConflict(ctx, range, fixing);
-    if (!conflict) return { ...line, key, replaced: replaced.map((k) => k.key).filter((k) => k !== key) };
+    const conflict = findConflict(ctx, range, fixing) ?? findDroppedHold(ctx, removing, range, fixing);
+    if (!conflict) return { ...line, key, replaced: removing.map((k) => k.key) };
     for (const copy of needSelector) staying.set(copy.path, conflict);
   }
 
@@ -695,11 +737,7 @@ function recordBumps(ctx: PackageContext, line: SolvedLine, plan: Plan): void {
   }
 }
 
-/**
- * Write each line's key and drop the keys it replaces. A key on another line is
- * never among them: it's still holding that line's earlier fix, and only a `fixed`
- * alert may free an override.
- */
+/** Write each line's key and drop the keys it replaces. */
 function recordOverrides(ctx: PackageContext, lines: SolvedLine[], plan: Plan): void {
   const removed = new Set<string>();
   for (const { key, target, replaced } of lines) {
