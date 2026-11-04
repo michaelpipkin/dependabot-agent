@@ -66,6 +66,24 @@ function safeAtOrAbove(version: string | undefined, target: string): boolean {
   }
 }
 
+/** A path added by the run that carries the very name and version of a copy the plan meant to move. */
+function reappearedCopy(before: LockIndex, after: LockIndex, old: LockEntry): LockEntry | undefined {
+  return [...after.entries.values()].find(
+    (e) => !before.entries.has(e.path) && !e.link && e.name === old.name && e.version === old.version,
+  );
+}
+
+/** Whether the entry, as it is now, still declares `name`: a new version of a dependent may have dropped it. */
+function stillDeclares(entry: LockEntry | undefined, name: string): boolean {
+  return (
+    entry !== undefined &&
+    (name in entry.dependencies ||
+      name in entry.optionalDependencies ||
+      name in entry.peerDependencies ||
+      name in entry.devDependencies)
+  );
+}
+
 /**
  * Every planned copy is fixed. A copy still at its path must be at the target.
  * A copy gone from its path (hoisting can relocate or merge it) is judged by the
@@ -89,8 +107,18 @@ function checkFixed({ before, after, plan }: VerifyInput): VerificationFailure[]
       }
       continue;
     }
+    const old = before.entries.get(path);
+    const reappeared = old && reappearedCopy(before, after, old);
+    if (reappeared) {
+      out.push({
+        check: "fixed",
+        path,
+        detail: `${old.name}@${old.version} was planned to move to ${target}, but a copy of it reappeared at ${reappeared.path}.`,
+      });
+      continue;
+    }
     for (const edge of beforeEdges) {
-      if (edge.resolved?.path !== path || !after.entries.has(edge.from)) continue;
+      if (edge.resolved?.path !== path || !stillDeclares(after.entries.get(edge.from), edge.name)) continue;
       const now = resolveDep(after, edge.from, edge.name);
       if (!now || now.version === target) continue;
       const was = before.entries.get(now.path);
@@ -126,8 +154,9 @@ function checkNothingElseMoved({ before, after, plan }: VerifyInput): Verificati
   const beforeEdges = edgesOf(before);
 
   // A target relocated by hoisting shows up as a new path at a target version.
-  // It counts only if everything that depends on it used to resolve to a planned
-  // copy, so a safe copy is never mistaken for a target by sharing its version.
+  // It counts only if every dependent used to get this very version (hoisting
+  // merged copies) or a planned copy fixed at this target, so a safe copy at some
+  // other version is never mistaken for a target by sharing its version.
   const isRelocatedTarget = (path: string, entry: LockEntry): boolean => {
     if (before.entries.has(path) || entry.link || entry.version === undefined) return false;
     if (!targetVersions.get(entry.name)?.has(entry.version)) return false;
@@ -135,7 +164,8 @@ function checkNothingElseMoved({ before, after, plan }: VerifyInput): Verificati
     if (dependents.length === 0) return false;
     return dependents.every((e) => {
       const prev = before.entries.has(e.from) ? resolveDep(before, e.from, e.name) : null;
-      return prev === null || plan.targets.has(prev.path);
+      if (prev === null) return true;
+      return (prev.name === entry.name && prev.version === entry.version) || plan.targets.get(prev.path) === entry.version;
     });
   };
   const relocated = new Set<string>();

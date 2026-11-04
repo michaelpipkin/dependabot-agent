@@ -597,6 +597,86 @@ describe("verify: review findings", () => {
   });
 });
 
+describe("verify: re-review findings", () => {
+  it("R1. ignores an edge from a package that survives but no longer declares the dependency", () => {
+    const before: Packages = {
+      "": { dependencies: { m: "^1.0.0", qs: "6.4.0" } },
+      "node_modules/qs": { version: "6.4.0" },
+      "node_modules/m": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/m/node_modules/qs": { version: "6.5.0" },
+    };
+    const after: Packages = {
+      "": { dependencies: { m: "^1.0.1", qs: "6.4.0" } },
+      "node_modules/qs": { version: "6.4.0" },
+      "node_modules/m": { version: "1.0.1" },
+    };
+    const targets = { "node_modules/m/node_modules/qs": "6.5.3", "node_modules/m": "1.0.1" };
+    assert.deepEqual(run(before, after, targets, { bumps: [bump("m", "dependencies", "1.0.1")] }), []);
+  });
+
+  const hoistBefore = (): Packages => ({
+    "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+    "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+    "node_modules/a/node_modules/qs": { version: "6.5.0" },
+    "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+    "node_modules/b/node_modules/qs": { version: "6.5.3" },
+  });
+
+  it("R2a. allows a planned copy and a safe copy at the target version merging into one hoisted path", () => {
+    const after: Packages = {
+      "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+      "node_modules/qs": { version: "6.5.3" },
+    };
+    assert.deepEqual(run(hoistBefore(), after, { "node_modules/a/node_modules/qs": "6.5.3" }), []);
+  });
+
+  it("R2b. allows only the safe copy to relocate while the planned copy stays put", () => {
+    const after: Packages = {
+      "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/a/node_modules/qs": { version: "6.5.3" },
+      "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+      "node_modules/qs": { version: "6.5.3" },
+    };
+    assert.deepEqual(run(hoistBefore(), after, { "node_modules/a/node_modules/qs": "6.5.3" }), []);
+  });
+
+  it("R2c. still rejects an added path at the target version when a dependent came from a different safe version", () => {
+    const before: Packages = { ...hoistBefore(), "node_modules/b/node_modules/qs": { version: "6.5.4" } };
+    const after: Packages = {
+      "": { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/b": { version: "1.0.0", dependencies: { qs: "^6.5.3" } },
+      "node_modules/qs": { version: "6.5.3" },
+    };
+    const failures = run(before, after, { "node_modules/a/node_modules/qs": "6.5.3" });
+    assert.ok(checks(failures).includes("nothing-else-moved"));
+  });
+
+  it("R3. fails fixed when a planned copy and its dependent both relocate unfixed", () => {
+    const before: Packages = {
+      "": { dependencies: { x: "^1.0.0", m: "^1.0.0" } },
+      "node_modules/m": { version: "1.0.0" },
+      "node_modules/x": { version: "1.0.0", dependencies: { a: "^1.0.0" } },
+      "node_modules/x/node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/x/node_modules/qs": { version: "6.5.0" },
+    };
+    const after: Packages = {
+      "": { dependencies: { x: "^1.0.0", m: "^1.0.1" } },
+      "node_modules/m": { version: "1.0.1", dependencies: { a: "^1.0.0" } },
+      "node_modules/x": { version: "1.0.0", dependencies: { a: "^1.0.0" } },
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.5.0" } },
+      "node_modules/qs": { version: "6.5.0" },
+    };
+    const targets = { "node_modules/x/node_modules/qs": "6.5.3", "node_modules/m": "1.0.1" };
+    const failures = run(before, after, targets, { bumps: [bump("m", "dependencies", "1.0.1")] });
+    assert.ok(checks(failures).includes("fixed"));
+    assert.equal(failures.find((f) => f.check === "fixed")!.path, "node_modules/x/node_modules/qs");
+  });
+});
+
 describe("treeProblems", () => {
   it("reports unresolved and out-of-range edges as '<from> -> <name>@<spec>'", () => {
     const lock = makeLock({
