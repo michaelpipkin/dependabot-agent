@@ -74,6 +74,8 @@ export interface PlanInput {
   limits: Record<string, string>;
   published: Map<string, string[] | null>;
   updateWorkspaceMembers: boolean;
+  /** This lockfile's directory relative to the repository's root, as alerts name their manifests. Empty for the root. */
+  manifestPrefix?: string;
 }
 export interface Plan {
   alerts: AlertOutcome[];
@@ -753,6 +755,27 @@ function decide(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert, li
   return blocked(copy, pairBlock(ctx, copy, alert) ?? line.conflicts.get(copy.path) ?? atOrAbove);
 }
 
+/**
+ * An alert on a package.json whose exact pin is still in the vulnerable range. GitHub
+ * tracks what that manifest declares, so the alert won't close however safe the
+ * installed copy is, and saying it will would let a run look clean with it still open.
+ */
+function stuckOnPin(ctx: PackageContext, alert: DependabotAlert): CopyDecision | null {
+  const declared = alert.dependency.manifest_path;
+  const prefix = ctx.input.manifestPrefix ? `${ctx.input.manifestPrefix}/` : "";
+  const manifest = ctx.input.manifests.find((m) => `${prefix}${manifestFile(m)}` === declared);
+  const pin = manifest?.deps.find((d) => d.name === ctx.name && isExactPin(d.spec) && inRange(parseSimpleSpec(d.spec)!.version, alert) === true);
+  if (!manifest || !pin) return null;
+  return {
+    path: declared,
+    version: pin.spec,
+    action: "blocked",
+    reason: "pin",
+    detail: `Pinned at "${pin.spec}" in ${manifestFile(manifest)}. GitHub tracks the version this manifest declares, so the alert stays open even though the installed copy is safe.`,
+    pastDeclared: [],
+  };
+}
+
 function statusOf(copies: CopyDecision[]): AlertStatus {
   if (copies.length === 0) return "awaiting-close";
   const fixed = copies.filter((c) => c.action !== "blocked").length;
@@ -852,6 +875,8 @@ function planPackage(
 
   for (const alert of alerts) {
     const decisions = copies.flatMap((copy) => decide(ctx, copy, alert, lineOf(copy)) ?? []);
+    const pinned = decisions.length === 0 ? stuckOnPin(ctx, alert) : null;
+    if (pinned) decisions.push(pinned);
     outcomes.set(alert, outcomeOf(alert, statusOf(decisions), decisions));
   }
   for (const line of lines) recordBumps(ctx, line, plan);

@@ -420,10 +420,10 @@ Targeted mode is for teams that don't run a general `npm update`: packages move 
 dependabot-agent --update-strategy targeted --dry-run
 ```
 
-> **Status: new.** Targeted mode is recent, and some of it is not yet proven.
+> **Status: new.** Targeted mode is recent.
 >
-> - It has been tested on **npm 11, on Windows**. Linux is still to be confirmed, and npm 10 can fail safely on some workspace trees, so no minimum npm version is claimed (see [Supported npm versions](#supported-npm-versions)).
-> - It has not yet been shown on a live repository that Dependabot closes the alerts after the overrides this mode writes. The agent's earlier fixtures confirmed that for `name@major` override keys only.
+> - Use **npm 11.3 or newer**; 11.14 or newer is best. See [Supported npm versions](#supported-npm-versions).
+> - On a live repository, Dependabot closed every alert this mode fixed, within seconds of the push, including those fixed through the [temporary root step](#workspaces). Alerts it reported as blocked stayed open.
 >
 > **Run it with `--dry-run` on a real repository first**, read the plan, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
 
@@ -514,7 +514,7 @@ Things to know:
 - **Overrides on a member-only tree.** npm applies an override only when the package is reachable from the root `package.json`. For a package reachable only through workspace members, targeted mode adds the members' relevant dependencies to the root `devDependencies` temporarily, resolves, then restores `package.json` exactly and resolves again. This relies on npm behaviour that npm doesn't document, which is why the result is verified rather than assumed.
 - **A copy nested inside a member.** A copy that needs an override and sits in a workspace member's own `node_modules` is blocked, because npm's override can't reach it. Moving the members to one range of the parent package clears it.
 - **A package declared twice.** A package declared in two dependency fields of one manifest (say `dependencies` and `devDependencies`) is blocked: npm can't rewrite both.
-- **Alerts stay open until every copy is resolved.** An alert for a package that has a copy still blocked stays open on GitHub. An alert keyed to a member's `package.json` tracks the version that manifest *declares*, which an override doesn't change, so it may show as awaiting close even after the lockfile is fixed.
+- **Alerts stay open until every copy is resolved.** An alert for a package that has a copy still blocked stays open on GitHub. An alert keyed to a `package.json` tracks the version that manifest *declares*, which an override doesn't change. GitHub raises these for exact pins, not ranges, so one on a pin still in the vulnerable range is reported as blocked by the pin, even when the installed copy is safe: it won't close until the pin changes.
 
 ### How a run is checked
 
@@ -622,9 +622,17 @@ The workflow doesn't set up credentials for a private npm registry. If your lock
 
 ### Supported npm versions
 
-**Tested on npm 11 (11.16), on Windows.** Linux is still to be confirmed. The npm that matters is the one the agent runs, which is the one the job's Node ships, and the log and the report both say which it was. The reusable workflow defaults to Node 24, which ships npm 11.
+**Use npm 11.3 or newer; 11.14 or newer is best.** The live test suite was run on these versions, on Linux, and on 11.16 on Windows:
 
-**npm 10 can fail safely on some member-only trees.** On npm 10.9.9, which Node 22 ships, an Angular 19 tree living only in a workspace member, with an alert on `nanoid`, stops with `fixed on node_modules/nanoid: nanoid is at 3.3.8`, whichever npm wrote the lockfile. The temporary-root step doesn't move that copy, the post-run checks catch it, every file is restored, and no pull request is opened: the cost is a failed run, not a wrong tree. npm 11.16 fixes the same tree. So setting `node-version` to `"22"`, or running the CLI on npm 10, works until it meets such a tree.
+| npm | Result |
+| --- | --- |
+| 11.14, 11.16 | Everything passes. |
+| 11.3, 11.6, 11.9, 11.12 | Every fix applies. A forced override doesn't move an exact pin on these versions, so the agent's plan is what stops such a change rather than the pin check. |
+| 11.0, 10.9 | Some fixes fail safely (see below). |
+
+Versions between these weren't tested. The npm that matters is the one the agent runs, which is the one the job's Node ships, and the log and the report both say which it was. The reusable workflow defaults to Node 24, whose current releases ship npm 11. A pinned older Node 24 ships an older npm.
+
+**Older npm can fail safely on some trees.** On npm 10.9.9, which Node 22 ships, and on 11.0, an Angular 19 tree living only in a workspace member, with an alert on `nanoid`, stops with `fixed on node_modules/nanoid: nanoid is at 3.3.8`, whichever npm wrote the lockfile. npm 10.9.2 and 11.0 also leave a hoisted copy unmoved when another copy of the same package is bundled. The post-run checks catch these, every file is restored, and no pull request is opened: the cost is a failed run, not a wrong tree. So setting `node-version` to `"22"`, or running the CLI on npm 10, works until it meets such a tree.
 
 The lockfile must be `lockfileVersion` 2 or 3 (npm 7 or later). If a different npm version changes the behaviour this mode depends on, the post-run checks are meant to catch it and fail the run rather than produce a wrong tree, but that is not a substitute for a dry run on your own repository.
 

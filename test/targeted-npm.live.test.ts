@@ -410,12 +410,13 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       });
       const snapshot = snapshotFiles([join(dir, "package.json"), join(dir, "package-lock.json")]);
       const failures = applyPlan(dir, forced(), { limits: {}, manifests: manifestsOf(dir) });
-      // npm does move the pinned copy, leaving the member's manifest saying 3.0.4
-      // and `npm ci` content. This check is all that stops it reaching a PR.
-      assert.equal(versions(dir).get("node_modules/minimatch"), "3.0.5");
+      // From npm 11.14 it moves the pinned copy, leaving the member's manifest saying
+      // 3.0.4 and `npm ci` content. This check is all that stops it reaching a PR.
+      // Earlier versions leave the copy alone, so the plan's fix is what fails.
+      const moved = versions(dir).get("node_modules/minimatch") === "3.0.5";
       assert.deepEqual(
         failures.map((f) => f.check),
-        ["pins-held"],
+        moved ? ["pins-held"] : ["fixed"],
       );
       snapshot.restore();
       assert.equal(versions(dir).get("node_modules/minimatch"), "3.0.4");

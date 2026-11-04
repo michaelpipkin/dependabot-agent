@@ -522,6 +522,7 @@ async function planGroups(
       limits: cfg.limits,
       published,
       updateWorkspaceMembers: cfg.updateWorkspaceMembers,
+      manifestPrefix: prefix,
     });
     const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
     const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...manifestFiles])];

@@ -47,6 +47,7 @@ interface Setup {
   limits?: Record<string, string>;
   published?: Map<string, string[] | null>;
   updateWorkspaceMembers?: boolean;
+  manifestPrefix?: string;
 }
 
 /** Every alert's patch counts as published unless the test passes its own map. */
@@ -69,6 +70,7 @@ function plan(setup: Setup): Plan {
     limits: setup.limits ?? {},
     published: setup.published ?? publishedFrom(setup.alerts),
     updateWorkspaceMembers: setup.updateWorkspaceMembers ?? true,
+    manifestPrefix: setup.manifestPrefix,
   });
 }
 
@@ -99,6 +101,47 @@ function direct(name: string, spec: string, version: string): { lock: LockIndex;
     manifests: [root(dep(name, spec))],
   };
 }
+
+describe("an alert on a package.json whose copy is already safe", () => {
+  // Live: alerts keyed to a member's exact pin stayed open for months after the lockfile moved.
+  const on = (manifest: string): DependabotAlert => {
+    const a = alert(1, "qs", "< 6.7.3", "6.7.3");
+    return { ...a, dependency: { ...a.dependency, manifest_path: manifest } };
+  };
+  const safe = transitive("qs", "6.9.4");
+
+  it("is blocked by the pin while that pin is in the vulnerable range, and nothing is written", () => {
+    const p = plan({ alerts: [on("packages/a/package.json")], lock: safe, manifests: [root(), member("packages/a", dep("qs", "6.5.0"))] });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "pin");
+    assert.match(p.alerts[0].copies[0].detail ?? "", /Pinned at "6\.5\.0" in packages\/a\/package\.json.*stays open/);
+    assert.equal(p.alerts[0].manifest, "packages/a/package.json");
+    assertNoWrites(p);
+  });
+
+  it("finds the manifest under an isolated package's directory", () => {
+    const p = plan({ alerts: [on("functions/packages/a/package.json")], lock: safe, manifests: [root(), member("packages/a", dep("qs", "=6.5.0"))], manifestPrefix: "functions" });
+    assert.equal(p.alerts[0].status, "blocked");
+    assert.equal(p.alerts[0].copies[0].reason, "pin");
+  });
+
+  it("is blocked at the root too", () => {
+    const p = plan({ alerts: [on("package.json")], lock: safe, manifests: [root(dep("qs", "6.5.0"))] });
+    assert.equal(p.alerts[0].status, "blocked");
+  });
+
+  const stillAwaiting: Array<[string, () => Plan]> = [
+    ["a range", () => plan({ alerts: [on("packages/a/package.json")], lock: safe, manifests: [root(), member("packages/a", dep("qs", "^6.5.0"))] })],
+    ["a pin that's out of the range", () => plan({ alerts: [on("packages/a/package.json")], lock: safe, manifests: [root(), member("packages/a", dep("qs", "6.9.4"))] })],
+    ["a pin in another manifest", () => plan({ alerts: [on("packages/a/package.json")], lock: safe, manifests: [root(), member("packages/a"), member("packages/b", dep("qs", "6.5.0"))] })],
+    ["an alert on the lockfile", () => plan({ alerts: [on("package-lock.json")], lock: safe, manifests: [root(), member("packages/a", dep("qs", "6.5.0"))] })],
+  ];
+  for (const [label, build] of stillAwaiting) {
+    it(`stays awaiting close with ${label}`, () => {
+      assert.equal(build().alerts[0].status, "awaiting-close");
+    });
+  }
+});
 
 describe("sorting", () => {
   it("not in lockfile → not-found", () => {
