@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { ResolvedConfig } from "../config.js";
-import { discoverIsolatedManifestDirs } from "../discover.js";
+import { discoverIsolatedManifestDirs, hasOwnLockfile } from "../discover.js";
 import { fetchDependabotAlerts } from "../github.js";
 import { readDirectDependencies } from "../manifest.js";
 import type { DirectDep } from "../manifest.js";
@@ -18,13 +18,13 @@ import { fetchDependentRanges, readPublishedVersions, usableRange } from "../reg
 import { compareSemver, parseSemver } from "../semver.js";
 import type { DependabotAlert, DependentRange } from "../types.js";
 import { AgentError, exitWithError, log, warn } from "../util.js";
-import { applyPlan, snapshotFiles, tryRemoveOverride } from "./apply.js";
+import { applyPlan, npmVersion, snapshotFiles, tryRemoveOverride } from "./apply.js";
 import type { NpmRunner, Snapshot } from "./apply.js";
-import { copiesOf, edgesOf, edgesTo, readLockfile } from "./lockfile.js";
+import { copiesOf, edgesOf, edgesTo, hasOldLockfile, readLockfile } from "./lockfile.js";
 import type { LockEntry, LockIndex } from "./lockfile.js";
 import { isAgentAuthoredOverride, selectorKeyName } from "./override-keys.js";
-import { buildPlan } from "./plan.js";
-import type { ManifestInfo, Plan } from "./plan.js";
+import { buildPlan, unprocessedAlert } from "./plan.js";
+import type { AlertOutcome, ManifestInfo, Plan } from "./plan.js";
 import { computeOutcome, renderMarkdown, writeReport } from "./report.js";
 import type { RunReport } from "./report.js";
 import { treeProblems } from "./verify.js";
@@ -36,6 +36,8 @@ export interface TargetedDeps {
   fetchPublished: (name: string) => Promise<string[] | null>;
   /** What a dependent declares for a package at its latest release (its installed range comes from the lockfile). */
   fetchDependents: typeof fetchDependentRanges;
+  /** The npm this run uses, or null if it can't be read. */
+  npmVersion: (cwd: string) => string | null;
   run?: NpmRunner;
 }
 
@@ -43,6 +45,7 @@ const defaultDeps: TargetedDeps = {
   fetchAlerts: (cfg) => fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
   fetchPublished: readPublishedVersions,
   fetchDependents: fetchDependentRanges,
+  npmVersion,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,6 +97,62 @@ export function groupAlertsByNearestLockfile(
     if (!groups.has(dir)) groups.set(dir, []);
   }
   return groups;
+}
+
+/** The directory at or above `from` that manages its own install: an owner, or one with a lockfile of its own. */
+function nearestLockfileDir(root: string, from: string, owners: Set<string>): string {
+  let dir = from;
+  while (dir !== root && dir !== path.dirname(dir)) {
+    if (owners.has(dir) || hasOwnLockfile(dir)) return dir;
+    dir = path.dirname(dir);
+  }
+  return root;
+}
+
+interface PlacedAlerts {
+  /** The alerts some lockfile in this run answers for. */
+  processed: DependabotAlert[];
+  /** Directories that only an alert brought in: discovery prunes them, but they have a lockfile of their own. */
+  addedDirs: string[];
+  /** The alerts no lockfile in this run answers for. Reported as blocked, and never folded into the root. */
+  unprocessed: AlertOutcome[];
+}
+
+/**
+ * Decide which alerts this run can answer for. The grouping below folds whatever isn't
+ * under an owner into the root, which is right for a workspace member and wrong for
+ * anything else: the root's lockfile would say "nothing to change", or fix a copy the
+ * alert isn't about, while the real alert stayed open.
+ */
+function placeAlerts(open: DependabotAlert[], cfg: ResolvedConfig, extraDirs: string[]): PlacedAlerts {
+  const root = path.resolve(cfg.workspaceRoot);
+  const owners = new Set([root, ...extraDirs.map((dir) => path.resolve(dir))]);
+  const placed: PlacedAlerts = { processed: [], addedDirs: [], unprocessed: [] };
+  for (const alert of open) {
+    const manifest = alert.dependency.manifest_path;
+    const refuse = (detail: string): void => void placed.unprocessed.push(unprocessedAlert(alert, detail));
+    const at = path.resolve(root, path.dirname(manifest));
+    if (isOutside(root, at)) {
+      refuse(`${manifest} is outside the repository, so this run can't read it.`);
+      continue;
+    }
+    if (!existsSync(at)) {
+      refuse(`The directory holding ${manifest} no longer exists, so no lockfile here answers for this alert. Check that GitHub has rescanned, or dismiss the alert.`);
+      continue;
+    }
+    const dir = nearestLockfileDir(root, at, owners);
+    if (owners.has(dir)) {
+      placed.processed.push(alert);
+    } else if (!existsSync(path.join(dir, "package.json"))) {
+      refuse(`${manifest} is covered by a lockfile in ${posix(path.relative(root, dir))}, which has no package.json, so this run can't read it.`);
+    } else if (!cfg.discoverPackages) {
+      refuse(`${manifest} is covered by the lockfile in ${posix(path.relative(root, dir))}, which this run doesn't process because discoverPackages is off. Turn it on, or list that directory under "packages".`);
+    } else {
+      placed.processed.push(alert);
+      if (!placed.addedDirs.includes(dir)) placed.addedDirs.push(dir);
+    }
+  }
+  return placed;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +231,23 @@ const pathLabel = (group: Group, lockPath: string): string => {
   return lockPath ? `${group.prefix}/${lockPath}` : group.prefix;
 };
 
-/** Versions that changed, appeared or went away, other than the copies the plan moved on purpose. */
+/**
+ * The group's alerts as the report shows them: a plan speaks in its own lockfile's paths,
+ * which a report across several lockfiles has to place. The root's already read correctly.
+ */
+function reportedAlerts(group: Group): AlertOutcome[] {
+  if (!group.prefix) return group.plan.alerts;
+  return group.plan.alerts.map((alert) => ({
+    ...alert,
+    copies: alert.copies.map((copy) => ({
+      ...copy,
+      path: `${group.prefix}/${copy.path}`,
+      ...(copy.detail ? { detail: `In ${group.label}: ${copy.detail}` } : {}),
+    })),
+  }));
+}
+
+/** Versions that changed, appeared or went away at the paths the plan didn't name, relocated targets included. */
 function otherChangesOf(group: Group, after: LockIndex): RunReport["otherChanges"] {
   const out: RunReport["otherChanges"] = [];
   for (const lockPath of new Set([...group.before.entries.keys(), ...after.entries.keys()])) {
@@ -327,6 +402,7 @@ const plannedChangesOf = (plan: Plan): number => {
 
 /** Facts about the run so far, for a failure report that can't rely on the plan having been made. */
 interface RunState {
+  npmVersion: string | null;
   alerts: RunReport["alerts"];
   reported: boolean;
   /** Restoring the snapshot has been tried. */
@@ -351,7 +427,7 @@ const restoreNote = (state: RunState): string =>
     ? `Restoring the files failed, so the working tree may hold partial changes: ${state.restoreError}`
     : "Every file was restored to how it was before the run.";
 
-type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts">;
+type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion">;
 
 /** Write the report if asked to, and print it. A write that fails says so, and names the directory. */
 function publish(report: RunReport, cfg: ResolvedConfig, state: RunState): void {
@@ -410,6 +486,11 @@ async function planGroups(
   for (const [dir, alerts] of groupAlertsByNearestLockfile(open, cfg.workspaceRoot, extraDirs)) {
     const prefix = sameDir(dir, cfg.workspaceRoot) ? "" : posix(path.relative(cfg.workspaceRoot, dir));
     const label = prefix || "root";
+    // Nothing is asked of it, so a lockfile this strategy can't read shouldn't stop the others.
+    if (prefix && alerts.length === 0 && hasOldLockfile(dir)) {
+      warn(`Skipping ${label}: it has no open alerts, and its lockfile is older than the lockfileVersion 2 this strategy reads.`);
+      continue;
+    }
     log(`\n📂 Planning ${label} (${alerts.length} open alert(s)) [npm]`);
 
     const lock = readLockfile(dir);
@@ -506,11 +587,17 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
     deps,
   };
 
-  const groups = await planGroups(cfg, deps, open, extraDirs);
-  const alerts = groups.flatMap((g) => g.plan.alerts);
+  const placed = placeAlerts(open, cfg, extraDirs);
+  if (placed.addedDirs.length > 0) {
+    log(`🧩 Alerted package(s) that discovery skips: ${placed.addedDirs.map((d) => posix(path.relative(cfg.workspaceRoot, d))).join(", ")}`);
+    assertTargetedSupported(placed.addedDirs, cfg);
+  }
+
+  const groups = await planGroups(cfg, deps, placed.processed, [...extraDirs, ...placed.addedDirs]);
+  const alerts = [...groups.flatMap(reportedAlerts), ...placed.unprocessed];
   state.alerts = alerts;
   const blockedCount = blockedCountOf(alerts);
-  const base: ReportBase = { dryRun: cfg.dryRun, blockedCount, alerts };
+  const base: ReportBase = { dryRun: cfg.dryRun, blockedCount, alerts, npmVersion: state.npmVersion };
 
   if (cfg.dryRun) {
     const removedOverrides = await previewOrphans(groups, ctx);
@@ -555,14 +642,16 @@ ${restoreNote(state)}`);
 
 export async function runTargeted(cfg: ResolvedConfig, overrides: Partial<TargetedDeps> = {}): Promise<RunResult> {
   const deps: TargetedDeps = { ...defaultDeps, ...overrides };
-  const state: RunState = { alerts: [], reported: false, restored: false };
+  const version = deps.npmVersion(cfg.workspaceRoot);
+  log(`📦 npm ${version ?? "version unknown"}`);
+  const state: RunState = { npmVersion: version, alerts: [], reported: false, restored: false };
   try {
     return await execute(cfg, deps, state);
   } catch (e) {
     // Any exit, not only a failed verification: an expired token is the likeliest way a scheduled run fails.
     if (!state.reported) {
       const detail = e instanceof AgentError ? e.message : `Unexpected error: ${messageOf(e)}`;
-      const base: ReportBase = { dryRun: cfg.dryRun, blockedCount: blockedCountOf(state.alerts), alerts: state.alerts };
+      const base: ReportBase = { dryRun: cfg.dryRun, blockedCount: blockedCountOf(state.alerts), alerts: state.alerts, npmVersion: state.npmVersion };
       publishFailed([{ check: "run", detail }], base, cfg, state);
     }
     throw e;

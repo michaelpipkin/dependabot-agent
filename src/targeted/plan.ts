@@ -22,7 +22,8 @@ export type BlockReason =
   | "unrewritable-spec"
   | "major-crossing"
   | "hand-written-override"
-  | "selector-conflict";
+  | "selector-conflict"
+  | "manifest-not-processed";
 export type AlertStatus = "fixed" | "partly-fixed" | "blocked" | "awaiting-close" | "not-found";
 
 export interface CopyDecision {
@@ -42,6 +43,8 @@ export interface AlertOutcome {
   severity: string;
   scope: DepScope;
   status: AlertStatus;
+  /** The manifest GitHub raised the alert on, relative to the repository's root. */
+  manifest: string;
   copies: CopyDecision[];
 }
 export interface DirectBump {
@@ -732,8 +735,22 @@ function outcomeOf(alert: DependabotAlert, status: AlertStatus, copies: CopyDeci
     severity: alert.security_advisory.severity,
     scope: alertScope(alert),
     status,
+    manifest: alert.dependency.manifest_path,
     copies,
   };
+}
+
+/** An alert the run can't answer for: no lockfile it reads covers the manifest. */
+export function unprocessedAlert(alert: DependabotAlert, detail: string): AlertOutcome {
+  const copy: CopyDecision = {
+    path: alert.dependency.manifest_path,
+    version: "",
+    action: "blocked",
+    reason: "manifest-not-processed",
+    detail,
+    pastDeclared: [],
+  };
+  return outcomeOf(alert, "blocked", [copy]);
 }
 
 // ---------------------------------------------------------------------------

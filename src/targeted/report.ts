@@ -16,6 +16,8 @@ export interface RunReport {
   /** Overrides taken out of package.json as no longer needed (or, in a dry run, that would be tried). */
   removedOverrides: Array<{ key: string; reason: string }>;
   failures: VerificationFailure[];
+  /** What `npm --version` said when the run started, or null if it couldn't be read. */
+  npmVersion: string | null;
   /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
   restoreError?: string;
 }
@@ -121,6 +123,7 @@ function changeRows(alert: AlertOutcome, extra?: (alert: AlertOutcome) => string
       change,
       mechanism(copy),
       SCOPE_LABEL[alert.scope],
+      `\`${alert.manifest}\``,
     ];
     if (extra) cols.push(extra(alert));
     return `| ${cols.map(cell).join(" | ")} |`;
@@ -128,7 +131,7 @@ function changeRows(alert: AlertOutcome, extra?: (alert: AlertOutcome) => string
 }
 
 function changeTable(alerts: AlertOutcome[], extraHeader?: string, extra?: (alert: AlertOutcome) => string): Pick<Section, "intro" | "items"> {
-  const head = ["Alert", "Severity", "Package", "Change", "How", "Scope"];
+  const head = ["Alert", "Severity", "Package", "Change", "How", "Scope", "Manifest"];
   if (extraHeader) head.push(extraHeader);
   return {
     intro: [`| ${head.join(" | ")} |`, `|${head.map(() => " --- ").join("|")}|`],
@@ -160,14 +163,16 @@ function blockedItems(alerts: AlertOutcome[]): string[] {
   for (const alert of alerts) {
     if (alert.status !== "blocked" && alert.status !== "partly-fixed") continue;
     const lead = `${alertLink(alert)} ${alert.severity}, \`${alert.packageName}\``;
+    const onManifest = `on \`${alert.manifest}\``;
     const blocked = alert.copies.filter(isBlocked);
     if (blocked.length === 0) {
-      items.push(`- ${lead}: blocked, with no detail recorded.`);
+      items.push(`- ${lead} ${onManifest}: blocked, with no detail recorded.`);
       continue;
     }
     for (const copy of blocked) {
-      const at = copy.version ? ` ${copy.version}` : "";
-      items.push(`- ${lead}${at} at \`${copy.path}\`: ${copy.detail ?? copy.reason ?? "blocked"}`);
+      const version = copy.version ? ` ${copy.version}` : "";
+      const where = copy.path === alert.manifest ? "" : ` at \`${copy.path}\``;
+      items.push(`- ${lead}${version} ${onManifest}${where}: ${copy.detail ?? copy.reason ?? "blocked"}`);
     }
   }
   return items;
@@ -179,7 +184,7 @@ function pastDeclaredItems(alerts: AlertOutcome[]): string[] {
     for (const copy of alert.copies) {
       if (isBlocked(copy) || copy.pastDeclared.length === 0) continue;
       const dependents = copy.pastDeclared.map((d) => `\`${d.dependent}\` declares \`${d.range}\``).join("; ");
-      items.push(`- ${alertLink(alert)} \`${alert.packageName}\` ${arrow(copy.version, copy.target)}: ${dependents}`);
+      items.push(`- ${alertLink(alert)} \`${alert.packageName}\` ${arrow(copy.version, copy.target)} on \`${alert.manifest}\`: ${dependents}`);
     }
   }
   return items;
@@ -192,8 +197,8 @@ function awaitingItems(alerts: AlertOutcome[]): string[] {
       const note =
         a.status === "awaiting-close"
           ? "no installed copy is in the vulnerable range, so GitHub should close it on its next scan"
-          : "not in the lockfile, so there is nothing to change here";
-      return `- ${alertLink(a)} ${a.severity}, \`${a.packageName}\`: ${note}.`;
+          : "not in that manifest's lockfile, so there is nothing to change here";
+      return `- ${alertLink(a)} ${a.severity}, \`${a.packageName}\` on \`${a.manifest}\`: ${note}.`;
     });
 }
 
@@ -277,7 +282,7 @@ function buildSections(report: RunReport): Section[] {
 
   sections.push({
     heading: "Other changes",
-    intro: [`These packages ${planned ? "would move" : "moved"} only because a fixed package needs them.`, ""],
+    intro: [`These entries ${planned ? "would also change" : "also changed"}: a fixed package needs them, or npm relocated a fixed copy to another path.`, ""],
     items: report.otherChanges.map((c) => `- \`${c.path}\`: ${otherChangeText(c)}`),
   });
 
@@ -322,6 +327,8 @@ function headerBlock(report: RunReport): string {
     const verb = report.dryRun ? "would be removed" : "removed";
     lines.push("", `**${removed}** override${removed === 1 ? "" : "s"} ${verb} as no longer needed.`);
   }
+  if (lines.at(-1) !== "") lines.push("");
+  lines.push(report.npmVersion ? `Run with npm ${report.npmVersion}.` : "npm version unknown.");
   return lines.join("\n");
 }
 

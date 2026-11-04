@@ -46,6 +46,18 @@ function installedName(path: string, raw: RawEntry): string {
   return raw.name ?? path.slice(path.lastIndexOf("/") + 1);
 }
 
+const isSupportedVersion = (version: unknown): boolean => typeof version === "number" && version >= 2;
+
+/** Whether this directory's lockfile parses, but is too old for this strategy to read. */
+export function hasOldLockfile(dir: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf-8")) as { lockfileVersion?: unknown } | null;
+    return !isSupportedVersion(raw?.lockfileVersion);
+  } catch {
+    return false;
+  }
+}
+
 export function readLockfile(dir: string): LockIndex {
   const file = join(dir, "package-lock.json");
   if (!existsSync(file)) {
@@ -58,7 +70,7 @@ export function readLockfile(dir: string): LockIndex {
     exitWithError(`Could not parse ${file}: ${e instanceof Error ? e.message : String(e)}`);
   }
   const version = (raw as { lockfileVersion?: unknown } | null)?.lockfileVersion;
-  if (typeof version !== "number" || version < 2) {
+  if (!isSupportedVersion(version)) {
     exitWithError(
       `${file} has lockfileVersion ${String(version)}; the targeted strategy needs lockfileVersion 2 or 3 (npm 7+). Regenerate it with a current npm.`,
     );

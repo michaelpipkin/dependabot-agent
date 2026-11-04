@@ -32,6 +32,13 @@ const defaultRunner: NpmRunner = (command, cwd) => {
   if (result.status !== 0) throw Object.assign(new Error(`Command failed: ${command}`), { stderr: result.stderr });
 };
 
+/** What `npm --version` says in this directory, or null if npm can't be run. */
+export function npmVersion(cwd: string): string | null {
+  const result = spawnSync("npm --version", { cwd, shell: true, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const version = result.status === 0 ? result.stdout?.trim() : "";
+  return version || null;
+}
+
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**

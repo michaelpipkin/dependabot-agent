@@ -18,6 +18,11 @@ const PRUNE_DIRS = new Set([
 // of the parent workspace, which shares the root install/overrides).
 const LOCKFILES = ["pnpm-lock.yaml", "package-lock.json"];
 
+/** Whether a directory has a lockfile of its own. */
+export function hasOwnLockfile(dir: string): boolean {
+  return LOCKFILES.some((lockfile) => fs.existsSync(path.join(dir, lockfile)));
+}
+
 /**
  * Recursively find directories under `workspaceRoot` (excluding the root itself)
  * that have their own package.json + lockfile — i.e. isolated packages such as

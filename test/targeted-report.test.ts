@@ -18,6 +18,7 @@ function alert(over: Partial<AlertOutcome> = {}): AlertOutcome {
     severity: "high",
     scope: "production",
     status: "fixed",
+    manifest: "package-lock.json",
     copies: [copy()],
     ...over,
   };
@@ -33,6 +34,7 @@ function report(over: Partial<RunReport> = {}): RunReport {
     keptOverrides: [],
     removedOverrides: [],
     failures: [],
+    npmVersion: "11.16.0",
     ...over,
   };
 }
@@ -428,5 +430,79 @@ describe("a failed report", () => {
 
   it("a normal run still says resolved", () => {
     assert.match(renderMarkdown(report()), /resolved in the lockfile/);
+  });
+});
+
+describe("every alert line names its manifest", () => {
+  const MANIFEST = "functions/package-lock.json";
+  const lines = (md: string, heading: string): string[] => {
+    const section = md.split(`## ${heading}`)[1]?.split(/^## /m)[0] ?? "";
+    return section.split("\n").filter((line) => line.includes("#12") || line.includes("#30"));
+  };
+  const named = (md: string, heading: string): void => {
+    const found = lines(md, heading);
+    assert.ok(found.length > 0, `no alert lines under ${heading}`);
+    for (const line of found) assert.ok(line.includes(MANIFEST), `${heading}: ${line}`);
+  };
+
+  it("in Fixed", () => {
+    named(renderMarkdown(report({ alerts: [alert({ manifest: MANIFEST })] })), "Fixed");
+  });
+
+  it("in Partly fixed and Blocked", () => {
+    const partly = alert({
+      status: "partly-fixed",
+      manifest: MANIFEST,
+      copies: [copy(), copy({ path: "node_modules/a/node_modules/lodash", action: "blocked", target: undefined, reason: "pin", detail: "Pinned." })],
+    });
+    const md = renderMarkdown(report({ alerts: [partly, blockedAlert({ manifest: MANIFEST })] }));
+    named(md, "Partly fixed");
+    named(md, "Blocked");
+  });
+
+  it("in Applied past a declared range", () => {
+    const past = alert({ manifest: MANIFEST, copies: [copy({ pastDeclared: [{ dependent: "x", range: "4.17.20" }] })] });
+    named(renderMarkdown(report({ alerts: [past] })), "Applied past a declared range — review these");
+  });
+
+  it("in Awaiting close or not found", () => {
+    for (const status of ["awaiting-close", "not-found"] as const) {
+      named(renderMarkdown(report({ alerts: [alert({ status, manifest: MANIFEST, copies: [] })] })), "Awaiting close or not found");
+    }
+  });
+
+  it("doesn't say the path twice when the blocked copy is the manifest itself", () => {
+    const gone = alert({
+      status: "blocked",
+      manifest: MANIFEST,
+      copies: [copy({ path: MANIFEST, version: "", action: "blocked", target: undefined, reason: "manifest-not-processed", detail: "Gone." })],
+    });
+    const [line] = lines(renderMarkdown(report({ alerts: [gone] })), "Blocked");
+    assert.equal(line.split(MANIFEST).length - 1, 1, line);
+  });
+});
+
+describe("Other changes", () => {
+  it("doesn't claim a relocated target moved only because a fixed package needs it", () => {
+    const md = renderMarkdown(report({ otherChanges: [{ path: "node_modules/a/node_modules/qs", from: "6.5.0" }, { path: "node_modules/qs", to: "6.5.3" }] }));
+    const section = md.split("## Other changes")[1];
+    assert.doesNotMatch(section, /only because/);
+    assert.match(section, /a fixed package needs/);
+    assert.match(section, /relocated/);
+    assert.match(section, /`node_modules\/qs`: added at 6\.5\.3/);
+  });
+});
+
+describe("the npm version", () => {
+  it("is in the header", () => {
+    assert.match(renderMarkdown(report({ npmVersion: "11.16.0" })).split("##")[0], /Run with npm 11\.16\.0\./);
+  });
+
+  it("is in a report that failed before it planned anything", () => {
+    assert.match(renderMarkdown(report({ outcome: "failed", alerts: [], failures: [{ check: "run", detail: "x" }], npmVersion: "10.9.9" })), /npm 10\.9\.9/);
+  });
+
+  it("says so when it couldn't be read", () => {
+    assert.match(renderMarkdown(report({ npmVersion: null })), /npm version unknown/);
   });
 });
