@@ -18,6 +18,7 @@ import {
   rangeCouldResolveVulnerable,
   satisfiesVulnerableRange,
 } from "./semver.js";
+import { runTargeted } from "./targeted/run.js";
 import { findInstalledVersions } from "./tree.js";
 import { workspaceMemberDependents } from "./workspace.js";
 import {
@@ -1117,7 +1118,7 @@ export function groupAlertsByManifestDir(
  * --package-manager setting wins everywhere; otherwise each isolated package is
  * detected from its own lockfile, falling back to the root's package manager.
  */
-function resolvePmForDir(
+export function resolvePmForDir(
   manifestDir: string,
   isRoot: boolean,
   rootPmId: PackageManagerId,
@@ -1255,6 +1256,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   }
   log(`📦 Package manager: ${rootPmId}${cfg.packageManager ? " (explicit)" : " (auto-detected)"}`);
   log(`🔧 Update strategy: ${cfg.updateStrategy}${cfg.allowPrerelease ? " (pre-releases allowed)" : ""}`);
+  if (cfg.updateStrategy === "targeted") return runTargeted(cfg);
 
   const ctx: RunContext = {
     dryRun: cfg.dryRun,

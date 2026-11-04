@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import {
   baseNameOfOverrideKey,
   computeOverrideChanges,
@@ -15,8 +15,10 @@ import {
   loadBearingAlertNames,
   logMultiLineAdvisories,
   overrideFloor,
+  run,
 } from "../src/reconcile.js";
 import * as path from "node:path";
+import type { ResolvedConfig } from "../src/config.js";
 import {
   AlertRange,
   DependabotAlert,
@@ -1054,5 +1056,59 @@ describe("override key shapes — range selectors", () => {
       undefined,
       "the user's pin is preserved",
     );
+  });
+});
+
+describe("run() routes by update strategy", () => {
+  const cfgFor = (updateStrategy: ResolvedConfig["updateStrategy"]): ResolvedConfig => ({
+    token: "t",
+    repo: "o/r",
+    owner: "o",
+    name: "r",
+    packageManager: "pnpm",
+    workspaceRoot: path.resolve("."),
+    updateStrategy,
+    allowPrerelease: false,
+    dryRun: true,
+    skipUpdate: false,
+    exitCode: false,
+    discoverPackages: false,
+    packages: [],
+    updateWorkspaceMembers: false,
+    limits: {},
+  });
+
+  async function runWithFailingGitHub(
+    updateStrategy: ResolvedConfig["updateStrategy"],
+  ): Promise<{ error: Error; fetched: number }> {
+    const fetchMock = mock.method(globalThis, "fetch", async () => new Response("stubbed", { status: 500 }));
+    mock.method(console, "log", () => {});
+    try {
+      const error = await run(cfgFor(updateStrategy)).then(
+        () => new Error("run() resolved"),
+        (e: Error) => e,
+      );
+      return { error, fetched: fetchMock.mock.callCount() };
+    } finally {
+      mock.restoreAll();
+    }
+  }
+
+  it("compatible still reaches the existing path: it asks GitHub for alerts, even on pnpm", async () => {
+    const { error, fetched } = await runWithFailingGitHub("compatible");
+    assert.match(error.message, /GitHub API error 500/);
+    assert.equal(fetched, 1);
+  });
+
+  it("latest still reaches the existing path too", async () => {
+    const { error, fetched } = await runWithFailingGitHub("latest");
+    assert.match(error.message, /GitHub API error 500/);
+    assert.equal(fetched, 1);
+  });
+
+  it("targeted goes to its own path, which stops on pnpm before asking GitHub for anything", async () => {
+    const { error, fetched } = await runWithFailingGitHub("targeted");
+    assert.match(error.message, /npm only/);
+    assert.equal(fetched, 0);
   });
 });

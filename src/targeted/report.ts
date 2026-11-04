@@ -193,6 +193,11 @@ function awaitingItems(alerts: AlertOutcome[]): string[] {
     });
 }
 
+function otherChangeText(change: RunReport["otherChanges"][number]): string {
+  if (change.from && change.to) return arrow(change.from, change.to);
+  return change.from ? `removed (was ${change.from})` : `added at ${change.to ?? "?"}`;
+}
+
 function buildSections(report: RunReport): Section[] {
   const withStatus = (...statuses: string[]): AlertOutcome[] => report.alerts.filter((a) => statuses.includes(a.status));
   const planned = report.outcome === "failed" || report.dryRun;
@@ -265,7 +270,7 @@ function buildSections(report: RunReport): Section[] {
   sections.push({
     heading: "Other changes",
     intro: [`These packages ${planned ? "would move" : "moved"} only because a fixed package needs them.`, ""],
-    items: report.otherChanges.map((c) => `- \`${c.path}\`: ${c.from && c.to ? arrow(c.from, c.to) : `added at ${c.to ?? "?"}`}`),
+    items: report.otherChanges.map((c) => `- \`${c.path}\`: ${otherChangeText(c)}`),
   });
 
   sections.push({

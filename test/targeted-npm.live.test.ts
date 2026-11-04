@@ -3,13 +3,16 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { readDirectDependencies } from "../src/manifest.js";
 import { readNpmOverrides } from "../src/override-source.js";
 import { applyPlan, NpmRunner, resolveCommand, snapshotFiles } from "../src/targeted/apply.js";
 import { readLockfile } from "../src/targeted/lockfile.js";
 import { buildPlan, ManifestInfo, Plan } from "../src/targeted/plan.js";
+import { runTargeted } from "../src/targeted/run.js";
 import { DependabotAlert } from "../src/types.js";
+import type { ResolvedConfig } from "../src/config.js";
+import type { RunReport } from "../src/targeted/report.js";
 
 // Real npm against the real registry. Off by default so `pnpm test` stays
 // offline: run with DEPENDABOT_AGENT_LIVE_NPM=1. Projects live under os.tmpdir(),
@@ -641,5 +644,80 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       failures.some((f) => f.check === "manifests" && f.detail === 'dependencies "chalk": "^4.0.0" went missing during the run.'),
       JSON.stringify(failures),
     );
+  });
+
+  describe("runTargeted, the whole run", () => {
+    // Only the alerts are injected. npm and the npm registry are real.
+    beforeEach(() => {
+      mock.method(console, "log", () => {});
+    });
+    afterEach(() => {
+      mock.restoreAll();
+    });
+
+    function cfg(dir: string, reportDir: string): ResolvedConfig {
+      return {
+        token: "",
+        repo: "o/r",
+        owner: "o",
+        name: "r",
+        workspaceRoot: dir,
+        updateStrategy: "targeted",
+        allowPrerelease: false,
+        dryRun: false,
+        skipUpdate: false,
+        exitCode: false,
+        discoverPackages: true,
+        packages: [],
+        updateWorkspaceMembers: true,
+        limits: {},
+        reportDir,
+      };
+    }
+
+    const report = (reportDir: string): RunReport => JSON.parse(readFileSync(join(reportDir, "report.json"), "utf-8")) as RunReport;
+
+    for (const [label, shape] of [
+      ["single package", { root: { dependencies: { glob: "^7.1.6" } } }],
+      ["workspace, member only", { members: { a: { dependencies: { glob: "^7.1.6" } } } }],
+    ] as const) {
+      it(`${label}: fixes the alert, reports it, and a second run changes nothing`, async () => {
+        const dir = project("2020-06-01", shape);
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        const before = versions(dir);
+        const open = [MINIMATCH_ALERT];
+
+        const result = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => open });
+
+        assert.deepEqual(movedBetween(before, versions(dir)), MOVED_ONE);
+        assert.deepEqual(json(dir, "package.json").overrides, { [MINIMATCH_KEY]: "3.0.5" });
+        const first = report(reportDir);
+        assert.equal(first.outcome, "changes");
+        assert.equal(first.alerts[0].status, "fixed");
+        assert.deepEqual(first.otherChanges, []);
+        assert.deepEqual(first.failures, []);
+        assert.equal(result.overrideChanges, 1);
+        const md = readFileSync(join(reportDir, "report.md"), "utf-8");
+        assert.match(md, /3\.0\.4 → 3\.0\.5/);
+        assert.match(md, /\[#1\]\(https:\/\/example\.test\/alerts\/1\)/);
+        npm(dir, `ci ${QUIET}`);
+
+        // The same alert, still open as GitHub hasn't rescanned: nothing to do.
+        const settled = text(dir, "package-lock.json");
+        const again = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => open });
+        assert.equal(report(reportDir).outcome, "clean");
+        assert.equal(report(reportDir).alerts[0].status, "awaiting-close");
+        assert.equal(again.overrideChanges, 0);
+        assert.equal(text(dir, "package-lock.json"), settled);
+
+        // Once it is closed, glob 7.1.6 still declares ^3.0.4, so the override has to stay.
+        const closed = [{ ...MINIMATCH_ALERT, state: "fixed" as const }];
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => closed });
+        assert.equal(report(reportDir).outcome, "clean");
+        assert.deepEqual(json(dir, "package.json").overrides, { [MINIMATCH_KEY]: "3.0.5" });
+        assert.equal(text(dir, "package-lock.json"), settled);
+      });
+    }
   });
 });

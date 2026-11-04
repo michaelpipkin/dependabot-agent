@@ -217,6 +217,11 @@ describe("renderMarkdown", () => {
     assert.ok(md.includes("still needed by express"));
   });
 
+  it("says a package went away, rather than that it was added", () => {
+    const md = renderMarkdown(report({ otherChanges: [{ path: "node_modules/gone", from: "3.0.0" }] }));
+    assert.ok(md.includes("`node_modules/gone`: removed (was 3.0.0)"), md);
+  });
+
   it("truncates to MAX_BODY_CHARS, keeping Blocked, and says so", () => {
     const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
     const md = renderMarkdown(
