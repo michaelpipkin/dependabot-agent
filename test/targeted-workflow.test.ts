@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { generateKeyPairSync, verify } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -40,12 +39,12 @@ interface Job {
 }
 interface Workflow {
   on: { workflow_call: { inputs: Record<string, Input>; secrets: Record<string, { required?: boolean }> } };
-  jobs: { plan: Job; publish: Job };
+  jobs: { alerts: Job; plan: Job; publish: Job };
 }
 
 const text = readFileSync(WORKFLOW, "utf-8");
 const wf = yaml.load(text) as Workflow;
-const steps = [...wf.jobs.plan.steps, ...wf.jobs.publish.steps];
+const steps = [...wf.jobs.alerts.steps, ...wf.jobs.plan.steps, ...wf.jobs.publish.steps];
 
 const have = (tool: string): boolean => spawnSync("bash", ["-c", `command -v ${tool}`]).status === 0;
 
@@ -86,6 +85,7 @@ describe("targeted workflow: shape", () => {
 
   it("asks for only the permissions it uses", () => {
     // The PR is opened with its own token, so GITHUB_TOKEN only checks out and manages the issue.
+    assert.deepEqual(wf.jobs.alerts.permissions, {});
     assert.deepEqual(wf.jobs.plan.permissions, { contents: "read" });
     assert.deepEqual(wf.jobs.publish.permissions, { contents: "read", issues: "write" });
   });
@@ -119,9 +119,9 @@ describe("targeted workflow: tokens", () => {
     assert.match(text, /uses: peter-evans\/create-pull-request@[0-9a-f]{40} # v\d+\.\d+\.\d+\r?\n/);
   });
 
-  it("gives the alerts token to the agent step and nowhere else", () => {
-    assert.deepEqual(holdersOf("secrets.alerts-token"), ["agent"]);
-    assert.equal(findStep("agent").env?.GITHUB_TOKEN, "${{ steps.app-alerts.outputs.token || secrets.alerts-token }}");
+  it("gives the alerts token to the step that fetches the alerts and nowhere else", () => {
+    assert.deepEqual(holdersOf("secrets.alerts-token"), ["fetch"]);
+    assert.equal(findStep("fetch").env?.GH_TOKEN, "${{ steps.app-alerts.outputs.token || secrets.alerts-token }}");
   });
 
   it("gives the pull request token to the pull request step and nowhere else", () => {
@@ -130,13 +130,14 @@ describe("targeted workflow: tokens", () => {
     assert.deepEqual(holdersOf("steps.app-pr.outputs.token"), [pr]);
   });
 
-  it("gives the App's read token to the agent step and nowhere else", () => {
-    assert.deepEqual(holdersOf("steps.app-alerts.outputs.token"), ["agent"]);
+  it("gives the App's read token to the step that fetches the alerts and nowhere else", () => {
+    assert.deepEqual(holdersOf("steps.app-alerts.outputs.token"), ["fetch"]);
   });
 
-  it("never gives the agent step a token that can write", () => {
-    const agent = JSON.stringify(findStep("agent"));
-    for (const secret of ["pr-token", "app-private-key", "app-pr"]) assert.ok(!agent.includes(secret), secret);
+  it("gives the agent step no token at all", () => {
+    const agent = findStep("agent");
+    assert.deepEqual(Object.keys(agent.env ?? {}).filter((name) => /token/i.test(name)), []);
+    assert.ok(!/token|secrets\./i.test(JSON.stringify(agent)));
   });
 
   it("names the PR branch and base", () => {
@@ -159,30 +160,51 @@ const git = (cwd: string, ...args: string[]): string => {
   return result.stdout;
 };
 
-describe("targeted workflow: two jobs, so the agent can't reach the writing step through hooks or the environment", () => {
-  const { plan, publish } = wf.jobs;
-  const inPlan = withoutPresenceChecks(plan.steps);
-  const inPublish = withoutPresenceChecks(publish.steps);
+describe("targeted workflow: three jobs, so the agent's job holds no secret", () => {
+  const { alerts, plan, publish } = wf.jobs;
+  const inJob = (job: Job, action: string): Step => {
+    const step = job.steps.find((s) => s.uses?.startsWith(action));
+    assert.ok(step, `no ${action}`);
+    return step;
+  };
 
-  it("runs the agent in plan, and none of its code in publish", () => {
+  // A job's secrets are in its runner's memory, and hosted runners give steps sudo, so even
+  // asking whether a secret was passed would put it there. Nothing is exempt from this.
+  it("refers to no secret anywhere in plan, not even to ask whether one was passed", () => {
+    assert.ok(!JSON.stringify(plan).includes("secrets."));
+    assert.ok(!JSON.stringify(plan).includes("github.token"));
+    assert.ok(!JSON.stringify(plan).includes("create-github-app-token"));
+    assert.ok(!text.includes("secrets: inherit"));
+  });
+
+  it("runs the agent in plan, and none of its code anywhere else", () => {
     assert.ok(plan.steps.some((s) => s.id === "agent"));
-    assert.ok(!/dependabot-agent@|npx|setup-node/.test(inPublish));
+    for (const job of [alerts, publish]) assert.ok(!/dependabot-agent@|npx|setup-node/.test(JSON.stringify(job.steps)));
   });
 
-  // Not out of the runner's memory: see "What the agent's code can reach" in the README.
-  it("keeps every credential that can write out of the environment of plan's steps", () => {
-    for (const value of ["secrets.pr-token", "steps.app-pr", "create-pull-request", "create-github-app-token", "github.token"]) assert.ok(!inPlan.includes(value), value);
+  it("checks the credentials first, and runs plan only if they passed, even when fetching failed", () => {
+    assert.equal(alerts.steps[0].id, "credentials");
+    assert.equal(plan.needs, "alerts");
+    assert.match(plan.if ?? "", /!cancelled\(\)/);
+    assert.match(plan.if ?? "", /needs\.alerts\.outputs\.credentials-ok == 'true'/);
   });
 
-  it("gives plan's only use of the private key to a step with no post step, finished before the agent starts", () => {
-    assert.deepEqual(plan.steps.filter((s) => withoutPresenceChecks(s).includes("secrets.app-private-key")).map((s) => s.id), ["app-alerts"]);
-    const step = findStep("app-alerts");
-    assert.equal(step.uses, undefined, "an action's post step would get the key back after the agent has run");
-    assert.ok(plan.steps.indexOf(step) < plan.steps.indexOf(findStep("agent")));
+  it("runs the agent only with alerts to read, and reports it otherwise", () => {
+    const fetch = findStep("fetch-alerts");
+    assert.equal(fetch["continue-on-error"], true);
+    assert.equal(condition(findStep("agent")), "${{ steps.fetch-alerts.outcome == 'success' }}");
+    assert.equal(condition(findStep("report")), "");
+    assert.match(findStep("agent").run ?? "", /--alerts-file "\$AGENT_ALERTS_FILE"/);
   });
 
-  it("passes no credential to any action in plan", () => {
-    for (const step of plan.steps.filter((s) => s.uses)) assert.ok(!JSON.stringify(step).includes("secrets."), step.name ?? "");
+  it("carries the alerts from alerts to plan, under one name and path", () => {
+    const up = inJob(alerts, "actions/upload-artifact");
+    const down = inJob(plan, "actions/download-artifact");
+    assert.equal(up.with?.name, down.with?.name);
+    assert.equal(up.with?.path, "${{ runner.temp }}/agent-alerts/alerts.json");
+    assert.equal(down.with?.path, "${{ runner.temp }}/agent-alerts");
+    assert.equal(findStep("agent").env?.AGENT_ALERTS_FILE, "${{ runner.temp }}/agent-alerts/alerts.json");
+    assert.equal(String(up.with?.["retention-days"]), "1");
   });
 
   it("runs publish after plan, on a failed plan too, but not on a dry run or when plan never read a report", () => {
@@ -192,17 +214,17 @@ describe("targeted workflow: two jobs, so the agent can't reach the writing step
     assert.match(publish.if ?? "", /needs\.plan\.outputs\.outcome != ''/);
   });
 
-  it("passes on only the report and the patch", () => {
-    const upload = findStep("actions/upload-artifact");
-    const paths = String(upload.with?.path).split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
+  it("passes on only the report and the patch from plan", () => {
+    const up = inJob(plan, "actions/upload-artifact");
+    const paths = String(up.with?.path).split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
     assert.deepEqual(paths, ["${{ runner.temp }}/agent-report/report.md", "${{ runner.temp }}/agent-report/fixes.patch"]);
-    assert.equal(upload.with?.name, findStep("actions/download-artifact").with?.name);
-    assert.equal(String(upload.with?.["retention-days"]), "1");
+    assert.equal(up.with?.name, inJob(publish, "actions/download-artifact").with?.name);
+    assert.equal(String(up.with?.["retention-days"]), "1");
   });
 
   it("pins the actions that carry the results or a credential", () => {
     for (const action of ["actions/upload-artifact", "actions/download-artifact", "actions/create-github-app-token"]) {
-      assert.match(findStep(action).uses ?? "", new RegExp(`^${action}@[0-9a-f]{40}$`));
+      for (const step of steps.filter((s) => s.uses?.startsWith(action))) assert.match(step.uses ?? "", new RegExp(`^${action}@[0-9a-f]{40}$`));
       assert.match(text, new RegExp(`uses: ${action}@[0-9a-f]{40} # v\\d+\\.\\d+\\.\\d+\\r?\\n`));
     }
   });
@@ -351,19 +373,14 @@ describe("targeted workflow: the patch between the jobs", { skip: !(have("git") 
 describe("targeted workflow: a GitHub App", () => {
   const indexOf = (id: string): number => steps.findIndex((s) => s.id === id);
 
-  it("asks for a token for the agent that can only read alerts", () => {
+  it("makes a token that can only read alerts, to fetch them", () => {
     const step = findStep("app-alerts");
     assert.match(condition(step), /inputs\.app-client-id != ''/);
-    assert.equal(step.env?.APP_CLIENT_ID, "${{ inputs.app-client-id }}");
-    assert.equal(step.env?.APP_PRIVATE_KEY, "${{ secrets.app-private-key }}");
-    assert.match(step.run ?? "", /permissions: \{vulnerability_alerts: "read"\}/);
-    assert.ok(indexOf("app-alerts") < indexOf("agent"));
-  });
-
-  it("carries on if that token can't be made, so a dead key is reported as a failed run", () => {
-    assert.equal(findStep("app-alerts")["continue-on-error"], true);
-    assert.equal(condition(findStep("agent")), "");
-    assert.equal(condition(findStep("report")), "");
+    assert.equal(step.with?.["client-id"], "${{ inputs.app-client-id }}");
+    assert.equal(step.with?.["private-key"], "${{ secrets.app-private-key }}");
+    const permissions = Object.entries(step.with ?? {}).filter(([key]) => key.startsWith("permission-"));
+    assert.deepEqual(permissions, [["permission-vulnerability-alerts", "read"]]);
+    assert.ok(indexOf("app-alerts") < indexOf("fetch"));
   });
 
   it("makes the token that can write only for the pull request step, and only when that step will run", () => {
@@ -386,7 +403,7 @@ describe("targeted workflow: a GitHub App", () => {
 describe("targeted workflow: which credentials were passed", { skip: !have("bash") && "needs bash" }, () => {
   const check = (vars: Partial<Record<"HAS_APP_CLIENT_ID" | "HAS_APP_PRIVATE_KEY" | "HAS_ALERTS_TOKEN" | "HAS_PR_TOKEN", boolean>>) => {
     const names = ["HAS_APP_CLIENT_ID", "HAS_APP_PRIVATE_KEY", "HAS_ALERTS_TOKEN", "HAS_PR_TOKEN"] as const;
-    const exports = names.map((name) => `export ${name}=${vars[name] === true}`).join("; ");
+    const exports = ["export GITHUB_OUTPUT=/dev/null", ...names.map((name) => `export ${name}=${vars[name] === true}`)].join("; ");
     const run = spawnSync("bash", ["-c", `${exports}\n${findStep("credentials").run}`], { encoding: "utf-8" });
     return { status: run.status, out: `${run.stdout}${run.stderr}` };
   };
@@ -516,7 +533,8 @@ describe("targeted workflow: gates", () => {
     const last = planSteps[planSteps.length - 1];
     assert.match(condition(last), /outputs\.outcome == 'failed'/);
     assert.match(last.run ?? "", /exit 1/);
-    assert.ok(planSteps.indexOf(findStep("actions/upload-artifact")) < planSteps.length - 1);
+    const saved = planSteps.findIndex((s) => s.uses?.startsWith("actions/upload-artifact"));
+    assert.ok(saved !== -1 && saved < planSteps.length - 1);
     assert.equal(condition(findStep("issue")), "${{ !cancelled() }}");
   });
 
@@ -598,89 +616,35 @@ function runStep(step: Step, box: Sandbox, env: Record<string, string>): { statu
 const reportJson = (extra: Record<string, unknown>): string =>
   JSON.stringify({ outcome: "changes", dryRun: false, blockedCount: 0, alerts: [], ...extra });
 
-// Not on Windows: the job only ever runs on ubuntu-latest, and the key reaches openssl
-// through bash's process substitution, a path a native Windows openssl can't open.
-const canMint = canRun && have("openssl") && have("curl") && process.platform !== "win32";
-
-describe("targeted workflow: making the read token", { skip: !canMint && "needs Linux or macOS, with bash, jq, openssl and curl" }, () => {
-  const toBash = (p: string): string => p.replace(/\\/g, "/");
-  const CLIENT_ID = "Iv23liTEST";
-  const { publicKey, privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: "spki", format: "pem" },
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-  });
-
-  /** Runs the step with a stand-in curl that answers by URL, and records what it was asked. */
-  const mint = (answers: { installation: [number, string]; token: [number, string] }, key = privateKey) => {
+describe("targeted workflow: fetching the alerts", { skip: !canRun && "needs bash and jq" }, () => {
+  const fetchWith = (gh: string): { status: number | null; alerts: unknown } => {
     const box = sandbox();
     try {
-      const calls = toBash(join(box.dir, "curl.log"));
-      const curl = [
-        "#!/bin/bash",
-        `printf '%s\\n' "$*" >> '${calls}'`,
-        'case "$*" in',
-        `  *access_tokens*) printf '%s\\n%s' '${answers.token[1]}' '${answers.token[0]}' ;;`,
-        `  *) printf '%s\\n%s' '${answers.installation[1]}' '${answers.installation[0]}' ;;`,
-        "esac",
-        "",
-      ].join("\n");
-      writeFileSync(join(box.dir, "bin", "curl"), curl);
-      chmodSync(join(box.dir, "bin", "curl"), 0o755);
-      const got = runStep(findStep("app-alerts"), box, { APP_CLIENT_ID: CLIENT_ID, APP_PRIVATE_KEY: key, GITHUB_API_URL: "https://api.github.example" });
-      return { ...got, calls: existsSync(join(box.dir, "curl.log")) ? readFileSync(join(box.dir, "curl.log"), "utf-8") : "" };
+      const dir = join(box.dir, "agent-alerts");
+      writeFileSync(join(box.dir, "bin", "gh"), `#!/bin/bash\n${gh}\n`);
+      chmodSync(join(box.dir, "bin", "gh"), 0o755);
+      const got = runStep(findStep("fetch"), box, { AGENT_ALERTS_DIR: dir.replace(/\\/g, "/") });
+      const file = join(dir, "alerts.json");
+      return { status: got.status, alerts: existsSync(file) && readFileSync(file, "utf-8") ? JSON.parse(readFileSync(file, "utf-8")) : null };
     } finally {
       rmSync(box.dir, { recursive: true, force: true });
     }
   };
-  const GOOD = { installation: [200, '{"id":77}'] as [number, string], token: [201, '{"token":"ghs_made"}'] as [number, string] };
 
-  it("signs a token GitHub would accept, naming the App by its Client ID", () => {
-    const { calls, status } = mint(GOOD);
-    assert.equal(status, 0);
-    const jwt = /Authorization: Bearer (\S+)/.exec(calls)?.[1] ?? "";
-    const [header, claims, signature] = jwt.split(".");
-    const decode = (part: string): Record<string, unknown> => JSON.parse(Buffer.from(part, "base64url").toString());
-    assert.deepEqual(decode(header), { alg: "RS256", typ: "JWT" });
-    const body = decode(claims) as { iss: string; iat: number; exp: number };
-    assert.equal(body.iss, CLIENT_ID);
-    assert.ok(body.exp - body.iat <= 600, "GitHub refuses more than ten minutes");
-    assert.ok(body.iat < Date.now() / 1000 && body.exp > Date.now() / 1000);
-    assert.ok(verify("RSA-SHA256", Buffer.from(`${header}.${claims}`), publicKey, Buffer.from(signature, "base64url")));
+  it("joins the pages into one list", () => {
+    const got = fetchWith(`printf '[{"number":1}]\\n[{"number":2},{"number":3}]\\n'`);
+    assert.equal(got.status, 0);
+    assert.deepEqual(got.alerts, [{ number: 1 }, { number: 2 }, { number: 3 }]);
   });
 
-  it("asks for read access to alerts on this repository, and nothing more", () => {
-    const { calls, output } = mint(GOOD);
-    assert.match(calls, /repos\/acme\/app\/installation/);
-    assert.match(calls, /app\/installations\/77\/access_tokens/);
-    assert.ok(calls.includes('{"repositories":["app"],"permissions":{"vulnerability_alerts":"read"}}'), calls);
-    assert.equal(output.token, "ghs_made");
+  it("writes an empty list when there are no alerts", () => {
+    const got = fetchWith(`printf '[]\\n'`);
+    assert.equal(got.status, 0);
+    assert.deepEqual(got.alerts, []);
   });
 
-  it("never writes the private key or the signature's input to its output", () => {
-    const { output, summary } = mint(GOOD);
-    assert.ok(!JSON.stringify(output).includes("PRIVATE KEY"));
-    assert.ok(!summary.includes("PRIVATE KEY"));
-  });
-
-  const failures: Array<[string, Partial<typeof GOOD>]> = [
-    ["the App isn't installed", { installation: [404, '{"message":"Not Found"}'] }],
-    ["GitHub refuses the key", { installation: [401, '{"message":"A JSON web token could not be decoded"}'] }],
-    ["GitHub refuses the token", { token: [422, '{"message":"The permissions requested are not granted to this installation."}'] }],
-  ];
-  for (const [label, answers] of failures) {
-    it(`fails, with no token, when ${label}`, () => {
-      const got = mint({ ...GOOD, ...answers });
-      assert.equal(got.status, 1);
-      assert.equal(got.output.token, undefined);
-    });
-  }
-
-  it("fails, with no token, on a key that can't sign", () => {
-    const got = mint(GOOD, "not a key");
-    assert.equal(got.status, 1);
-    assert.equal(got.output.token, undefined);
-    assert.equal(got.calls, "");
+  it("fails when GitHub refuses, rather than passing on an empty list", () => {
+    assert.notEqual(fetchWith(`echo 'HTTP 403' >&2; exit 1`).status, 0);
   });
 });
 
@@ -739,6 +703,18 @@ describe("targeted workflow: reading the report", { skip: !canRun && "needs bash
       assert.match(got.report, /no report/i);
       assert.match(got.report, /https:\/\/github\.example\/acme\/app\/actions\/runs\/42/);
       assert.equal(got.summary, got.report);
+    } finally {
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the alerts couldn't be fetched when the agent never ran", () => {
+    const box = sandbox();
+    try {
+      const got = read(box, "skipped");
+      assert.equal(got.output.outcome, "failed");
+      assert.match(got.report, /alerts could not be fetched/);
+      assert.match(got.report, /https:\/\/github\.example\/acme\/app\/actions\/runs\/42/);
     } finally {
       rmSync(box.dir, { recursive: true, force: true });
     }
