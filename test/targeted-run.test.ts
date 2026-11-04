@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { join, relative } from "node:path";
@@ -8,7 +8,7 @@ import semver from "semver";
 import type { ResolvedConfig } from "../src/config.js";
 import { NpmRunner, resolveCommand } from "../src/targeted/apply.js";
 import type { RunReport } from "../src/targeted/report.js";
-import { assertTargetedSupported, groupAlertsByNearestLockfile, isWorkspaceMember, runTargeted, type TargetedDeps } from "../src/targeted/run.js";
+import { assertTargetedSupported, groupAlertsByNearestLockfile, runTargeted, type TargetedDeps } from "../src/targeted/run.js";
 import type { DependabotAlert } from "../src/types.js";
 import { AgentError } from "../src/util.js";
 
@@ -771,19 +771,6 @@ describe("workspace members the lockfile holds", () => {
       (e: Error) => e instanceof AgentError && /apps\/web\/site is a workspace member/.test(e.message),
     );
   });
-
-  it("isWorkspaceMember reads patterns as npm does", () => {
-    const patterns = (include: string[], exclude: string[] = []) => ({ include, exclude });
-    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/**"])), true);
-    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/*/*"])), true);
-    assert.equal(isWorkspaceMember("apps/web/site", patterns(["apps/*"])), false);
-    assert.equal(isWorkspaceMember("packages/a", patterns(["packages/*"])), true);
-    assert.equal(isWorkspaceMember("packages/a", patterns(["./packages/*"])), true);
-    assert.equal(isWorkspaceMember("packages/a", patterns(["packages/**"], ["packages/a"])), false);
-    assert.equal(isWorkspaceMember("libs/site", patterns([])), false);
-    assert.equal(isWorkspaceMember("a/x/b", patterns(["a/**/b"])), true);
-    assert.equal(isWorkspaceMember("a/b", patterns(["a/**/b"])), true);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1010,5 +997,177 @@ describe("grouping alerts by the nearest lockfile", () => {
       [...groups].map(([dir, list]) => [path.relative(root, dir), list.length]),
       [["", 3], ["functions", 2], ["other", 0]],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workspace globs are npm's business: anything the lockfile holds that no file: spec reaches is a member
+// ---------------------------------------------------------------------------
+
+describe("workspace patterns this tool doesn't read", () => {
+  for (const pattern of ["apps/{web,api}", "apps/[wa]*", "apps\\*"]) {
+    it(`a member under ${pattern} is bumped with -w, not blocked as a file: package`, async () => {
+      const dir = tempDir();
+      writeProject(dir, {
+        root: { workspaces: [pattern] },
+        placed: { "apps/web": { name: "web", dependencies: { minimatch: "^3.0.4" } } },
+        packages: { "node_modules/minimatch": { version: "3.0.4" } },
+      });
+      const npm = fakeNpm();
+      await runTargeted(cfgFor(dir), depsFor([MM_ALERT], npm));
+      assert.ok(npm.commands.some((c) => c.startsWith("npm install minimatch@3.0.5 -w apps/web ")), npm.commands.join("\n"));
+      assert.deepEqual(readJson(join(dir, "apps", "web", "package.json")).dependencies, { minimatch: "^3.0.5" });
+    });
+
+    it(`a member under ${pattern} that reaches the copy through glob gets the temporary-root owners`, async () => {
+      const dir = tempDir();
+      writeProject(dir, {
+        root: { workspaces: [pattern] },
+        placed: { "apps/web": { name: "web", dependencies: { glob: "^7.1.6" } } },
+        packages: {
+          "node_modules/glob": { version: "7.1.6", dependencies: { minimatch: "^3.0.4" } },
+          "node_modules/minimatch": { version: "3.0.4" },
+        },
+      });
+      const npm = fakeNpm({ reachableVia: "glob" });
+      await runTargeted(cfgFor(dir), depsFor([MM_ALERT], npm));
+      assert.ok(npm.roots.some((r) => r.devDependencies?.glob === "^7.1.6"));
+      assert.equal(readLock(dir).packages["node_modules/minimatch"].version, "3.0.5");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// file: packages outside the root are never read, snapshotted or written
+// ---------------------------------------------------------------------------
+
+describe("a file: package outside the repository", () => {
+  function externalProject(siblingDeps: Json, extra: Record<string, Json> = {}): { repo: string; sibling: string } {
+    const base = tempDir();
+    const repo = join(base, "repo");
+    writeProject(repo, {
+      root: { dependencies: { glob: "^7.1.6", a: "^1.0.0", x: "file:../x" } },
+      placed: { "../x": { name: "x", dependencies: siblingDeps } },
+      packages: {
+        "node_modules/glob": { version: "7.1.6", dependencies: { minimatch: "^3.0.4" } },
+        "node_modules/minimatch": { version: "3.0.4" },
+        "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/qs": { version: "6.5.0" },
+        "node_modules/ms": { version: "2.0.0" },
+        ...extra,
+      },
+    });
+    return { repo, sibling: join(base, "x") };
+  }
+
+  /** The alert's verdict on its copy, with the sibling checked out or not. */
+  async function verdicts(siblingDeps: Json, alerts: DependabotAlert[]): Promise<Array<{ reason?: string; detail?: string; commands: string[] }>> {
+    const out = [];
+    for (const present of [true, false]) {
+      const { repo, sibling } = externalProject(siblingDeps);
+      if (!present) rmSync(sibling, { recursive: true });
+      const reportDir = tempDir();
+      const npm = fakeNpm();
+      await runTargeted(cfgFor(repo, { reportDir }), depsFor(alerts, npm));
+      const copy = reportIn(reportDir).alerts[0].copies[0];
+      out.push({ reason: copy.reason, detail: copy.detail, commands: npm.commands });
+    }
+    return out;
+  }
+
+  it("a pin there blocks the alert whether or not the sibling is checked out", async () => {
+    const [present, absent] = await verdicts({ minimatch: "3.0.4" }, [MM_ALERT]);
+    assert.equal(present.reason, "pin");
+    assert.deepEqual(absent, present);
+    assert.deepEqual(present.commands, []);
+  });
+
+  it("a range there is blocked, never bumped with -w ../x, whether or not it is checked out", async () => {
+    const [present, absent] = await verdicts({ minimatch: "^3.0.4" }, [MM_ALERT]);
+    assert.equal(present.reason, "unrewritable-spec");
+    assert.match(present.detail ?? "", /file: dependency/);
+    assert.deepEqual(absent, present);
+    assert.ok(present.commands.every((c) => !c.includes("../x")));
+  });
+
+  it("a failed run leaves the sibling's file untouched, bytes and mtime", async () => {
+    const { repo, sibling } = externalProject({ ms: "^2.0.0" });
+    const file = join(sibling, "package.json");
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(file, old, old);
+    const bytes = readFileSync(file);
+    const mtime = statSync(file).mtimeMs;
+    const npm = fakeNpm({ failIn: repo });
+
+    await assert.rejects(runTargeted(cfgFor(repo), depsFor([qsAlert()], npm)), /failed verification in root/);
+
+    assert.ok(npm.commands.length > 0, "the run did try to apply a fix");
+    assert.ok(npm.commands.every((c) => !c.includes("../x")));
+    assert.ok(readFileSync(file).equals(bytes));
+    assert.equal(statSync(file).mtimeMs, mtime, "restore didn't rewrite it");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// When putting the files back fails
+// ---------------------------------------------------------------------------
+
+describe("a restore that fails", () => {
+  it("tries every file, says so in the report, and keeps the original error beside the restore error", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      members: { a: { dependencies: { a1: "^1.0.0" } } },
+      packages: {
+        "node_modules/a1": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+        "node_modules/qs": { version: "6.5.0" },
+      },
+    });
+    const rootBefore = readFileSync(join(dir, "package.json"), "utf-8");
+    const lockBefore = readFileSync(join(dir, "package-lock.json"), "utf-8");
+    // npm dies after taking the member's directory with it, so its manifest can't be written back.
+    const run: NpmRunner = (_command, cwd) => {
+      rmSync(join(cwd, "packages", "a"), { recursive: true, force: true });
+      throw new Error("npm died");
+    };
+
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], { run })),
+      (e: Error) =>
+        e instanceof AgentError &&
+        /failed verification in root: stable/.test(e.message) &&
+        /Restoring the files failed/.test(e.message) &&
+        /Could not restore 1 file\(s\)/.test(e.message) &&
+        !/Every file was restored/.test(e.message),
+    );
+
+    assert.equal(readFileSync(join(dir, "package.json"), "utf-8"), rootBefore, "one bad path didn't strand the others");
+    assert.equal(readFileSync(join(dir, "package-lock.json"), "utf-8"), lockBefore);
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "failed");
+    assert.match(report.restoreError ?? "", /Could not restore 1 file/);
+    assert.match(report.failures[0].detail, /npm died/);
+    const md = reportMd(reportDir);
+    assert.match(md, /restoring the files failed too/);
+    assert.doesNotMatch(md, /No changes were kept/);
+  });
+});
+
+describe("a failed report that can't be written", () => {
+  it("is published once, so the specific failure stays what is reported", async () => {
+    const dir = tempDir();
+    const reportDir = join(tempDir(), "taken");
+    writeFileSync(reportDir, "a file, not a directory");
+    writeProject(dir, qsProject());
+
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert()], fakeNpm({ failIn: dir }))),
+      /failed verification in root: stable/,
+    );
+
+    const printed = logs.filter((l) => l.includes("## Failures"));
+    assert.equal(printed.length, 1, "one report, not two");
+    assert.match(printed[0], /\*\*stable\*\*/);
+    assert.doesNotMatch(printed[0], /\*\*run\*\*/);
   });
 });

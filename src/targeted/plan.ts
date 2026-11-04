@@ -58,6 +58,8 @@ export interface ManifestInfo {
   deps: DirectDep[];
   /** A package the lockfile holds at its own path that isn't a workspace member (a `file:` dependency): npm can't `-w` it. */
   notWorkspace?: boolean;
+  /** Outside the root: its declarations came from the lockfile, and nothing reads, snapshots or writes it. */
+  external?: boolean;
 }
 export interface PlanInput {
   alerts: DependabotAlert[];

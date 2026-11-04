@@ -194,6 +194,28 @@ describe("snapshotFiles", () => {
     snap.restore();
     assert.throws(() => readFileSync(file), /ENOENT/);
   });
+
+  it("tries every file even when one can't be restored, then reports all the failures together", () => {
+    const dir = tempDir();
+    const first = join(dir, "gone", "a.json");
+    const second = join(dir, "b.json");
+    const third = join(dir, "gone", "c.json");
+    const fourth = join(dir, "d.json");
+    mkdirSync(join(dir, "gone"));
+    for (const file of [first, second, third, fourth]) writeFileSync(file, "original");
+    const snap = snapshotFiles([first, second, third, fourth]);
+    writeFileSync(second, "changed");
+    writeFileSync(fourth, "changed");
+    // A directory that has vanished makes its files unwritable.
+    rmSync(join(dir, "gone"), { recursive: true });
+
+    assert.throws(
+      () => snap.restore(),
+      (e: Error) => /Could not restore 2 file\(s\)/.test(e.message) && e.message.includes("a.json") && e.message.includes("c.json"),
+    );
+    assert.equal(readFileSync(second, "utf-8"), "original", "the files after the first failure are restored too");
+    assert.equal(readFileSync(fourth, "utf-8"), "original");
+  });
 });
 
 describe("applyPlan", () => {

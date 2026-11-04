@@ -54,11 +54,18 @@ function failureDetail(e: unknown): string {
 export function snapshotFiles(paths: string[]): Snapshot {
   const saved = paths.map((path) => ({ path, bytes: existsSync(path) ? readFileSync(path) : null }));
   return {
+    /** Every file is tried, so one that can't be written doesn't strand the others; all failures come back together. */
     restore() {
+      const failed: string[] = [];
       for (const { path, bytes } of saved) {
-        if (bytes === null) rmSync(path, { force: true });
-        else writeFileSync(path, bytes);
+        try {
+          if (bytes === null) rmSync(path, { force: true });
+          else writeFileSync(path, bytes);
+        } catch (e) {
+          failed.push(`${path} (${messageOf(e)})`);
+        }
       }
+      if (failed.length > 0) throw new Error(`Could not restore ${failed.length} file(s): ${failed.join("; ")}`);
     },
   };
 }
@@ -242,7 +249,9 @@ const manifestLabel = (lockPath: string): string => (lockPath ? `${lockPath}/pac
 /** The text of the root's and every listed member's manifest, by the label verification uses. */
 function readManifests(dir: string, manifests: ManifestInfo[]): Map<string, string | null> {
   const files = new Map<string, string>([["package.json", join(dir, "package.json")]]);
-  for (const manifest of manifests) files.set(manifestLabel(manifest.lockPath), join(manifest.dir, "package.json"));
+  for (const manifest of manifests) {
+    if (!manifest.external) files.set(manifestLabel(manifest.lockPath), join(manifest.dir, "package.json"));
+  }
   const texts = new Map<string, string | null>();
   for (const [label, file] of files) texts.set(label, existsSync(file) ? readFileSync(file, "utf-8") : null);
   return texts;

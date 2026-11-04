@@ -656,12 +656,12 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     });
 
     /** A member at apps/web/site under a glob no workspace reader resolves, with its own manifest. */
-    function unseenMemberProject(rootDeps: Record<string, string>, memberDeps: Record<string, string>, workspaces: string[] = ["apps/**"]): string {
+    function unseenMemberProject(rootDeps: Record<string, string>, memberDeps: Record<string, string>, workspaces: string[] = ["apps/**"], at = "apps/web/site"): string {
       const dir = mkdtempSync(join(tmpdir(), "targeted-live-"));
       dirs.push(dir);
       writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fx", version: "1.0.0", private: true, workspaces, dependencies: rootDeps }, null, 2) + "\n");
-      mkdirSync(join(dir, "apps", "web", "site"), { recursive: true });
-      writeFileSync(join(dir, "apps", "web", "site", "package.json"), JSON.stringify({ name: "site", version: "1.0.0", dependencies: memberDeps }, null, 2) + "\n");
+      mkdirSync(join(dir, at), { recursive: true });
+      writeFileSync(join(dir, at, "package.json"), JSON.stringify({ name: "site", version: "1.0.0", dependencies: memberDeps }, null, 2) + "\n");
       npm(dir, `install --before=2020-06-01 --package-lock-only ${QUIET}`);
       return dir;
     }
@@ -711,6 +711,28 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       assert.equal(versions(dir).get("node_modules/minimatch"), "3.0.5");
       npm(dir, `ci ${QUIET}`);
     });
+
+    // Patterns this tool has no reader for: npm accepted them, so what its lockfile holds is a member.
+    for (const pattern of ["apps/{web,api}", "apps/[wa]*"]) {
+      it(`a member under ${pattern} is bumped with -w, and one reached through glob goes through the temporary root`, async () => {
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+
+        const direct = unseenMemberProject({}, { minimatch: "^3.0.4" }, [pattern], "apps/web");
+        await runTargeted(cfg(direct, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+        assert.equal(report(reportDir).outcome, "changes");
+        assert.deepEqual(json(direct, "apps", "web", "package.json").dependencies, { minimatch: "^3.0.5" });
+        assert.equal(json(direct, "package.json").overrides, undefined);
+        npm(direct, `ci ${QUIET}`);
+
+        const viaGlob = unseenMemberProject({}, { glob: "^7.1.6" }, [pattern], "apps/web");
+        const rootBefore = json(viaGlob, "package.json");
+        await runTargeted(cfg(viaGlob, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+        assert.deepEqual(report(reportDir).failures, []);
+        assert.deepEqual(json(viaGlob, "package.json"), { ...rootBefore, overrides: { [MINIMATCH_KEY]: "3.0.5" } });
+        assert.equal(versions(viaGlob).get("node_modules/minimatch"), "3.0.5");
+      });
+    }
 
     function cfg(dir: string, reportDir: string): ResolvedConfig {
       return {

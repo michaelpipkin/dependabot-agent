@@ -16,6 +16,8 @@ export interface RunReport {
   /** Overrides taken out of package.json as no longer needed (or, in a dry run, that would be tried). */
   removedOverrides: Array<{ key: string; reason: string }>;
   failures: VerificationFailure[];
+  /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
+  restoreError?: string;
 }
 
 /** GitHub rejects a PR or issue body over 65536 characters; leave room. */
@@ -211,7 +213,11 @@ function buildSections(report: RunReport): Section[] {
 
   sections.push({
     heading: "Failures",
-    intro: ["The run failed, so no changes were kept. Each line names the check that failed and where.", ""],
+    intro: [
+      (report.restoreError ? "The run failed, and the files could not all be restored." : "The run failed, so no changes were kept.") +
+        " Each line names the check that failed and where.",
+      "",
+    ],
     items: report.failures.map(failureItem),
   });
 
@@ -302,7 +308,9 @@ function headerBlock(report: RunReport): string {
   if (report.dryRun) {
     lines.push("> **Dry run.** This is the plan of what the tool would do. Nothing was changed.", "");
   }
-  if (report.outcome === "failed") {
+  if (report.outcome === "failed" && report.restoreError) {
+    lines.push(`> **The run failed, and restoring the files failed too.** The working tree may hold partial changes: ${inline(report.restoreError)}`, "");
+  } else if (report.outcome === "failed") {
     lines.push("> **The run failed.** No changes were kept.", "");
   }
   // A failed run that never got as far as planning has no alerts to summarise.

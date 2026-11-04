@@ -4,6 +4,7 @@ import type { ResolvedConfig } from "../config.js";
 import { discoverIsolatedManifestDirs } from "../discover.js";
 import { fetchDependabotAlerts } from "../github.js";
 import { readDirectDependencies } from "../manifest.js";
+import type { DirectDep } from "../manifest.js";
 import { readNpmOverrides } from "../override-source.js";
 import { detectPackageManager } from "../package-manager/index.js";
 import {
@@ -21,8 +22,8 @@ import type { DependabotAlert, DependentRange } from "../types.js";
 import { AgentError, exitWithError, log, warn } from "../util.js";
 import { applyPlan, snapshotFiles, tryRemoveOverride } from "./apply.js";
 import type { NpmRunner, Snapshot } from "./apply.js";
-import { copiesOf, edgesTo, readLockfile } from "./lockfile.js";
-import type { LockIndex } from "./lockfile.js";
+import { copiesOf, edgesOf, edgesTo, readLockfile } from "./lockfile.js";
+import type { LockEntry, LockIndex } from "./lockfile.js";
 import { buildPlan } from "./plan.js";
 import type { ManifestInfo, Plan } from "./plan.js";
 import { computeOutcome, renderMarkdown, writeReport } from "./report.js";
@@ -113,65 +114,55 @@ interface Group {
   files: string[];
 }
 
-/** The root's `workspaces` patterns: included, and excluded (`!pattern`). */
-function workspacePatterns(dir: string): { include: string[]; exclude: string[] } {
-  let declared: unknown;
-  try {
-    declared = (JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as { workspaces?: unknown }).workspaces;
-  } catch {
-    return { include: [], exclude: [] };
+/** The lockfile paths that a `file:` spec resolves to: packages that npm links in but that aren't workspace members. */
+function fileDependencyPaths(lock: LockIndex): Set<string> {
+  const paths = new Set<string>();
+  for (const edge of edgesOf(lock)) {
+    const target = edge.resolved?.path;
+    if (edge.spec.trim().startsWith("file:") && target && target !== "" && !target.includes("node_modules/")) paths.add(target);
   }
-  const list = Array.isArray(declared) ? declared : (declared as { packages?: unknown } | undefined)?.packages;
-  const patterns = Array.isArray(list) ? list.filter((p): p is string => typeof p === "string") : [];
-  return {
-    include: patterns.filter((p) => !p.startsWith("!")),
-    exclude: patterns.filter((p) => p.startsWith("!")).map((p) => p.slice(1)),
-  };
+  return paths;
 }
 
-/** A workspace pattern as npm reads it: `*` within a path segment, `**` across any number of them. */
-function globToRegExp(pattern: string): RegExp {
-  const segments = pattern.replace(/^\.\//, "").replace(/\/+$/, "").split("/");
-  const source = segments
-    .map((segment, i) => {
-      const last = i === segments.length - 1;
-      if (segment === "**") return last ? ".*" : "(?:[^/]+/)*";
-      const body = segment
-        .replaceAll(/[.+^${}()|[\]\\]/g, String.raw`\$&`)
-        .replaceAll("*", "[^/]*")
-        .replaceAll("?", "[^/]");
-      return last ? body : `${body}/`;
-    })
-    .join("");
-  return new RegExp(`^${source}$`);
+/** Whether a directory is outside the root: nothing there is read, snapshotted or written. */
+function isOutside(root: string, target: string): boolean {
+  const relative = posix(path.relative(root, target));
+  return relative === ".." || relative.startsWith("../") || path.isAbsolute(relative);
 }
 
-/** Whether a lockfile path is a workspace member under the root's declared patterns. */
-export function isWorkspaceMember(lockPath: string, patterns: { include: string[]; exclude: string[] }): boolean {
-  const matches = (list: string[]): boolean => list.some((pattern) => globToRegExp(pattern).test(lockPath));
-  return matches(patterns.include) && !matches(patterns.exclude);
+/** What the lockfile records a package as declaring, for one that isn't read from disk. */
+function declaredInLock(entry: LockEntry): DirectDep[] {
+  const fields = ["dependencies", "devDependencies", "optionalDependencies"] as const;
+  return fields.flatMap((field) => Object.entries(entry[field]).map(([name, spec]) => ({ name, spec, field })));
 }
 
 /**
  * The root and every package the lockfile holds at its own path (no node_modules, not a
- * link): workspace members, and `file:` dependencies, which share that shape. Read from
- * the lockfile, so it doesn't depend on how a workspace glob is written. A `file:` package
- * counts for pins and declarations but is marked, since npm can't `-w` it.
+ * link). Read from the lockfile, so it doesn't depend on how a workspace glob is written:
+ * whatever isn't reached by a `file:` spec is a workspace member. A `file:` package counts
+ * for pins and declarations but is marked, since npm can't `-w` it. One outside the root is
+ * never read from disk (it may not be checked out), and so can't be snapshotted or written:
+ * its declarations come from the lockfile.
  */
 function manifestsOf(dir: string, lock: LockIndex): ManifestInfo[] {
   const manifests: ManifestInfo[] = [{ dir, lockPath: "", deps: readDirectDependencies(dir) }];
-  const patterns = workspacePatterns(dir);
+  const filePaths = fileDependencyPaths(lock);
   for (const [lockPath, entry] of lock.entries) {
-    if (lockPath === "" || lockPath.includes("node_modules/") || entry.link) continue;
+    if (lockPath === "" || posix(lockPath).includes("node_modules/") || entry.link) continue;
     const memberDir = path.resolve(dir, lockPath);
-    const member = isWorkspaceMember(lockPath, patterns);
-    if (!existsSync(path.join(memberDir, "package.json"))) {
-      if (member) {
-        exitWithError(`${lockPath} is a workspace member in ${path.join(dir, "package-lock.json")}, but ${path.join(memberDir, "package.json")} doesn't exist.`);
-      }
-      continue;
+    const external = isOutside(dir, memberDir);
+    const file = external || filePaths.has(lockPath);
+    const onDisk = !external && existsSync(path.join(memberDir, "package.json"));
+    if (!onDisk && !file) {
+      exitWithError(`${lockPath} is a workspace member in ${path.join(dir, "package-lock.json")}, but ${path.join(memberDir, "package.json")} doesn't exist.`);
     }
-    manifests.push({ dir: memberDir, lockPath, deps: readDirectDependencies(memberDir), ...(member ? {} : { notWorkspace: true }) });
+    manifests.push({
+      dir: memberDir,
+      lockPath,
+      deps: onDisk ? readDirectDependencies(memberDir) : declaredInLock(entry),
+      ...(file ? { notWorkspace: true } : {}),
+      ...(external ? { external: true } : {}),
+    });
   }
   return manifests;
 }
@@ -338,7 +329,27 @@ const plannedChangesOf = (plan: Plan): number => {
 interface RunState {
   alerts: RunReport["alerts"];
   reported: boolean;
+  /** Restoring the snapshot has been tried. */
+  restored: boolean;
+  /** Set if it failed: the files may be left half-changed. */
+  restoreError?: string;
 }
+
+/** Put every file back. A failure is kept, not thrown, so it can't hide the error that made the restore necessary. */
+function restoreAll(snapshot: Snapshot, state: RunState): void {
+  state.restored = true;
+  try {
+    snapshot.restore();
+  } catch (e) {
+    state.restoreError = messageOf(e);
+    warn(state.restoreError);
+  }
+}
+
+const restoreNote = (state: RunState): string =>
+  state.restoreError
+    ? `Restoring the files failed, so the working tree may hold partial changes: ${state.restoreError}`
+    : "Every file was restored to how it was before the run.";
 
 type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts">;
 
@@ -357,7 +368,17 @@ function publish(report: RunReport, cfg: ResolvedConfig, state: RunState): void 
 
 /** A failed run's report must never hide why the run failed, so a failure to write it is only a warning. */
 function publishFailed(failures: VerificationFailure[], base: ReportBase, cfg: ResolvedConfig, state: RunState): void {
-  const report: RunReport = { ...base, outcome: "failed", otherChanges: [], keptOverrides: [], removedOverrides: [], failures };
+  const report: RunReport = {
+    ...base,
+    outcome: "failed",
+    otherChanges: [],
+    keptOverrides: [],
+    removedOverrides: [],
+    failures,
+    ...(state.restoreError ? { restoreError: state.restoreError } : {}),
+  };
+  // Set first: if the write fails, the cause is still this report's failure, not a new one made of the write error.
+  state.reported = true;
   try {
     publish(report, cfg, state);
   } catch (e) {
@@ -366,14 +387,14 @@ function publishFailed(failures: VerificationFailure[], base: ReportBase, cfg: R
   }
 }
 
-function failureMessage(group: Group, failures: VerificationFailure[]): string {
+function failureMessage(group: Group, failures: VerificationFailure[], state: RunState): string {
   const [first, ...rest] = failures;
   const where = first.path ? ` on ${first.path}` : "";
   const more = rest.length > 0 ? ` (and ${rest.length} more)` : "";
   const detail = first.detail.split("\n")[0].replace(/\.$/, "");
   return (
     `The targeted run failed verification in ${group.label}: ${first.check}${where}: ${detail}${more}. ` +
-    `Every file was restored to how it was before the run.`
+    restoreNote(state)
   );
 }
 
@@ -406,7 +427,7 @@ async function planGroups(
       published,
       updateWorkspaceMembers: cfg.updateWorkspaceMembers,
     });
-    const manifestFiles = manifests.map((m) => path.join(m.dir, "package.json"));
+    const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
     const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...manifestFiles])];
     groups.push({ dir, label, prefix, manifests, before: lock, plan, files });
   }
@@ -431,10 +452,10 @@ function applyGroups(
     if (planned > 0) log(`\n🔧 Applying ${group.label}`);
     const failures = applyPlan(group.dir, group.plan, { limits: cfg.limits, manifests: group.manifests, run });
     if (failures.length > 0) {
-      snapshot.restore();
+      restoreAll(snapshot, state);
       const named = groups.length > 1 ? failures.map((f) => ({ ...f, detail: `In ${group.label}: ${f.detail}` })) : failures;
       publishFailed(named, base, cfg, state);
-      exitWithError(failureMessage(group, failures));
+      exitWithError(failureMessage(group, failures, state));
     }
     applied += planned;
   }
@@ -517,20 +538,24 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
       publish(report, cfg, state);
     } catch (e) {
       // The files are changed and nothing will say so: put them back, and say why.
-      snapshot.restore();
-      throw new AgentError(`${messageOf(e)}. Every file was restored to how it was before the run.`);
+      restoreAll(snapshot, state);
+      throw new AgentError(`${messageOf(e)}. ${restoreNote(state)}`);
     }
     return { overrideChanges };
   } catch (e) {
     // A failed verification restored already. Anything else would leave a half-applied tree.
-    snapshot.restore();
+    if (!state.restored) restoreAll(snapshot, state);
+    if (state.restoreError && !messageOf(e).includes(state.restoreError)) {
+      throw new AgentError(`${messageOf(e)}
+${restoreNote(state)}`);
+    }
     throw e;
   }
 }
 
 export async function runTargeted(cfg: ResolvedConfig, overrides: Partial<TargetedDeps> = {}): Promise<RunResult> {
   const deps: TargetedDeps = { ...defaultDeps, ...overrides };
-  const state: RunState = { alerts: [], reported: false };
+  const state: RunState = { alerts: [], reported: false, restored: false };
   try {
     return await execute(cfg, deps, state);
   } catch (e) {
