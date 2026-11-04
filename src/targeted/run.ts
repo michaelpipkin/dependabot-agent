@@ -14,7 +14,7 @@ import {
   resolvePmForDir,
 } from "../reconcile.js";
 import type { RunResult } from "../reconcile.js";
-import { fetchDependentRanges, fetchPublishedVersions, usableRange } from "../registry.js";
+import { fetchDependentRanges, readPublishedVersions, usableRange } from "../registry.js";
 import { compareSemver, parseSemver } from "../semver.js";
 import type { DependabotAlert, DependentRange } from "../types.js";
 import { AgentError, exitWithError, log, warn } from "../util.js";
@@ -32,6 +32,7 @@ import type { VerificationFailure } from "./verify.js";
 
 export interface TargetedDeps {
   fetchAlerts: (cfg: ResolvedConfig) => Promise<DependabotAlert[]>;
+  /** A package's published versions, null if the registry has no such package. Any other failure throws. */
   fetchPublished: (name: string) => Promise<string[] | null>;
   /** What a dependent declares for a package at its latest release (its installed range comes from the lockfile). */
   fetchDependents: typeof fetchDependentRanges;
@@ -40,7 +41,7 @@ export interface TargetedDeps {
 
 const defaultDeps: TargetedDeps = {
   fetchAlerts: (cfg) => fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
-  fetchPublished: fetchPublishedVersions,
+  fetchPublished: readPublishedVersions,
   fetchDependents: fetchDependentRanges,
 };
 

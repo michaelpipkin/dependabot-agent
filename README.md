@@ -468,7 +468,7 @@ A blocked copy is left exactly as it is, and the report names the copy and the r
 | Reason | What it means |
 |---|---|
 | `no-fix` | The advisory has no patched version yet. |
-| `target-unavailable` | The patched version isn't published on npm, is a pre-release, is still inside the vulnerable range, isn't above the installed version, or its published versions couldn't be read. |
+| `target-unavailable` | The patched version isn't published on npm, is a pre-release, is still inside the vulnerable range or isn't above the installed version, or the registry has no such package (a 404). Any other registry failure fails the whole run rather than blocking its alerts: an outage says nothing about the package, and a blocked-only result would close an open pull request. |
 | `unreadable-range` | The installed version or the advisory's range couldn't be compared. |
 | `limit` | The patched version is outside a limit in your config. |
 | `pin` | The copy is a direct dependency declared at an exact version. |

@@ -254,7 +254,7 @@ function targetBlock(ctx: PackageContext, alert: DependabotAlert): Block | null 
 
   const published = ctx.input.published.get(ctx.name);
   if (!published) {
-    return { reason: "target-unavailable", detail: `Could not read ${ctx.name}'s published versions.` };
+    return { reason: "target-unavailable", detail: `${ctx.name} isn't on the npm registry.` };
   }
   if (!published.includes(target)) {
     return { reason: "target-unavailable", detail: `${ctx.name}@${target} isn't published.` };

@@ -1171,3 +1171,54 @@ describe("a failed report that can't be written", () => {
     assert.doesNotMatch(printed[0], /\*\*run\*\*/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The registry: only a 404 says anything about the package
+// ---------------------------------------------------------------------------
+
+describe("the npm registry", () => {
+  /** The real fetchPublished, against a registry that answers with this. */
+  const withRegistry = (answer: () => Promise<Response>, alerts: DependabotAlert[], npm: { run: NpmRunner }): Partial<TargetedDeps> => {
+    mock.method(globalThis, "fetch", answer);
+    return { fetchAlerts: async () => alerts, run: npm.run };
+  };
+
+  for (const [label, answer] of [
+    ["a 503", async () => new Response("", { status: 503 })],
+    ["a network failure", async () => Promise.reject(new TypeError("fetch failed"))],
+  ] as Array<[string, () => Promise<Response>]>) {
+    it(`${label} fails the run, rather than reading as every alert's target being unavailable`, async () => {
+      const dir = tempDir();
+      const reportDir = tempDir();
+      writeProject(dir, qsProject());
+      const before = treeOf(dir);
+      const npm = fakeNpm();
+
+      await assert.rejects(
+        runTargeted(cfgFor(dir, { reportDir }), withRegistry(answer, [qsAlert()], npm)),
+        (e: Error) => e instanceof AgentError && /npm registry/.test(e.message) && e.message.includes("qs"),
+      );
+
+      const report = reportIn(reportDir);
+      assert.equal(report.outcome, "failed");
+      assert.equal(report.failures[0].check, "run");
+      assert.match(report.failures[0].detail, /npm registry/);
+      assert.deepEqual(npm.commands, []);
+      assert.deepEqual(treeOf(dir), before);
+    });
+  }
+
+  it("a 404 stays target-unavailable for that alert", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    const npm = fakeNpm();
+
+    await runTargeted(cfgFor(dir, { reportDir }), withRegistry(async () => new Response("", { status: 404 }), [qsAlert()], npm));
+
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "blocked-only");
+    assert.equal(report.alerts[0].copies[0].reason, "target-unavailable");
+    assert.match(report.alerts[0].copies[0].detail ?? "", /isn't on the npm registry/);
+  });
+});

@@ -1,4 +1,5 @@
 import { compareSemver, parseSemver } from "./semver.js";
+import { AgentError } from "./util.js";
 
 /**
  * Fetch a published version of a package from the npm registry and return the
@@ -119,6 +120,37 @@ export async function fetchPublishedVersions(packageName: string): Promise<strin
   } catch {
     return null;
   }
+}
+
+/**
+ * The same list, for a caller that acts on the answer: the targeted strategy reports an
+ * unavailable target as blocked, and a blocked-only run closes an open pull request. So
+ * only a 404 reads as "not there" (null). Any other failure says nothing about the
+ * package, and throws.
+ */
+export async function readPublishedVersions(packageName: string): Promise<string[] | null> {
+  const failed = (why: string): AgentError =>
+    new AgentError(`Could not read ${packageName}'s published versions from the npm registry: ${why}.`);
+
+  let response: Response;
+  try {
+    response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(packageName)}`, {
+      headers: { Accept: "application/vnd.npm.install-v1+json" },
+    });
+  } catch (e) {
+    throw failed(e instanceof Error ? e.message : String(e));
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) throw failed(`HTTP ${response.status}`);
+
+  let doc: { versions?: Record<string, unknown> };
+  try {
+    doc = (await response.json()) as { versions?: Record<string, unknown> };
+  } catch {
+    throw failed("the response wasn't JSON");
+  }
+  if (!doc.versions || typeof doc.versions !== "object") throw failed("the response has no version list");
+  return Object.keys(doc.versions);
 }
 
 /**

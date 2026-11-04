@@ -94,6 +94,7 @@ Then, for each copy inside the vulnerable range, in this order:
 
 Details:
 
+- **A registry failure isn't a blocked alert:** only a 404 reads as target unavailable. Any other failure reading the published versions fails the run, since a `blocked-only` result would close an open PR over an outage.
 - **Partial fixes:** fixable copies are fixed even if another copy of the same package is blocked. The report shows that alert as partly fixed, and it stays open until every copy is resolved. *(Builder's call.)*
 - **Overrides must not catch copies that stay put:** a selector's range must exclude every copy that's blocked or safe. If it can't, for example because a pinned copy and a transitive copy share one version, the transitive copy is blocked too, naming the reason. No override is ever written that could move a pinned copy. *(Builder's call.)*
 - **Limits on a shared release line:** if several alerts hit one line and the highest target breaks a limit, use the highest target that doesn't. The alert needing the higher one is reported as blocked, and the lower one is still fixed. *(Builder's call.)*
