@@ -422,7 +422,7 @@ dependabot-agent --update-strategy targeted --dry-run
 
 > **Status: new.** Targeted mode is recent.
 >
-> - Use **npm 11.3 or newer**; 11.14 or newer is best. See [Supported npm versions](#supported-npm-versions).
+> - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
 > - On a live repository, Dependabot closed every alert this mode fixed, within seconds of the push, including those fixed through the [temporary root step](#workspaces). Alerts it reported as blocked stayed open.
 >
 > **Run it with `--dry-run` on a real repository first**, read the plan, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
@@ -622,12 +622,11 @@ The workflow doesn't set up credentials for a private npm registry. If your lock
 
 ### Supported npm versions
 
-**Use npm 11.3 or newer; 11.14 or newer is best.** The live test suite was run on these versions, on Linux, and on 11.16 on Windows:
+**Use npm 11.3 or newer.** The live test suite was run on these versions, on Linux, and on 11.16 on Windows:
 
 | npm | Result |
 | --- | --- |
-| 11.14, 11.16 | Everything passes. |
-| 11.3, 11.6, 11.9, 11.12 | Every fix applies. A forced override doesn't move an exact pin on these versions, so the agent's plan is what stops such a change rather than the pin check. |
+| 11.3, 11.6, 11.9, 11.12, 11.14, 11.16 | Every fix applies. |
 | 11.0, 10.9 | Some fixes fail safely (see below). |
 
 Versions between these weren't tested. The npm that matters is the one the agent runs, which is the one the job's Node ships, and the log and the report both say which it was. The reusable workflow defaults to Node 24, whose current releases ship npm 11. A pinned older Node 24 ships an older npm.
