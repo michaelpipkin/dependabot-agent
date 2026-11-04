@@ -1,9 +1,9 @@
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isExactPin } from "../manifest.js";
-import { readNpmOverrides, selectOverrideSource } from "../override-source.js";
-import { log } from "../util.js";
+import { isExactPin, topLevelValueRange } from "../manifest.js";
+import { readNpmOverrides } from "../override-source.js";
+import { log, sortObjectKeys } from "../util.js";
 import { copiesOf, LockIndex, memberOwnersOf, readLockfile, resolveDep } from "./lockfile.js";
 import { DirectBump, ManifestInfo, Plan } from "./plan.js";
 import { verify, VerificationFailure, VerifyInput } from "./verify.js";
@@ -16,11 +16,39 @@ export interface Snapshot {
 const NODE_MODULES = "node_modules/";
 const FLAGS = "--package-lock-only --ignore-scripts --no-audit --no-fund";
 
+/** Captures npm's output, so a failure can carry its error code, and forwards it to the log. */
 const defaultRunner: NpmRunner = (command, cwd) => {
-  execSync(command, { cwd, stdio: "inherit" });
+  const result = spawnSync(command, {
+    cwd,
+    shell: true,
+    encoding: "utf-8",
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  for (const output of [result.stdout, result.stderr]) {
+    if (output?.trim()) log(output.trimEnd());
+  }
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw Object.assign(new Error(`Command failed: ${command}`), { stderr: result.stderr });
 };
 
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * What to report for a failed step. A runner may attach npm's stderr to what it throws,
+ * as execSync does: keep its error lines (the code and the message), and leave out its
+ * warnings and the path to a debug log that won't exist by the time anyone reads this.
+ */
+function failureDetail(e: unknown): string {
+  const message = messageOf(e);
+  const stderr = ((e as { stderr?: Buffer | string } | null)?.stderr ?? "").toString().trim();
+  const npmError = stderr
+    .split(/\r?\n/)
+    .filter((line) => /^npm (error|ERR!) ?\S/.test(line) && !/complete log of this run|_logs[\\/]/.test(line));
+  const command = message.split("\n")[0];
+  if (npmError.length > 0) return [command, ...npmError].join("\n");
+  return stderr && !message.includes(stderr) ? `${message}\n${stderr}` : message;
+}
 
 /** Holds each file's exact bytes, or that it didn't exist. */
 export function snapshotFiles(paths: string[]): Snapshot {
@@ -61,19 +89,57 @@ export function resolveCommand(): string {
   return `npm install ${FLAGS}`;
 }
 
-/** A package in both dependencies and devDependencies yields two bumps but needs one command. */
-function bumpCommands(bumps: DirectBump[]): string[] {
-  return [...new Set(bumps.map(bumpCommand))];
+/** `overrides` rendered at the top level of a manifest with this indent and line ending. */
+function renderOverrides(overrides: Record<string, unknown>, indent: string, eol: string): string {
+  return JSON.stringify(overrides, null, indent)
+    .split("\n")
+    .map((line, i) => (i === 0 ? line : indent + line))
+    .join(eol);
+}
+
+/**
+ * The manifest's text with its top-level `overrides` replaced, added or removed, and
+ * nothing else touched: indentation, line endings and any trailing newline all stay,
+ * so a PR's diff shows only what changed. (override-source.ts reformats the whole
+ * file, which the other strategies keep.)
+ */
+function withOverridesBlock(text: string, overrides: Record<string, unknown>): string {
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const indent = /\n([ \t]+)\S/.exec(text)?.[1] ?? "  ";
+  const isEmpty = Object.keys(overrides).length === 0;
+  const range = topLevelValueRange(text, "overrides");
+
+  if (range) {
+    const [start, end] = range;
+    if (!isEmpty) return text.slice(0, start) + renderOverrides(overrides, indent, eol) + text.slice(end);
+    const before = text.slice(0, text.lastIndexOf('"overrides"', start));
+    const after = text.slice(end);
+    const commaBefore = /,\s*$/.exec(before);
+    if (commaBefore) return before.slice(0, commaBefore.index) + after;
+    const commaAfter = /^\s*,\s*/.exec(after);
+    return commaAfter ? before + after.slice(commaAfter[0].length) : before.trimEnd() + after;
+  }
+  if (isEmpty) return text;
+
+  const close = text.lastIndexOf("}");
+  const head = text.slice(0, close).trimEnd();
+  const comma = head.endsWith("{") ? "" : ",";
+  return `${head}${comma}${eol}${indent}"overrides": ${renderOverrides(overrides, indent, eol)}${eol}${text.slice(close)}`;
+}
+
+/** Write the root's flat overrides, sorted, with its nested ones preserved. */
+function writeRootOverrides(dir: string, flat: Record<string, string>, nested: Record<string, unknown>): void {
+  const file = join(dir, "package.json");
+  writeFileSync(file, withOverridesBlock(readFileSync(file, "utf-8"), sortObjectKeys({ ...nested, ...flat })));
 }
 
 function writeOverrides(dir: string, plan: Plan): void {
   const adding = Object.keys(plan.addOverrides).length > 0;
   if (!adding && plan.removeOverrideKeys.length === 0) return;
   // Read now, not earlier: a root bump has just rewritten this file.
-  const source = selectOverrideSource("npm", dir, true);
-  const overrides = { ...source.overrides };
-  for (const key of plan.removeOverrideKeys) delete overrides[key];
-  source.write({ ...overrides, ...plan.addOverrides });
+  const { flat, nested } = readNpmOverrides(dir);
+  for (const key of plan.removeOverrideKeys) delete flat[key];
+  writeRootOverrides(dir, { ...flat, ...plan.addOverrides }, nested);
 }
 
 /** The packages with a planned copy still not at its target: at its path, or reappeared at another. */
@@ -95,9 +161,11 @@ const ROOT_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", 
 
 /**
  * What the root must temporarily declare for npm to reach the targets: each member's
- * own dependencies leading to one, with their declared ranges. Left out are a member's
- * peer and optional edges, a sibling member (its own dependencies are looked at in
- * turn), and anything the root already declares, since a root entry wins.
+ * own dependencies leading to one, with their declared ranges. That includes peer and
+ * optional edges, which npm reaches the same way, though a range a member really
+ * depends on is preferred over one it only peers on. Left out are a sibling member
+ * (its own dependencies are looked at in turn) and anything the root already declares,
+ * since a root entry wins.
  */
 function temporaryRootEntries(
   lock: LockIndex,
@@ -105,22 +173,22 @@ function temporaryRootEntries(
   targetNames: string[],
   root: Record<string, unknown>,
 ): Record<string, string> {
-  const entries: Record<string, string> = {};
+  const required: Record<string, string> = {};
+  const weaker: Record<string, string> = {};
   const isDeclared = (name: string): boolean =>
     ROOT_FIELDS.some((field) => name in ((root[field] as Record<string, string> | undefined) ?? {}));
 
   for (const memberPath of memberPaths) {
     const member = lock.entries.get(memberPath);
     if (!member) continue;
-    for (const name of Object.keys(memberOwnersOf(lock, [memberPath], targetNames))) {
-      if (name in entries || isDeclared(name)) continue;
-      const spec = member.dependencies[name] ?? member.devDependencies[name];
-      if (spec === undefined) continue;
-      if (!resolveDep(lock, memberPath, name)?.path.includes(NODE_MODULES)) continue;
-      entries[name] = spec;
+    for (const [name, spec] of Object.entries(memberOwnersOf(lock, [memberPath], targetNames))) {
+      if (isDeclared(name) || !resolveDep(lock, memberPath, name)?.path.includes(NODE_MODULES)) continue;
+      const real = member.dependencies[name] ?? member.devDependencies[name];
+      if (real !== undefined) required[name] ??= real;
+      else weaker[name] ??= spec;
     }
   }
-  return entries;
+  return { ...weaker, ...required };
 }
 
 /**
@@ -197,7 +265,7 @@ export function applyPlan(
   const run = opts.run ?? defaultRunner;
   const lockFile = join(dir, "package-lock.json");
   try {
-    const commands = bumpCommands(plan.bumps);
+    const commands = plan.bumps.map(bumpCommand);
     const before = readLockfile(dir);
     const pins = pinsOf(before, opts.manifests);
     const manifestsBefore = readManifests(dir, opts.manifests);
@@ -227,7 +295,7 @@ export function applyPlan(
       stable,
     });
   } catch (e) {
-    return [{ check: "stable", detail: messageOf(e) }];
+    return [{ check: "stable", detail: failureDetail(e) }];
   }
 }
 
@@ -247,16 +315,15 @@ function sameVersions(a: Map<string, string | undefined>, b: Map<string, string 
 export function tryRemoveOverride(dir: string, key: string, run: NpmRunner = defaultRunner): boolean {
   const snapshot = snapshotFiles([join(dir, "package.json"), join(dir, "package-lock.json")]);
   try {
-    const source = selectOverrideSource("npm", dir, true);
-    if (!(key in source.overrides)) return false;
+    const { flat, nested } = readNpmOverrides(dir);
+    if (!(key in flat)) return false;
     const before = versionsOf(readLockfile(dir));
-    const remaining = { ...source.overrides };
-    delete remaining[key];
-    source.write(remaining);
+    delete flat[key];
+    writeRootOverrides(dir, flat, nested);
     run(resolveCommand(), dir);
     if (sameVersions(before, versionsOf(readLockfile(dir)))) return true;
   } catch (e) {
-    log(`   Keeping the override "${key}": ${messageOf(e)}`);
+    log(`   Keeping the override "${key}": ${failureDetail(e)}`);
   }
   snapshot.restore();
   return false;

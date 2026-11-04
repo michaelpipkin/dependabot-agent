@@ -356,6 +356,80 @@ describe("sorting", () => {
     assert.deepEqual(p.addOverrides, {});
   });
 
+  describe("a package declared twice in one manifest", () => {
+    const twice = (first: DirectDep["field"], second: DirectDep["field"]): Setup => ({
+      alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+      lock: makeLock({
+        "": { [first]: { qs: "^6.5.0" }, [second]: { qs: "^6.5.0" } },
+        "node_modules/qs": { version: "6.7.0" },
+      }),
+      manifests: [root(dep("qs", "^6.5.0", first), dep("qs", "^6.5.0", second))],
+    });
+
+    it("dependencies and devDependencies → blocked unrewritable-spec, naming both", () => {
+      const p = plan(twice("dependencies", "devDependencies"));
+      const copy = p.alerts[0].copies[0];
+      assert.equal(p.alerts[0].status, "blocked");
+      assert.equal(copy.reason, "unrewritable-spec");
+      assert.match(copy.detail ?? "", /declared twice in package\.json/);
+      assert.match(copy.detail ?? "", /dependencies and devDependencies/);
+      assertNoWrites(p);
+    });
+
+    it("any other two fields are blocked as well: a bump mishandles those too", () => {
+      for (const [first, second] of [
+        ["dependencies", "optionalDependencies"],
+        ["devDependencies", "optionalDependencies"],
+      ] as Array<[DirectDep["field"], DirectDep["field"]]>) {
+        const p = plan(twice(first, second));
+        assert.equal(p.alerts[0].copies[0].reason, "unrewritable-spec", `${first}+${second}`);
+        assertNoWrites(p);
+      }
+    });
+
+    it("in a member, names the member's manifest", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+        lock: makeLock({
+          "": {},
+          "packages/a": { name: "a", dependencies: { qs: "^6.5.0" }, devDependencies: { qs: "^6.5.0" } },
+          "node_modules/a": { link: true, resolved: "packages/a" },
+          "node_modules/qs": { version: "6.7.0" },
+        }),
+        manifests: [root(), member("packages/a", dep("qs", "^6.5.0"), dep("qs", "^6.5.0", "devDependencies"))],
+      });
+      assert.equal(p.alerts[0].copies[0].reason, "unrewritable-spec");
+      assert.match(p.alerts[0].copies[0].detail ?? "", /packages\/a\/package\.json/);
+      assertNoWrites(p);
+    });
+
+    it("an exact pin in either field still reads as a pin", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+        lock: makeLock({
+          "": { dependencies: { qs: "^6.5.0" }, devDependencies: { qs: "6.7.0" } },
+          "node_modules/qs": { version: "6.7.0" },
+        }),
+        manifests: [root(dep("qs", "^6.5.0"), dep("qs", "6.7.0", "devDependencies"))],
+      });
+      assert.equal(p.alerts[0].copies[0].reason, "pin");
+    });
+
+    it("writes no override that would catch it for a transitive copy on the same line", () => {
+      const p = plan({
+        alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],
+        lock: makeLock({
+          "": { dependencies: { qs: "^6.5.0", b: "^1.0.0" }, devDependencies: { qs: "^6.5.0" } },
+          "node_modules/qs": { version: "6.7.0" },
+          "node_modules/b": { version: "1.0.0", dependencies: { qs: "~6.6.0" } },
+          "node_modules/b/node_modules/qs": { version: "6.6.0" },
+        }),
+        manifests: [root(dep("qs", "^6.5.0"), dep("qs", "^6.5.0", "devDependencies"), dep("b", "^1.0.0"))],
+      });
+      assertNoWrites(p);
+    });
+  });
+
   it("updateWorkspaceMembers false → member's direct copy blocked unrewritable-spec", () => {
     const setup: Setup = {
       alerts: [alert(1, "qs", "< 6.7.3", "6.7.3")],

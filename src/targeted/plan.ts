@@ -277,6 +277,18 @@ function declarationBlock(ctx: PackageContext, copy: LockEntry): Block | null {
   const pin = declarations.find((d) => isExactPin(d.dep.spec));
   if (pin) return { reason: "pin", detail: `Pinned at "${pin.dep.spec}" in ${manifestFile(pin.manifest)}.` };
 
+  // npm keeps only one of the two when it saves, or rewrites one and leaves the
+  // other: `dependencies` and `devDependencies` lose the production entry outright.
+  for (const { manifest, dep } of declarations) {
+    const other = declarations.find((d) => d.manifest === manifest && d.dep.field !== dep.field);
+    if (other) {
+      return {
+        reason: "unrewritable-spec",
+        detail: `${dep.name} is declared twice in ${manifestFile(manifest)}, in ${dep.field} and ${other.dep.field}, and npm can't rewrite both.`,
+      };
+    }
+  }
+
   for (const { manifest, dep } of declarations) {
     const operator = parseSimpleSpec(dep.spec)?.operator;
     if (operator !== "^" && operator !== "~") {

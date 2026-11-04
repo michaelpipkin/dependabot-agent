@@ -454,17 +454,65 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     });
   });
 
-  describe("what the temporary-root step leaves out", () => {
-    it("a target reachable only through a member's peer stops the run", () => {
-      const dir = project("2020-06-01", { members: { a: { peerDependencies: { glob: "^7.1.6" } } } });
-      const failures = applyPlan(dir, planFor(dir, [MINIMATCH_ALERT]), { limits: {}, manifests: manifestsOf(dir) });
-      assert.ok(failures.some((f) => f.check === "fixed"), JSON.stringify(failures));
+  describe("a target reachable only through a member's weaker edge", () => {
+    for (const [label, field] of [
+      ["peer", "peerDependencies"],
+      ["optional", "optionalDependencies"],
+    ]) {
+      it(`${label}: moves through the temporary-root step, manifests otherwise unchanged`, () => {
+        const dir = project("2020-06-01", { members: { a: { [field]: { glob: "^7.1.6" } } } });
+        const before = versions(dir);
+        const rootText = text(dir, "package.json");
+        const memberText = text(dir, "packages", "a", "package.json");
+
+        const { run, roots } = counting();
+        applied(dir, planFor(dir, [MINIMATCH_ALERT]), run);
+
+        assert.equal(usedTemporaryRoot(roots), true);
+        assert.deepEqual(movedBetween(before, versions(dir)), MOVED_ONE);
+        assert.deepEqual(json(dir, "package.json"), withOverrides(rootText, { [MINIMATCH_KEY]: "3.0.5" }));
+        assert.equal(text(dir, "packages", "a", "package.json"), memberText);
+        npm(dir, `ci ${QUIET}`);
+      });
+    }
+  });
+
+  describe("formatting of the root manifest", () => {
+    /** Tabs, CRLF, no trailing newline. */
+    const tabbed = (value: unknown): string => JSON.stringify(value, null, "\t").replaceAll("\n", "\r\n");
+
+    it("override only, single package: the resolves leave the bytes as written", () => {
+      const dir = project("2020-06-01", { root: { dependencies: { glob: "^7.1.6" } } });
+      const original = json(dir, "package.json");
+      writeFileSync(join(dir, "package.json"), tabbed(original));
+      applied(dir, planFor(dir, [MINIMATCH_ALERT]));
+      assert.equal(text(dir, "package.json"), tabbed({ ...original, overrides: { [MINIMATCH_KEY]: "3.0.5" } }));
     });
 
-    it("a target reachable only through a member's optional dependency stops the run", () => {
-      const dir = project("2020-06-01", { members: { a: { optionalDependencies: { glob: "^7.1.6" } } } });
-      const failures = applyPlan(dir, planFor(dir, [MINIMATCH_ALERT]), { limits: {}, manifests: manifestsOf(dir) });
-      assert.ok(failures.some((f) => f.check === "fixed"), JSON.stringify(failures));
+    it("override only, member only: the temporary-root step leaves the bytes as written", () => {
+      const dir = project("2020-06-01", { members: { a: { dependencies: { glob: "^7.1.6" } } } });
+      const original = json(dir, "package.json");
+      writeFileSync(join(dir, "package.json"), tabbed(original));
+      const { run, roots } = counting();
+      applied(dir, planFor(dir, [MINIMATCH_ALERT]), run);
+      assert.equal(usedTemporaryRoot(roots), true);
+      assert.equal(text(dir, "package.json"), tabbed({ ...original, overrides: { [MINIMATCH_KEY]: "3.0.5" } }));
+    });
+
+    it("a bump: npm keeps the indent and line endings, but adds a trailing newline", () => {
+      const dir = project("2020-05-01", { root: { dependencies: { chalk: "~4.0.0" } } });
+      const original = json(dir, "package.json");
+      writeFileSync(join(dir, "package.json"), tabbed(original));
+      applied(dir, planFor(dir, [alert(1, "chalk", "<4.1.2", "4.1.2")]));
+      assert.equal(text(dir, "package.json"), tabbed({ ...original, dependencies: { chalk: "~4.1.2" } }) + "\r\n");
+    });
+
+    it("a member's bump leaves the root alone", () => {
+      const dir = project("2020-05-01", { members: { a: { dependencies: { chalk: "~4.0.0" } } } });
+      const original = tabbed(json(dir, "package.json"));
+      writeFileSync(join(dir, "package.json"), original);
+      applied(dir, planFor(dir, [alert(1, "chalk", "<4.1.2", "4.1.2")]));
+      assert.equal(text(dir, "package.json"), original);
     });
   });
 
@@ -476,24 +524,36 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
     assert.equal(failures.length, 1);
     assert.equal(failures[0].check, "stable");
     assert.match(failures[0].detail, /chalk@99\.99\.99/);
+    assert.match(failures[0].detail, /npm error code ETARGET/);
+    assert.doesNotMatch(failures[0].detail, /complete log/);
   });
 
-  it("a package declared in both dependencies and devDependencies stops the run", () => {
-    // One command is all npm gets, but it "removes dependencies.chalk in favor of
-    // devDependencies.chalk" as it saves. A production dependency silently becoming
-    // dev-only is exactly what the manifests check exists for.
-    const dir = project("2020-05-01", {
-      root: { dependencies: { chalk: "^4.0.0" }, devDependencies: { chalk: "^4.0.0" } },
-    });
+  it("a package declared in both dependencies and devDependencies is blocked before npm can drop one", () => {
+    const dir = project("2020-05-01", { root: { dependencies: { chalk: "^4.0.0" }, devDependencies: { chalk: "^4.0.0" } } });
+    const rootText = text(dir, "package.json");
+    const before = versions(dir);
     const plan = planFor(dir, [alert(1, "chalk", "<4.1.2", "4.1.2")]);
-    assert.equal(plan.bumps.length, 2);
+    assert.equal(plan.alerts[0].copies[0].reason, "unrewritable-spec");
+    assert.deepEqual(plan.bumps, []);
 
-    const { run, commands } = counting();
-    const failures = applyPlan(dir, plan, { limits: {}, manifests: manifestsOf(dir), run });
+    applied(dir, plan);
+    assert.equal(text(dir, "package.json"), rootText);
+    assert.deepEqual(movedBetween(before, versions(dir)), []);
 
-    assert.equal(commands.filter((c) => c !== resolveCommand()).length, 1);
-    assert.deepEqual(failures, [
-      { check: "manifests", path: "package.json", detail: 'dependencies "chalk": "^4.0.0" went missing during the run.' },
-    ]);
+    // Why: npm "removes dependencies.chalk in favor of devDependencies.chalk" as it
+    // saves. A production dependency turning dev-only is what the manifests check
+    // is the backstop for, should a plan ever ask for it.
+    const forced: Plan = {
+      alerts: [],
+      bumps: [{ manifestDir: dir, memberPath: null, name: "chalk", field: "dependencies", from: "^4.0.0", operator: "^", target: "4.1.2" }],
+      addOverrides: {},
+      removeOverrideKeys: [],
+      targets: new Map([["node_modules/chalk", "4.1.2"]]),
+    };
+    const failures = applyPlan(dir, forced, { limits: {}, manifests: manifestsOf(dir) });
+    assert.ok(
+      failures.some((f) => f.check === "manifests" && f.detail === 'dependencies "chalk": "^4.0.0" went missing during the run.'),
+      JSON.stringify(failures),
+    );
   });
 });

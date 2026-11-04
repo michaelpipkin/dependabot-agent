@@ -228,26 +228,6 @@ describe("applyPlan", () => {
     assert.ok(cwds.every((cwd) => cwd === project.dir));
   });
 
-  it("dedupes a package declared in both dependencies and devDependencies", () => {
-    const project = memberProject();
-    const { run, commands } = fakeNpm(project, { reachable: true });
-    const plan = emptyPlan({
-      bumps: [bump({ manifestDir: project.dir }), bump({ manifestDir: project.dir, field: "devDependencies" })],
-    });
-    applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run });
-    assert.equal(commands.filter((c) => c === bumpCommand(plan.bumps[0])).length, 1);
-  });
-
-  it("keeps bumps apart when their operators differ", () => {
-    const project = memberProject();
-    const { run, commands } = fakeNpm(project, { reachable: true });
-    const plan = emptyPlan({
-      bumps: [bump({ manifestDir: project.dir }), bump({ manifestDir: project.dir, field: "devDependencies", operator: "~" })],
-    });
-    applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run });
-    assert.equal(commands.filter((c) => c !== resolveCommand()).length, 2);
-  });
-
   it("removes the keys it replaces and keeps nested overrides", () => {
     const project = memberProject({
       root: { overrides: { minimatch: ">=3.0.0", webpack: { "loader-utils": "^2.0.4" }, ms: "2.1.3" } },
@@ -343,15 +323,19 @@ describe("applyPlan", () => {
     assert.equal(readJson(project.rootFile).devDependencies, undefined);
   });
 
-  it("doesn't add a member's peer or optional edges as temporary root entries", () => {
+  it("adds a member's peer and optional edges as temporary root entries", () => {
     const project = memberProject({
       member: { dependencies: undefined, peerDependencies: { glob: "^7.1.6" }, optionalDependencies: { rimraf: "^3.0.0" } },
       packages: { "node_modules/rimraf": { version: "3.0.2", dependencies: { glob: "^7.1.3" } } },
     });
-    const { run, commands } = fakeNpm(project);
+    const during: Array<Json | undefined> = [];
+    const { run, commands } = fakeNpm(project, {
+      onResolve: (text) => during.push((JSON.parse(text) as Json).devDependencies as Json | undefined),
+    });
     const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
-    assert.equal(resolves(commands), 2, "no temporary step, so nothing else to resolve");
-    assert.ok(failures.some((f) => f.check === "fixed" && f.path === "node_modules/minimatch"));
+    assert.deepEqual(failures, []);
+    assert.equal(resolves(commands), 4);
+    assert.deepEqual(during[1], { glob: "^7.1.6", rimraf: "^3.0.0" });
   });
 
   it("adds a member's dev edge even when the same name is also its peer", () => {
@@ -406,6 +390,37 @@ describe("applyPlan", () => {
     assert.equal(failures.length, 1);
     assert.equal(failures[0].check, "stable");
     assert.match(failures[0].detail, /EOVERRIDE/);
+  });
+
+  it("puts npm's error code and message in the detail, and leaves out the noise", () => {
+    const project = memberProject();
+    const stderr = [
+      "npm warn deprecated glob@7.1.6: old",
+      "npm error code EOVERRIDE",
+      "npm error Override for minimatch@^3.0.4 conflicts with direct dependency",
+      "npm error A complete log of this run can be found in: C:\\npm-cache\\_logs\\x-debug-0.log",
+      "",
+    ].join("\r\n");
+    const run: NpmRunner = (command) => {
+      throw Object.assign(new Error(`Command failed: ${command}\n${stderr}`), { stderr: Buffer.from(stderr) });
+    };
+    const [failure] = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+    assert.equal(failure.check, "stable");
+    assert.match(failure.detail, /^Command failed: npm install /);
+    assert.match(failure.detail, /npm error code EOVERRIDE/);
+    assert.match(failure.detail, /Override for minimatch@\^3\.0\.4 conflicts/);
+    assert.doesNotMatch(failure.detail, /npm warn/);
+    assert.doesNotMatch(failure.detail, /complete log/);
+  });
+
+  it("keeps a shell's own complaint when npm never got to say anything", () => {
+    const project = memberProject();
+    const run: NpmRunner = () => {
+      throw Object.assign(new Error("Command failed: npm install"), { stderr: "'npm' is not recognized\r\n" });
+    };
+    const [failure] = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
+    assert.match(failure.detail, /Command failed: npm install/);
+    assert.match(failure.detail, /not recognized/);
   });
 
   it("returns a failure when a name can't go on a command line, running nothing", () => {
@@ -512,6 +527,110 @@ describe("applyPlan", () => {
       run,
     });
     assert.ok(failures.some((f) => f.check === "limits-held"));
+  });
+});
+
+describe("writing overrides keeps the manifest's formatting", () => {
+  /** Apply the plan with an npm that does nothing, and return the root manifest's bytes. */
+  function written(text: string, plan: Plan): string {
+    const project = memberProject();
+    writeFileSync(project.rootFile, text);
+    applyPlan(project.dir, plan, { limits: {}, manifests: project.manifests, run: () => {} });
+    return readFileSync(project.rootFile, "utf-8");
+  }
+
+  const KEY = '"minimatch@>=3.0.0 <3.0.5": "3.0.5"';
+
+  it("tabs, CRLF and no trailing newline: adding the block touches only the overrides lines", () => {
+    const text = '{\r\n\t"name": "fx",\r\n\t"workspaces": [\r\n\t\t"packages/*"\r\n\t]\r\n}';
+    assert.equal(
+      written(text, overridePlan()),
+      `{\r\n\t"name": "fx",\r\n\t"workspaces": [\r\n\t\t"packages/*"\r\n\t],\r\n\t"overrides": {\r\n\t\t${KEY}\r\n\t}\r\n}`,
+    );
+  });
+
+  it("tabs, CRLF and no trailing newline: an existing block in mid-file, nested and sorted", () => {
+    const head = '{\r\n\t"name": "fx",\r\n\t"overrides": {\r\n';
+    const tail = '\r\n\t},\r\n\t"workspaces": [ "packages/*" ],\r\n\t"scripts": {\r\n\t\t"x": "y"\r\n\t}\r\n}';
+    const nested = '\t\t"webpack": {\r\n\t\t\t"loader-utils": "^2.0.4"\r\n\t\t}';
+    const text = `${head}\t\t"ms": "2.1.3",\r\n${nested},\r\n\t\t"minimatch": ">=3.0.0"${tail}`;
+    assert.equal(
+      written(text, { ...overridePlan(), removeOverrideKeys: ["minimatch"] }),
+      `${head}\t\t${KEY},\r\n\t\t"ms": "2.1.3",\r\n${nested}${tail}`,
+    );
+  });
+
+  it("four spaces and LF with a trailing newline", () => {
+    const text = '{\n    "name": "fx",\n    "workspaces": ["packages/*"]\n}\n';
+    assert.equal(
+      written(text, overridePlan()),
+      `{\n    "name": "fx",\n    "workspaces": ["packages/*"],\n    "overrides": {\n        ${KEY}\n    }\n}\n`,
+    );
+  });
+
+  it("a blank line before the closing brace and a trailing blank line", () => {
+    const text = '{\n  "name": "fx",\n  "workspaces": ["packages/*"]\n\n}\n\n';
+    assert.equal(
+      written(text, overridePlan()),
+      `{\n  "name": "fx",\n  "workspaces": ["packages/*"],\n  "overrides": {\n    ${KEY}\n  }\n}\n\n`,
+    );
+  });
+
+  it("an empty manifest takes the block with no stray comma", () => {
+    assert.deepEqual(JSON.parse(written("{}", overridePlan())), { overrides: { "minimatch@>=3.0.0 <3.0.5": "3.0.5" } });
+  });
+
+  it("isn't fooled by a dependency named overrides", () => {
+    const text = '{\n  "dependencies": {\n    "overrides": "^1.0.0"\n  },\n  "workspaces": ["packages/*"]\n}\n';
+    assert.equal(
+      written(text, overridePlan()),
+      `{\n  "dependencies": {\n    "overrides": "^1.0.0"\n  },\n  "workspaces": ["packages/*"],\n  "overrides": {\n    ${KEY}\n  }\n}\n`,
+    );
+  });
+
+  describe("removing the last key drops the block", () => {
+    const removed = (text: string): string => {
+      const project = memberProject();
+      writeFileSync(project.rootFile, text);
+      assert.equal(tryRemoveOverride(project.dir, "ms", () => {}), true);
+      return readFileSync(project.rootFile, "utf-8");
+    };
+    const block = '"overrides": {\r\n\t\t"ms": "2.1.3"\r\n\t}';
+
+    it("at the end", () => {
+      assert.equal(removed(`{\r\n\t"name": "fx",\r\n\t${block}\r\n}`), '{\r\n\t"name": "fx"\r\n}');
+    });
+
+    it("in the middle", () => {
+      assert.equal(
+        removed(`{\r\n\t"name": "fx",\r\n\t${block},\r\n\t"version": "1.0.0"\r\n}`),
+        '{\r\n\t"name": "fx",\r\n\t"version": "1.0.0"\r\n}',
+      );
+    });
+
+    it("at the start", () => {
+      assert.equal(removed(`{\r\n\t${block},\r\n\t"name": "fx"\r\n}`), '{\r\n\t"name": "fx"\r\n}');
+    });
+
+    it("as the only key", () => {
+      assert.equal(removed(`{\r\n\t${block}\r\n}`), "{\r\n}");
+    });
+  });
+
+  it("removing one of several keeps the rest in the same format", () => {
+    const project = memberProject();
+    writeFileSync(project.rootFile, '{\r\n\t"overrides": {\r\n\t\t"a": "1.0.0",\r\n\t\t"ms": "2.1.3"\r\n\t}\r\n}');
+    assert.equal(tryRemoveOverride(project.dir, "ms", () => {}), true);
+    assert.equal(readFileSync(project.rootFile, "utf-8"), '{\r\n\t"overrides": {\r\n\t\t"a": "1.0.0"\r\n\t}\r\n}');
+  });
+
+  it("a removal that moved something restores the original bytes", () => {
+    const project = memberProject();
+    const text = '{\r\n\t"overrides": {\r\n\t\t"ms": "2.1.3"\r\n\t}\r\n}';
+    writeFileSync(project.rootFile, text);
+    const moved = tryRemoveOverride(project.dir, "ms", () => setLockVersion(project, "node_modules/minimatch", "9.9.9"));
+    assert.equal(moved, false);
+    assert.equal(readFileSync(project.rootFile, "utf-8"), text);
   });
 });
 
