@@ -67,6 +67,34 @@ So the removal decision is proven deterministically instead:
 A genuine live removal needs a package with real alert history whose dependents have since moved on — reproduce from a repo that actually hit such a case rather than a constructed fixture.
 
 
+## Targeted — npm
+
+Run this when touching `src/targeted/` or `.github/workflows/targeted-reconcile.yml`. `pnpm test` with `DEPENDABOT_AGENT_LIVE_NPM=1` covers real npm resolution in temp projects. This procedure covers what that can't: whether Dependabot closes the alerts, and whether the workflow behaves on GitHub.
+
+No fixture stays in the needed state, because a successful run removes what it tests. The November 2026 proof reshaped `dependabot-agent-fixture-removal` for the test, then restored it. Commit `c60e030` there is a working starting point: an npm workspace resolved with `--before=2020-06-01`, holding a vulnerable direct dependency, transitive packages, a member-only transitive package, a member with a `^` range, an exact pin in a member, and a major crossing.
+
+**1. Do alerts close?** After pushing that shape, wait for Dependabot's alerts, then run a local build from the fixture:
+
+```bash
+node <repo>/dist/index.js --repo <fixture> --update-strategy targeted --report <tmp>
+```
+
+Push the result. **Expect** every alert reported as fixed to go `fixed`, every blocked alert to stay open, and a second run to change nothing.
+
+**2. Does the workflow behave?** The workflow installs the agent with `npx`, so test an unreleased build by committing the output of `pnpm pack` to the fixture and passing its raw GitHub URL as `agent-version`. `npx` accepts `dependabot-agent@<url>`. Call `targeted-reconcile.yml` from a `workflow_dispatch` workflow, with a token set as `alerts-token` and `pr-token`. The token needs Contents and Pull requests write as well as Dependabot alerts read. **Expect:**
+
+| Situation | Result |
+| --- | --- |
+| Fixes available | A PR opens with the report as its description, and the fixture's `pull_request` CI runs on it |
+| Run again | The same PR is updated, with no duplicate |
+| `limits` in `dependabot-agent.config.json` stop every fix | The PR closes, its branch is deleted, and a `dependabot-agent-blocked` issue opens |
+| Nothing left blocked | The issue closes with "Nothing is blocked" |
+| PR merged, then run again | Outcome `clean`, no PR, no issue, and the merged branch is deleted |
+
+**3. Clean up.** Restore the fixture's files, delete its secrets and the label, and remove any write permissions you added to its token. Its fixed alerts stay in its history.
+
+**Results, 2026-11-04, npm 11.16 locally and 11.19 on the runner:** all 46 alerts ended `fixed` once the fixes landed. Of the first run's 16 fixes, all closed about 15 seconds after a direct push; the 4 fixed through a merged PR closed about 9.5 minutes after the merge. All 30 blocked alerts stayed open until their packages were removed. Every row in the table above behaved as expected. GitHub raised a `package.json`-keyed alert for the exact pin only, not for `^` ranges. The first real run also exposed npm refetching a dependency only the replaced package used, which is why the agent now puts such entries back.
+
 ## Regenerating the captured fixtures
 
 `test/fixtures/` holds real output captured once. To refresh after an intentional format change:
