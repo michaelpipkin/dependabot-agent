@@ -93,7 +93,7 @@ describe("targeted workflow: tokens", () => {
 
   it("pins the third-party action to a full commit, with the version in a comment", () => {
     assert.match(findStep("peter-evans/create-pull-request").uses ?? "", /^peter-evans\/create-pull-request@[0-9a-f]{40}$/);
-    assert.match(text, /uses: peter-evans\/create-pull-request@[0-9a-f]{40} # v\d+\.\d+\.\d+\n/);
+    assert.match(text, /uses: peter-evans\/create-pull-request@[0-9a-f]{40} # v\d+\.\d+\.\d+\r?\n/);
   });
 
   it("gives the alerts token to the agent step and nowhere else", () => {
