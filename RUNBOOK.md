@@ -101,9 +101,11 @@ To test a GitHub App, create one with the permissions in the README, install it 
 
 ### Real applications
 
-The fixture above is small, and it can't show what a real framework's tree does. `dependabot-agent-test-angular` and `dependabot-agent-test-angular-workspace` are Angular 21 applications with server-side rendering, Material, routing, forms, ESLint and Vitest, locked as of February 2026 so that Dependabot raises real alerts. Their CI runs `npm ci`, the build, the tests and linting on every pull request. Their `dependabot-agent.config.json` sets `limits` and `moveTogether`.
+The fixture above is small, and it can't show what a real framework's tree does. So these runs used two Angular 21 applications, one single-package and one npm workspace, with server-side rendering, Material, routing, forms, ESLint and Vitest, locked as of February 2026 so that Dependabot raised real alerts. Their CI ran `npm ci`, the build, the tests and linting on every pull request. Their `dependabot-agent.config.json` set `limits` and `moveTogether`.
 
-A successful run removes what it tests, so a full repeat needs a new repository, or a replay of the lockfile before the merge. To replay, fetch the alerts, set the fixed ones back to `open`, and pass the file with `--alerts-file` on a clone of the earlier commit. Then run `npm ci`, the build, the tests and linting on the result, since those are what a lockfile check can't see. `npm audit --package-lock-only` shows what's left, and lists more than the open alerts, because GitHub auto-dismisses some development-only ones.
+Those repositories, `dependabot-agent-test-angular` and `dependabot-agent-test-angular-workspace`, and their GitHub App were deleted after 1.3.0 shipped. What follows is a record of the results, and can't be re-checked there. A repeat needs new applications built the same way, and a GitHub App or tokens.
+
+A successful run removes what it tests, so each further repeat needs another new repository, or a replay of the lockfile before the merge. To replay, fetch the alerts, set the fixed ones back to `open`, and pass the file with `--alerts-file` on a clone of the earlier commit. Then run `npm ci`, the build, the tests and linting on the result, since those are what a lockfile check can't see. `npm audit --package-lock-only` shows what's left, and lists more than the open alerts, because GitHub auto-dismisses some development-only ones.
 
 **Results, 2026-11-04 and 2026-11-05, npm 11.16 locally:** both applications ended with 173 of 174 alerts fixed and 1 blocked (`minimatch`, which needs a major upgrade), with `npm ci`, the build, the tests and linting passing locally and in pull request CI on Linux. Dependabot closed all 173 within a minute of each merge, and left the blocked one open. 40 alerts that weren't open at the run, all development-only, closed as well, and 10 stayed auto-dismissed.
 
@@ -116,6 +118,8 @@ What these runs found, which is worth re-checking after any change to planning o
 - **A tighter limit fixes less, and works.** With `@angular/*` at `<21.2`, 138 alerts were fixed and 36 blocked, and the build passed.
 
 The reusable workflow ran on both with a GitHub App: a dry run wrote nothing, a real run opened a pull request authored by the App with CI running on it, and a second run updated that pull request with no duplicate. That pull request moved `hono` to 4.13.11 and removed four overrides no longer needed, with no other version moving.
+
+These workflow runs used the workflow pinned to a commit, with a packed build passed by URL as `agent-version`. The published path, `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm, hasn't been run, so try it first on any repeat.
 
 Merging it raised no new alerts. The `hono` alert closed in seconds on the workspace and after about twenty minutes on the single-package application. A further run on each left `minimatch` and `@hono/node-server` blocked, both needing a major upgrade, and opened one issue with no pull request. The single-package run fell inside those twenty minutes, and listed `hono` as awaiting close with nothing to change.
 
