@@ -2040,3 +2040,51 @@ describe("advisories on a fix version, in the report", () => {
     assert.doesNotMatch(md, /weren't checked/);
   });
 });
+
+describe("a raised version that won't verify", () => {
+  const project = (): ProjectSpec => ({
+    root: { dependencies: { b: "^1.0.0" } },
+    packages: { "node_modules/b": { version: "1.0.0", dependencies: { ms: "^2.0.0" } }, "node_modules/ms": { version: "2.0.0" } },
+  });
+  const rootMs = (): DependabotAlert => alert(2, "ms", "< 2.0.5", "2.0.5");
+  const withRaise = (npm: { run: NpmRunner }): Partial<TargetedDeps> => ({
+    ...depsFor([rootMs()], npm),
+    fetchPackage: async () => new Map(["2.0.0", "2.0.5", "2.0.7"].map((v) => [v, { dependencies: {}, peerDependencies: {} }])),
+    fetchAdvisories: async () => ({ ms: [{ url: "https://example.test/ms", vulnerable_versions: ">=2.0.1 <2.0.7" }] }),
+  });
+  const raising = (at: string): boolean =>
+    Object.keys(readJson(join(at, "package.json")).overrides ?? {}).some((key) => key.startsWith("ms@") && key.endsWith("<2.0.7"));
+
+  it("falls back to the fix itself, and reports it's still inside the advisory", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, project());
+    const stubborn = (at: string): void => {
+      if (!raising(at)) return;
+      const lock = readLock(at);
+      lock.packages["node_modules/ms"].version = "2.9.9";
+      writeLock(at, lock);
+    };
+    await runTargeted(cfgFor(dir, { reportDir }), withRaise(fakeNpm({ onResolve: stubborn })));
+
+    const report = reportIn(reportDir);
+    assert.equal(report.alerts[0].status, "fixed");
+    assert.equal(readLock(dir).packages["node_modules/ms"].version, "2.0.5");
+    assert.deepEqual(report.advised?.map((a) => `${a.name} ${a.version}`), ["ms 2.0.5"]);
+  });
+
+  it("does the same when npm fails in a way that names no package", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, project());
+    const fake = fakeNpm();
+    const run: NpmRunner = (command, cwd) => {
+      if (raising(cwd)) throw Object.assign(new Error(`Command failed: ${command}`), { stderr: "npm error code ETARGET\nnpm error notarget No matching version" });
+      fake.run(command, cwd);
+    };
+    await runTargeted(cfgFor(dir, { reportDir }), withRaise({ run }));
+
+    assert.equal(reportIn(reportDir).alerts[0].status, "fixed");
+    assert.equal(readLock(dir).packages["node_modules/ms"].version, "2.0.5");
+  });
+});

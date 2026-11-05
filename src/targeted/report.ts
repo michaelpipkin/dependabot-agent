@@ -258,7 +258,7 @@ function buildSections(report: RunReport): Section[] {
   sections.push({
     heading: "Fix still inside another advisory — review these",
     intro: [
-      `Each fix below ${planned ? "would land" : "landed"} on a version with an advisory of its own. It's still better than what was installed, but nothing later on its release line within your limits is clear, so expect a new alert until a person moves it further.`,
+      `Each fix below ${planned ? "would land" : "landed"} on a version with an advisory of its own. It's still better than what was installed, but the run couldn't reach a later release on its line that's clear: there's none, or your limits, a pin or another package stop it. Expect a new alert until a person moves it further.`,
       "",
     ],
     items: (report.advised ?? []).map((a) => `- \`${a.name}\` ${a.version}: inside ${a.advisory}`),

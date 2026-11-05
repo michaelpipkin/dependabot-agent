@@ -173,18 +173,20 @@ async function needsOfDependents(lock: LockIndex, plan: Plan, required: Map<stri
 interface AdvisoryBook {
   read?: ReadAdvisories;
   found: Map<string, Advisory[]>;
-  asked: Set<string>;
+  /** By release line, the lowest version asked from: a restart can fall back below it. */
+  asked: Map<string, string>;
   unchecked?: string;
 }
 
-/** Ask once per release line, in one request, about every version on it from the target up. */
+/** Ask in one request about every version on each target's line from the target up, unless that's been asked already. */
 async function loadAdvisories(book: AdvisoryBook, targets: Array<{ name: string; version: string }>, read: ReadPackage): Promise<void> {
   if (!book.read || book.unchecked) return;
   const query: Record<string, string[]> = {};
   for (const { name, version } of targets) {
     const line = `${name}@${lineStart(version)}`;
-    if (book.asked.has(line)) continue;
-    book.asked.add(line);
+    const known = book.asked.get(line);
+    if (known && semver.gte(version, known)) continue;
+    book.asked.set(line, version);
     const onLine = [...((await read(name))?.keys() ?? [])].filter(
       (v) => semver.valid(v) && !semver.prerelease(v) && semver.gte(v, version) && lineStart(v) === lineStart(version),
     );
@@ -193,7 +195,8 @@ async function loadAdvisories(book: AdvisoryBook, targets: Array<{ name: string;
   if (Object.keys(query).length === 0) return;
   try {
     for (const [name, advisories] of Object.entries(await book.read(query))) {
-      book.found.set(name, [...(book.found.get(name) ?? []), ...advisories]);
+      const all = [...(book.found.get(name) ?? []), ...advisories];
+      book.found.set(name, [...new Map(all.map((advisory) => [`${advisory.url}|${advisory.vulnerable_versions}`, advisory])).values()]);
     }
   } catch (e) {
     book.unchecked = e instanceof Error ? e.message : String(e);
@@ -315,6 +318,15 @@ export interface Solved {
   plan: Plan;
   /** For a package moving only because of another, the packages it comes down to. */
   drivers: Map<string, Set<string>>;
+  /** Packages taken past their fix to get clear of an advisory: the first thing to give up if the run fails. */
+  raised: Set<string>;
+}
+
+/** The raises a failure could come down to: of the packages behind it, or by something behind those. */
+function raisesBehind(required: Map<string, Need>, drivers: Set<string>): string[] {
+  return [...required]
+    .filter(([name, need]) => need.soft && (drivers.has(name) || [...need.drivers].some((driver) => drivers.has(driver))))
+    .map(([name]) => name);
 }
 
 /**
@@ -325,7 +337,7 @@ export interface Solved {
  * can leave a fix half-planned.
  */
 export async function solvePlan(input: PlanInput, readPackage: ReadPackage, readAdvisories?: ReadAdvisories): Promise<Solved> {
-  const book: AdvisoryBook = { read: readAdvisories, found: new Map(), asked: new Set() };
+  const book: AdvisoryBook = { read: readAdvisories, found: new Map(), asked: new Map() };
   const finish = (plan: Plan, advised: Advised[]): Plan => {
     if (advised.length > 0) plan.advised = advised;
     if (book.unchecked) plan.advisoriesUnchecked = book.unchecked;
@@ -348,25 +360,29 @@ export async function solvePlan(input: PlanInput, readPackage: ReadPackage, read
   }
 
   const excluded = new Map(input.excluded);
+  const declined = new Set(input.declinedRaises);
   // Each restart rules out at least one alert, so this ends.
   for (let restart = 0; restart <= input.alerts.length; restart++) {
     const required = new Map<string, Need>();
     const batched = new Set<string>();
-    const declined = new Set<string>();
     let moving: Map<string, string> | undefined;
     let restarted = false;
+    // Going further than a fix is worth trying, not worth losing the fix over. Everything worked out
+    // on top of a raise goes with it, and is worked out afresh. Each can only be given up once, so this ends.
+    const giveUp = (names: string[]): void => {
+      for (const name of names) declined.add(name);
+      required.clear();
+      batched.clear();
+      moving = undefined;
+    };
 
     for (let pass = 0; pass < MAX_PASSES && !restarted; pass++) {
       const plan = buildPlan({ ...input, required: [...required.values()], moving, excluded });
 
-      // Going further than a fix is worth trying, not worth losing the fix over.
       const optional = [...(plan.unmet?.keys() ?? [])].filter((name) => required.get(name)?.soft);
       if (optional.length > 0) {
-        for (const name of optional) {
-          declined.add(name);
-          required.delete(name);
-        }
-        if (required.size === 0) moving = undefined;
+        giveUp(optional);
+        pass = -1;
         continue;
       }
 
@@ -382,10 +398,16 @@ export async function solvePlan(input: PlanInput, readPackage: ReadPackage, read
       const c = b.dead ? b : await needsOfGroups(input, plan, required, read);
       const stop = c.dead;
       if (stop) {
+        const raises = raisesBehind(required, stop.drivers);
+        if (raises.length > 0) {
+          giveUp(raises);
+          pass = -1;
+          continue;
+        }
         const block: Block = { reason: "moves-together", detail: stop.detail };
         if (!ruleOut(input, plan, stop.drivers, block, excluded)) {
           const fallback = buildPlan({ ...input, excluded });
-          return { plan: finish(fallback, []), drivers: new Map() };
+          return { plan: finish(fallback, []), drivers: new Map(), raised: new Set() };
         }
         restarted = true;
         continue;
@@ -393,17 +415,21 @@ export async function solvePlan(input: PlanInput, readPackage: ReadPackage, read
 
       const d = await needsOfAdvisories(input, plan, required, read, book, declined);
       const changed = merge(required, [...a.needs, ...b.needs, ...c.needs, ...d.needs], batched);
-      if (!changed && required.size === 0) return { plan: finish(plan, d.advised), drivers: new Map() };
+      if (!changed && required.size === 0) return { plan: finish(plan, d.advised), drivers: new Map(), raised: new Set() };
       if (!changed && sameTargets(moving, plan.targets)) {
         plan.batched = new Set([...batched].filter((name) => [...plan.targets.keys()].some((path) => input.lock.entries.get(path)?.name === name)));
         plan.movedWith = movedWithOf(plan, input, required);
-        return { plan: finish(plan, d.advised), drivers: new Map([...required].map(([name, need]) => [name, need.drivers])) };
+        return {
+          plan: finish(plan, d.advised),
+          drivers: new Map([...required].map(([name, need]) => [name, need.drivers])),
+          raised: new Set([...required].filter(([, need]) => need.soft).map(([name]) => name)),
+        };
       }
       moving = plan.targets;
     }
     if (!restarted) break;
   }
-  return { plan: finish(buildPlan({ ...input, excluded }), []), drivers: new Map() };
+  return { plan: finish(buildPlan({ ...input, excluded }), []), drivers: new Map(), raised: new Set() };
 }
 
 /** The plan alone, for a caller with no use for who drove what. */

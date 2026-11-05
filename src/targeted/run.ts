@@ -207,6 +207,7 @@ interface Group {
   plan: Plan;
   /** For a package moving only because of another, the packages it comes down to. */
   drivers: Solved["drivers"];
+  raised: Solved["raised"];
   /** Every file this group's run may write. */
   files: string[];
 }
@@ -545,12 +546,12 @@ async function planGroups(
       manifestPrefix: prefix,
       moveTogether: cfg.moveTogether,
     };
-    const { plan, drivers } = await solvePlan(input, read, deps.fetchAdvisories);
+    const { plan, drivers, raised } = await solvePlan(input, read, deps.fetchAdvisories);
     const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
     // npm writes to a shrinkwrap when there is one, so a failed run has to put it back too.
     const shrinkwrap = path.join(dir, "npm-shrinkwrap.json");
     const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...(existsSync(shrinkwrap) ? [shrinkwrap] : []), ...manifestFiles])];
-    groups.push({ dir, label, prefix, manifests, before: lock, input, plan, drivers, files });
+    groups.push({ dir, label, prefix, manifests, before: lock, input, plan, drivers, raised, files });
   }
   return groups;
 }
@@ -592,6 +593,20 @@ function culpritOf(failure: VerificationFailure, group: Group, moving: Set<strin
   }
 }
 
+/** The raises past a fix these failures could come down to. A failure naming no package could be any of them. */
+function raisesBehindFailures(group: Group, failures: VerificationFailure[], moving: Set<string>): string[] {
+  const out = new Set<string>();
+  for (const failure of failures) {
+    const culprit = culpritOf(failure, group, moving);
+    const behind = culprit ? new Set([culprit, ...(group.drivers.get(culprit) ?? [])]) : null;
+    for (const name of group.raised) {
+      const related = !behind || behind.has(name) || [...(group.drivers.get(name) ?? [])].some((driver) => behind.has(driver));
+      if (related) out.add(name);
+    }
+  }
+  return [...out];
+}
+
 /** The alerts on the copy a failure names, or on every copy of the package if it names none. */
 function alertsOnCopy(group: Group, failure: VerificationFailure, culprit: string): DependabotAlert[] {
   const version = failure.path ? group.before.entries.get(failure.path)?.version : undefined;
@@ -607,6 +622,19 @@ function alertsOnCopy(group: Group, failure: VerificationFailure, culprit: strin
  */
 async function replanWithout(group: Group, failures: VerificationFailure[], read: ReadPackage, readAdvisoriesOf: ReadAdvisories): Promise<boolean> {
   const moving = new Set([...group.plan.targets.keys()].flatMap((path) => group.before.entries.get(path)?.name ?? []));
+  const replan = async (): Promise<boolean> => {
+    const { plan, drivers, raised } = await solvePlan(group.input, read, readAdvisoriesOf);
+    group.plan = plan;
+    group.drivers = drivers;
+    group.raised = raised;
+    return true;
+  };
+  // Going past the fix was optional, so that goes first: the fix itself may well verify.
+  const raises = raisesBehindFailures(group, failures, moving);
+  if (raises.length > 0) {
+    group.input = { ...group.input, declinedRaises: new Set([...(group.input.declinedRaises ?? []), ...raises]) };
+    return replan();
+  }
   const excluded = new Map(group.input.excluded);
   const sizeBefore = excluded.size;
   for (const failure of failures) {
@@ -625,10 +653,7 @@ async function replanWithout(group: Group, failures: VerificationFailure[], read
   }
   if (excluded.size === sizeBefore) return false;
   group.input = { ...group.input, excluded };
-  const { plan, drivers } = await solvePlan(group.input, read, readAdvisoriesOf);
-  group.plan = plan;
-  group.drivers = drivers;
-  return true;
+  return replan();
 }
 
 /** The report's view of every group's plan, as it stands. */

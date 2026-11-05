@@ -690,3 +690,124 @@ describe("a fix version that has an advisory of its own", () => {
     assert.equal(plan.advisoriesUnchecked, undefined);
   });
 });
+
+describe("going further than a fix never costs the fix", () => {
+  const advisoryOn = (name: string, range: string): ReadAdvisories =>
+    async () => ({ [name]: [{ url: "https://example.test/a", vulnerable_versions: range }] });
+
+  it("gives up the raise when it would drag a package past its limit, and keeps the fix", async () => {
+    const { plan } = await solvePlan(
+      { ...inputOf({ alerts: [coreAlert("1.2.4")], ...family() }), limits: { forms: "<1.2.5" } },
+      registry(familyPublished(["1.1.2", "1.2.4", "1.2.6"])).read,
+      advisoryOn("core", ">=1.2.0 <1.2.5"),
+    );
+    assert.deepEqual(targetsOf(plan), { "node_modules/core": "1.2.4", "node_modules/common": "1.2.4", "node_modules/forms": "1.2.4" });
+    assert.equal(plan.alerts[0].status, "fixed");
+    assert.equal(plan.advised?.[0].name, "core");
+  });
+
+  it("gives up the raise when a family member has no release at the raised version", async () => {
+    const published = familyPublished(["1.1.2", "1.2.4", "1.2.6"]);
+    delete published.forms["1.2.6"];
+    const { plan } = await solvePlan(inputOf({ alerts: [coreAlert("1.2.4")], ...family() }), registry(published).read, advisoryOn("core", ">=1.2.0 <1.2.5"));
+    assert.equal(plan.targets.get("node_modules/core"), "1.2.4");
+    assert.equal(plan.targets.get("node_modules/forms"), "1.2.4");
+    assert.equal(plan.alerts[0].status, "fixed");
+  });
+
+  it("keeps an unrelated package's raise when it gives one up", async () => {
+    const lock = makeLock({
+      "": { dependencies: { core: "^1.1.0", common: "^1.1.0", forms: "^1.1.0", parent: "^1.0.0" } },
+      "node_modules/core": { version: "1.1.2" },
+      "node_modules/common": { version: "1.1.2", peerDependencies: { core: "1.1.2" } },
+      "node_modules/forms": { version: "1.1.2", peerDependencies: { core: "1.1.2", common: "1.1.2" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { tar: "^7.0.0" } },
+      "node_modules/tar": { version: "7.5.7" },
+    });
+    const deps = family().deps.concat({ name: "parent", spec: "^1.0.0", field: "dependencies" });
+    const published = { ...familyPublished(["1.1.2", "1.2.4", "1.2.6"]), tar: coreVersions("7.5.7", "7.5.18", "7.5.21") };
+    const readAdvisories: ReadAdvisories = async () => ({
+      core: [{ url: "https://example.test/core", vulnerable_versions: ">=1.2.0 <1.2.5" }],
+      tar: [{ url: "https://example.test/tar", vulnerable_versions: ">=7.5.0 <7.5.21" }],
+    });
+    const { plan } = await solvePlan(
+      { ...inputOf({ alerts: [coreAlert("1.2.4"), alert(9, "tar", ">= 7.0.0, < 7.5.18", "7.5.18")], lock, deps }), limits: { forms: "<1.2.5" } },
+      registry(published).read,
+      readAdvisories,
+    );
+    assert.equal(plan.targets.get("node_modules/core"), "1.2.4");
+    assert.equal(plan.targets.get("node_modules/tar"), "7.5.21");
+  });
+
+  it("leaves nothing tied to the abandoned raise behind", async () => {
+    const deps: DirectDep[] = [
+      { name: "core", spec: "^1.1.0", field: "dependencies" },
+      { name: "extra", spec: "^1.0.0", field: "dependencies" },
+    ];
+    // core 1.2.6 needs extra to move, and the only extra that would accept it is out of limits.
+    const published = {
+      core: coreVersions("1.1.2", "1.2.4", "1.2.6"),
+      extra: { "1.0.0": { peers: { core: ">=1.1.0 <1.2.5" } }, "1.1.0": { peers: { core: "^1.2.6" } } },
+    };
+    const manifestLock = makeLock({
+      "": { dependencies: { core: "^1.1.0", extra: "^1.0.0" } },
+      "node_modules/core": { version: "1.1.2" },
+      "node_modules/extra": { version: "1.0.0", peerDependencies: { core: ">=1.1.0 <1.2.5" } },
+    });
+    const { plan } = await solvePlan(
+      { ...inputOf({ alerts: [coreAlert("1.2.4")], lock: manifestLock, deps }), limits: { extra: "<1.1.0" } },
+      registry(published).read,
+      advisoryOn("core", ">=1.2.0 <1.2.5"),
+    );
+    assert.deepEqual(targetsOf(plan), { "node_modules/core": "1.2.4" });
+    assert.equal(plan.batched?.size ?? 0, 0);
+    assert.deepEqual(plan.movedWith ?? [], []);
+  });
+
+  it("honours a raise the caller has already given up on", async () => {
+    const { plan } = await solvePlan(
+      { ...inputOf({ alerts: [coreAlert("1.2.4")], ...family() }), declinedRaises: new Set(["core"]) },
+      registry(familyPublished(["1.1.2", "1.2.4", "1.2.6"])).read,
+      advisoryOn("core", ">=1.2.0 <1.2.5"),
+    );
+    assert.equal(plan.targets.get("node_modules/core"), "1.2.4");
+    assert.equal(plan.advised?.length, 1);
+  });
+
+  it("says which packages it raised, so a failed run can give those up first", async () => {
+    const { raised } = await solvePlan(
+      inputOf({ alerts: [coreAlert("1.2.4")], ...family() }),
+      registry(familyPublished(["1.1.2", "1.2.4", "1.2.6"])).read,
+      advisoryOn("core", ">=1.2.0 <1.2.5"),
+    );
+    assert.deepEqual([...raised], ["core"]);
+  });
+
+  it("checks a lower fix for advisories when a restart falls back to one", async () => {
+    const lock = makeLock({
+      "": { dependencies: { parent: "^1.0.0", other: "^1.0.0" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { hono: "^4.0.0" } },
+      "node_modules/hono": { version: "4.11.7" },
+      "node_modules/other": { version: "1.0.0" },
+    });
+    const deps: DirectDep[] = [
+      { name: "parent", spec: "^1.0.0", field: "dependencies" },
+      { name: "other", spec: "^1.0.0", field: "dependencies" },
+    ];
+    // hono 4.14.0 peers another major of `other`, which only shows on the second pass, after advisories were first read.
+    const published = {
+      hono: { "4.11.7": {}, "4.13.7": {}, "4.13.8": {}, "4.14.0": { peers: { other: "^2.0.0" } } },
+      other: coreVersions("1.0.0", "2.0.0"),
+    };
+    const reader: ReadAdvisories = async (query) => {
+      const low = { url: "https://example.test/low", vulnerable_versions: ">=4.13.0 <4.13.8" };
+      return { hono: (query.hono ?? []).includes("4.13.7") ? [low] : [] };
+    };
+    const { plan } = await solvePlan(
+      inputOf({ alerts: [alert(1, "hono", ">= 4.0.0, < 4.13.7", "4.13.7"), alert(2, "hono", ">= 4.0.0, < 4.14.0", "4.14.0")], lock, deps }),
+      registry(published).read,
+      reader,
+    );
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.8");
+  });
+});

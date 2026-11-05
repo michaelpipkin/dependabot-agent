@@ -86,6 +86,8 @@ export interface PlanInput {
   excluded?: Map<DependabotAlert, Block>;
   /** Groups a person has said must stay on one version, where npm's own metadata doesn't say so. */
   moveTogether?: string[][];
+  /** Packages not to take past their fix to clear an advisory: an earlier attempt that did failed. */
+  declinedRaises?: Set<string>;
 }
 export interface Requirement {
   name: string;
