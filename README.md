@@ -207,11 +207,12 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "discoverPackages": true,      // auto-discover isolated sub-packages (default true)
   "packages": [],                // extra manifest dirs to always process
   "updateWorkspaceMembers": true, // bump workspace members' manifests too (default true)
-  "limits": {}                   // targeted mode only: package glob -> semver range, e.g. {"@angular/*": "<22"}
+  "limits": {},                  // targeted mode only: package glob -> semver range, e.g. {"@angular/*": "<22"}
+  "moveTogether": []             // targeted mode only: groups kept on one version, e.g. [["@angular/ssr", "@angular/build"]]
 }
 ```
 
-`discoverPackages`, `packages`, `updateWorkspaceMembers`, and `limits` are config-file only — they have no flag or environment variable. See [Monorepos & isolated packages](#monorepos--isolated-packages) for what the first three govern: they are three different kinds of subdirectory and are easy to mix up. `limits` belongs to [targeted mode](#limits).
+`discoverPackages`, `packages`, `updateWorkspaceMembers`, `limits`, and `moveTogether` are config-file only — they have no flag or environment variable. See [Monorepos & isolated packages](#monorepos--isolated-packages) for what the first three govern: they are three different kinds of subdirectory and are easy to mix up. `limits` belongs to [targeted mode](#limits).
 
 > **The GitHub token is never read from a config file** — a `token` key here is ignored with a warning. Keep secrets in `.env` / `GITHUB_TOKEN` / CI secrets so they don't get committed.
 
@@ -426,12 +427,12 @@ Targeted mode is for teams that don't run a general `npm update`: packages move 
 dependabot-agent --update-strategy targeted --dry-run
 ```
 
-> **Status: new in 1.3.0, and not yet run on a real application.** See [What hasn't been tested](#what-hasnt-been-tested).
+> **Status: new in 1.3.0.** It has been run end to end on two Angular 21 applications built to test it, one single-package and one npm workspace, with 174 open alerts each. Neither is a production application. See [What hasn't been tested](#what-hasnt-been-tested).
 >
 > - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
-> - On a test repository, Dependabot closed every alert this mode fixed, including those fixed through the [temporary root step](#workspaces), and left open the ones it reported as blocked. Closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports them as awaiting close.
+> - On both applications, 173 of the 174 alerts were fixed, and the other was reported as blocked because it needs a major upgrade. `npm ci`, the build, the tests and linting passed on the pull requests. Dependabot closed all 173 within a minute of the merge and left the blocked one open. On a smaller test repository, closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports alerts as awaiting close.
 >
-> **Follow [Trying it safely](#trying-it-safely) on a real repository first**, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests. The agent doesn't build or test anything.
+> **Follow [Trying it safely](#trying-it-safely) on a real repository first**, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests, because the agent doesn't build or test anything. On those applications, a lockfile that passed every check still failed its build until [`moveTogether`](#packages-that-must-move-together) was set.
 
 It supports npm only. Run against a pnpm project, it stops at startup with an error, before anything is written. `compatible`, `latest` and everything on pnpm behave as before.
 
@@ -446,7 +447,7 @@ export GITHUB_TOKEN=<token> # PowerShell: $env:GITHUB_TOKEN = "<token>"
 npx -y dependabot-agent@1.3.0 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
 ```
 
-This reads the alerts and the lockfile, and looks up published versions. It needs no `node_modules`, changes nothing in the repository, and writes only the report. Read `report.md`. **A dry run only plans: it never resolves anything with npm,** so it can't show peer dependency conflicts, `legacy-peer-deps` problems or a failed check.
+This reads the alerts and the lockfile, and looks up published versions, what they require and their advisories. It needs no `node_modules`, changes nothing in the repository, and writes only the report. Read `report.md`. **A dry run only plans: it never resolves anything with npm,** so it can't show every conflict npm would refuse, `legacy-peer-deps` problems or a failed check.
 
 **2. A real run, locally, not pushed.** Run the same command without `--dry-run`. It needs no more access, edits only `package.json` and `package-lock.json` files, and never pushes. Check the result with `git diff`, then `npm ci` and your build and tests. `npm ci` runs your dependencies' install scripts, as it always does, so run it where you'd normally trust that. Undo everything with `git restore .`.
 
@@ -478,7 +479,7 @@ Run locally, the agent holds whatever token you give it, and talks to `api.githu
 
 #### What leaves the machine
 
-- **To `registry.npmjs.org`:** the names of alerted packages found in your lockfile, to read their published versions. When it's deciding whether an override it wrote can be removed, also the name and version of each installed package that depends on that override's package. **This address is fixed, and doesn't follow `.npmrc`,** so **a private package's name can reach the public registry** if it's in one of those lists. If that registry is blocked, the run fails and changes nothing.
+- **To `registry.npmjs.org`:** the names of alerted packages found in your lockfile, and of packages a fix would need to move with them, to read their published versions and what those require. The names of the packages the plan would move, with their versions from the fix upward on that release line, posted to the advisory endpoint `npm audit` uses. When it's deciding whether an override it wrote can be removed, also the name and version of each installed package that depends on that override's package. **This address is fixed, and doesn't follow `.npmrc`,** so **a private package's name can reach the public registry** if it's in one of those lists. If that registry is blocked, the run fails and changes nothing. If only the advisory endpoint fails, the run carries on, and the report says fix versions weren't checked.
 - **To your npm registry, through npm:** what `npm install --package-lock-only` normally requests.
 - **To GitHub:** the pull request, the issue, the job summary and the artifacts. These hold package names and versions, advisory severities, and what was fixed or blocked, and are as visible as your repository's Actions runs. See the note on public repositories [below](#what-the-agents-code-can-reach).
 - Nothing else: the agent has no telemetry.
@@ -487,7 +488,7 @@ Run locally, the agent holds whatever token you give it, and talks to `api.githu
 
 Be aware of these when deciding how far to go:
 
-- **A real application.** All live runs so far have been on small test repositories. Peer dependency conflicts and `legacy-peer-deps` haven't been seen on a real tree, which is what step 2 of [Trying it safely](#trying-it-safely) is for.
+- **A production application.** The largest runs have been on two Angular 21 applications built for this, with server-side rendering, Material, routing, forms, ESLint and Vitest, about 750 lockfile entries each. `legacy-peer-deps` ran on one of them, locally. Other frameworks, larger trees and a real application's own tests can turn up what these didn't, which is what step 2 of [Trying it safely](#trying-it-safely) is for.
 - **A private npm registry.** Lookups go to the public registry, as above, and the workflow doesn't set up credentials for a private one.
 - **GitHub Enterprise Server.** The agent's API address is fixed at `api.github.com`, and the workflow has only been run on github.com. With `--alerts-file`, the agent itself makes no GitHub call.
 - **A self-hosted runner.** The separation between jobs relies on each getting a fresh machine, and the workflow specifies `ubuntu-latest`. On a long-lived runner, code from `plan` could outlast its job.
@@ -500,7 +501,7 @@ The unit of decision is each **copy** of a package in `package-lock.json`, not e
 
 **What can move**
 
-- A copy inside an alert's vulnerable range, to the **earliest version that fixes it**: the alert's patched version. Where several alerts hit one release line, the highest patch on that line.
+- A copy inside an alert's vulnerable range, to the **earliest version that fixes it**: the alert's patched version. Where several alerts hit one release line, the highest patch on that line. If that version is inside another published advisory, which no alert would show because it doesn't touch the installed version, the fix goes on to the lowest later version on the same line, within your limits, that's clear of them all. If there's none it stays on the earliest fix, and the report lists it under "Fix still inside another advisory — review these", since merging it can raise a new alert.
 - A **direct dependency** is fixed by raising its declared range in the manifest that declares it, keeping the existing `^` or `~`.
 - A **transitive dependency** is fixed with an `overrides` entry in the root `package.json`, keyed to the vulnerable versions and set to exactly the target:
 
@@ -511,7 +512,8 @@ The unit of decision is each **copy** of a package in `package-lock.json`, not e
   ```
 
   The key has a lower bound as well as an upper one, so it can't catch a copy on another major line.
-- A package a fixed package newly requires, or that has to move with it, and a fixed copy npm relocates to another path. These are listed under "Other changes" in the report.
+- **A package a fix can't be installed without,** even with no alert of its own. See [Packages that must move together](#packages-that-must-move-together). These are listed under "Moved with a fix — review these" in the report, with the reason.
+- A package a fixed package newly requires, and a fixed copy npm relocates to another path. These are listed under "Other changes" in the report.
 
 **What doesn't move**
 
@@ -523,7 +525,7 @@ The unit of decision is each **copy** of a package in `package-lock.json`, not e
 - A copy bundled inside another package's tarball, which only that package's upgrade can change.
 - An override a person wrote.
 
-A fix can still land **past a range a dependent declares**, within the same major: for example `4.0.3` to `4.0.4` where a parent pins `4.0.3`. The change is applied, and the report lists it under "Applied past a declared range — review these" so a person looks at it.
+A fix can still land **past a range a dependent declares**, within the same major: for example `4.0.3` to `4.0.4` where a parent pins `4.0.3`. The change is applied, and the report lists it under "Applied past a declared range — review these" so a person looks at it. `npm ls` can call such a copy `invalid`: on the workspace test application it exited 1 over two overrides past exact versions declared by Angular's tooling, while `npm ci`, the build and the tests all passed.
 
 **Partial fixes.** A copy that can be fixed is fixed even if another copy of the same package is blocked. The alert is reported as partly fixed and stays open on GitHub until every copy is resolved.
 
@@ -543,6 +545,8 @@ A blocked copy is left exactly as it is, and the report names the copy and the r
 | `hand-written-override` | A person wrote an override that names this package. It is never changed or removed. |
 | `bundled` | The copy ships inside another package's tarball (`inBundle` in the lockfile). Neither a bump nor an override reaches it: fixing it needs an upgrade of the package that bundles it. A hoisted copy of the same package is still fixed. |
 | `manifest-not-processed` | No lockfile this run reads answers for the alert's manifest: it has a lockfile of its own and `discoverPackages` is off, it has no `package-lock.json` and no parent lockfile holds it as a package, it's a `yarn.lock` or `npm-shrinkwrap.json`, its directory no longer exists, or the path can't be read. The report names the manifest. |
+| `moves-together` | The fix needs another package to move with it, and that can't happen: a limit or a pin stops it, or no release agrees. The report names the package and the reason. |
+| `failed-verification` | The run couldn't move this package and pass [its checks](#how-a-run-is-checked), so it was left alone and the other fixes were kept. |
 | `selector-conflict` | The override the fix needs can't be written without moving something it shouldn't, or can't reach the copy. For example: it would also catch a copy that must stay put; the root declares a range the override would collide with (npm rejects that with `EOVERRIDE`); the copy is an alias; a dependent declares a range the override wouldn't match; an existing agent-written override still holds a different dependent's fix; or the copy sits inside a workspace member's own `node_modules`, where npm's override can't reach it. |
 
 ### Limits
@@ -561,6 +565,26 @@ A blocked copy is left exactly as it is, and the report names the copy and the r
 
 A fix whose target is outside a matching limit is blocked with the reason `limit`, so a fix that needs Angular 22 stays a hard no. If several alerts hit one release line and the highest patch would break a limit, the highest patch that doesn't is used, the alert that needs the higher one is blocked, and the lower one is still fixed. Limits are also checked after the run on every version that changed, including packages that moved as a side effect, so a limit can't be crossed indirectly. A malformed limit stops the run at startup, naming the key: `limits` that isn't an object, an empty package name or glob, or a blank or invalid range. `limits` under another strategy prints a warning and has no effect.
 
+### Packages that must move together
+
+Some packages can't move alone. Angular's name each other at an exact version in their peer dependencies, so npm refuses `@angular/router@21.2.25` while `@angular/core` is at `21.1.2`.
+
+The agent reads what each fix version requires from the registry. A package whose peer range a fix would break moves to the lowest version that agrees, and a package the fix peers on moves to the lowest version the fix accepts. Packages tied this way go in one `npm install`, after their old entries are taken out of the lockfile, because npm refuses them otherwise. On the Angular test applications, alerts on `@angular/router` and others moved eight `@angular/*` packages to one version, including `@angular/forms`, which had no alert asking for that version.
+
+**That's the one way a package with no alert can move, and your settings still apply.** A limit or an exact pin on any package in the group stops the fix, which is then blocked with the reason `moves-together`. Peers that already accept the new version leave a package alone: `@angular/material` stayed where it was. A peer that was out of range before the run is left as it was.
+
+npm's metadata doesn't show every such tie. `@angular/ssr` 21.2 needs `@angular/build` 21.2, but `@angular/build` 21.1 declares that it accepts any `^21.1.2` of `@angular/ssr`. With `ssr` moved alone, every check passed, and the build failed with `this.manifest.allowedHosts is not iterable`. List ties like that yourself:
+
+```jsonc
+// dependabot-agent.config.json
+{
+  "limits": { "@angular/*": "<22" },
+  "moveTogether": [["@angular/ssr", "@angular/build"]]
+}
+```
+
+When a package in a group moves, the others on the same release line move to the lowest version at or above it, in the same install. It does nothing unless you set it, and limits and pins apply as they do above. **Set this for an Angular application that uses server-side rendering.** A group needs at least two names, and a malformed one stops the run at startup. Under another strategy it prints a warning and has no effect.
+
 ### Overrides already in `package.json`
 
 - **Hand-written** overrides (a plain name, `name@2`, or one nested under a parent) are never changed or removed. If one applies to an alerted package, that copy is blocked and the report names the override.
@@ -569,7 +593,7 @@ A fix whose target is outside a matching limit is blocked with the reason `limit
 
 ### Workspaces
 
-Targeted mode reads the root, the workspace members and any `file:` packages from `package-lock.json`, not from the workspace globs, so any glob form works. Isolated sub-packages with their own lockfile (a `functions/` folder, say) are processed too, and share one report, one pull request and one all-or-nothing result.
+Targeted mode reads the root, the workspace members and any `file:` packages from `package-lock.json`, not from the workspace globs, so any glob form works. Isolated sub-packages with their own lockfile (a `functions/` folder, say) are processed too, and share one report and one pull request.
 
 Things to know:
 
@@ -585,7 +609,7 @@ Things to know:
 
 The agent applies fixes to the lockfile only: every npm command is `--package-lock-only --ignore-scripts`, and no `node_modules` is needed. `npm ci` passing is not treated as evidence, because it has passed on trees with packages missing. Instead, the result is checked against the snapshot taken before the run:
 
-1. Every copy the plan said it would fix is at its target.
+1. Every copy the plan said it would fix is at its target. If npm carried one past it, the agent first brings it back to the earliest fix. A copy whose dependents have moved on is judged by those dependents: each must get the target, or a later version clear of every open alert.
 2. Nothing else moved: every changed entry is a target copy at its target, or a package a target requires. When npm replaces a package it refetches what only that package used at the newest version in range; before this check runs, the agent puts back any entry that only changed version, and the check fails if npm won't keep it there. Anything else unrequired fails too: a package added, removed or moved to a new path, or a bundled package that changed with its parent's tarball, since an older entry for that would make the lockfile disagree with what `npm ci` installs.
 3. Every exact pin in every manifest resolves to the same version as before.
 4. Every changed entry satisfies any matching limit.
@@ -593,13 +617,15 @@ The agent applies fixes to the lockfile only: every npm command is `--package-lo
 6. Only the expected `package.json` files changed, and no temporary `devDependencies` remain.
 7. A second resolve changes nothing.
 
-If any check fails, **every file is restored, the run exits with code 1, and the report says which check failed and on which package.** It never produces a partial result. If restoring itself fails, the report says so and the pull request step doesn't run.
+**What lands has passed every check.** If a check fails on a particular package, that lockfile's files are restored and the run tries again without it, up to five times. It first gives up any step past the earliest fix, then the alerts behind the failure, which are reported as blocked with the reason `failed-verification`. So one package that won't verify doesn't cost every other fix, and a run can end with some alerts fixed and others blocked.
+
+If a failure can't be tied to a package, or the retries run out, **every file in every lockfile is restored, the run exits with code 1, and the report says which check failed.** If restoring itself fails, the report says so and the pull request step doesn't run.
 
 ### The report
 
 `--report <dir>` writes:
 
-- `report.md`: the text for a pull request or issue. Sections are Fixed, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text.
+- `report.md`: the text for a pull request or issue. Sections are Fixed, Moved with a fix, Fix still inside another advisory, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text.
 - `report.json`: the same data, plus an `outcome` that a workflow can act on.
 
 Every alert's line names the manifest GitHub raised it on, and the report says which npm ran.
@@ -738,7 +764,7 @@ The workflow doesn't set up credentials for a private npm registry. If your lock
 
 ### Supported npm versions
 
-**Use npm 11.3 or newer.** The live test suite was run on these versions, on Linux, and on 11.16 on Windows:
+**Use npm 11.3 or newer.** The live test suite was run on these versions, on Linux, and on 11.16 on Windows. The current code ran on 11.3, 11.16 and 11.19, and the Angular test applications on 11.16 and on the runner's npm:
 
 | npm | Result |
 | --- | --- |
