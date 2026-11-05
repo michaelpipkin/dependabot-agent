@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { fetchPublishedVersions, highestStableVersion, readPublishedVersions } from "../src/registry.js";
+import { fetchPublishedVersions, highestStableVersion, readPublishedPackage, readPublishedVersions } from "../src/registry.js";
 import { AgentError } from "../src/util.js";
 
 const realFetch = globalThis.fetch;
@@ -90,5 +90,30 @@ describe("reading published versions when the answer matters", () => {
     assert.equal(await fetchPublishedVersions("pkg"), null);
     globalThis.fetch = (() => Promise.reject(new TypeError("fetch failed"))) as typeof globalThis.fetch;
     assert.equal(await fetchPublishedVersions("pkg"), null);
+  });
+});
+
+describe("reading what published versions ask for", () => {
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("returns each version's dependencies and peers", async () => {
+    stubPackument({
+      versions: {
+        "1.0.0": { dependencies: { a: "^1.0.0" }, optionalDependencies: { b: "^2.0.0" }, peerDependencies: { c: "1.0.0" } },
+        "1.0.1": {},
+      },
+    });
+    const pkg = await readPublishedPackage("pkg");
+    assert.deepEqual(pkg?.get("1.0.0"), { dependencies: { a: "^1.0.0", b: "^2.0.0" }, peerDependencies: { c: "1.0.0" } });
+    assert.deepEqual(pkg?.get("1.0.1"), { dependencies: {}, peerDependencies: {} });
+  });
+
+  it("a 404 is null, and anything else throws, the same as reading the versions", async () => {
+    stubPackument(null, 404);
+    assert.equal(await readPublishedPackage("nope"), null);
+    stubPackument(null, 503);
+    await assert.rejects(readPublishedPackage("pkg"), (e: unknown) => e instanceof AgentError && e.message.includes("503"));
   });
 });

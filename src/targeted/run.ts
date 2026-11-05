@@ -14,8 +14,8 @@ import {
   resolvePmForDir,
 } from "../reconcile.js";
 import type { RunResult } from "../reconcile.js";
-import { fetchDependentRanges, readPublishedVersions, usableRange } from "../registry.js";
-import { compareSemver, parseSemver } from "../semver.js";
+import { fetchDependentRanges, readPublishedPackage, usableRange } from "../registry.js";
+import { compareSemver, parseSemver, satisfiesVulnerableRange } from "../semver.js";
 import type { DependabotAlert, DependentRange } from "../types.js";
 import { AgentError, exitWithError, log, warn } from "../util.js";
 import { applyPlan, npmVersion, snapshotFiles, tryRemoveOverride } from "./apply.js";
@@ -23,17 +23,19 @@ import type { NpmRunner, Snapshot } from "./apply.js";
 import { copiesOf, edgesOf, edgesTo, hasOldLockfile, readLockfile } from "./lockfile.js";
 import type { LockEntry, LockIndex } from "./lockfile.js";
 import { isAgentAuthoredOverride, selectorKeyName } from "./override-keys.js";
-import { buildPlan, unprocessedAlert } from "./plan.js";
-import type { AlertOutcome, ManifestInfo, Plan } from "./plan.js";
+import { unprocessedAlert } from "./plan.js";
+import type { AlertOutcome, Block, ManifestInfo, Plan, PlanInput } from "./plan.js";
 import { computeOutcome, renderMarkdown, writeReport } from "./report.js";
 import type { RunReport } from "./report.js";
+import { ruleOut, solvePlan } from "./requirements.js";
+import type { PublishedPackage, ReadPackage, Solved } from "./requirements.js";
 import { treeProblems } from "./verify.js";
 import type { VerificationFailure } from "./verify.js";
 
 export interface TargetedDeps {
   fetchAlerts: (cfg: ResolvedConfig) => Promise<DependabotAlert[]>;
-  /** A package's published versions, null if the registry has no such package. Any other failure throws. */
-  fetchPublished: (name: string) => Promise<string[] | null>;
+  /** A package's published versions and what each asks of others, null if the registry has no such package. Any other failure throws. */
+  fetchPackage: ReadPackage;
   /** What a dependent declares for a package at its latest release (its installed range comes from the lockfile). */
   fetchDependents: typeof fetchDependentRanges;
   /** The npm this run uses, or null if it can't be read. */
@@ -44,7 +46,7 @@ export interface TargetedDeps {
 const defaultDeps: TargetedDeps = {
   fetchAlerts: async (cfg) =>
     cfg.alertsFile ? readDependabotAlertsFile(cfg.alertsFile) : fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
-  fetchPublished: readPublishedVersions,
+  fetchPackage: readPublishedPackage,
   fetchDependents: fetchDependentRanges,
   npmVersion,
 };
@@ -197,7 +199,11 @@ interface Group {
   manifests: ManifestInfo[];
   /** The lockfile as the run found it. */
   before: LockIndex;
+  /** What the plan was made from: a retry makes it again with an alert ruled out. */
+  input: PlanInput;
   plan: Plan;
+  /** For a package moving only because of another, the packages it comes down to. */
+  drivers: Solved["drivers"];
   /** Every file this group's run may write. */
   files: string[];
 }
@@ -456,7 +462,7 @@ const restoreNote = (state: RunState): string =>
     ? `Restoring the files failed, so the working tree may hold partial changes: ${state.restoreError}`
     : "Every file was restored to how it was before the run.";
 
-type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion">;
+type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith">;
 
 /** Write the report if asked to, and print it. A write that fails says so, and names the directory. */
 function publish(report: RunReport, cfg: ResolvedConfig, state: RunState): void {
@@ -512,6 +518,7 @@ async function planGroups(
 ): Promise<Group[]> {
   const published = new Map<string, string[] | null>();
   const groups: Group[] = [];
+  const read = once(deps.fetchPackage);
   for (const [dir, alerts] of groupAlertsByNearestLockfile(open, cfg.workspaceRoot, extraDirs)) {
     const prefix = sameDir(dir, cfg.workspaceRoot) ? "" : posix(path.relative(cfg.workspaceRoot, dir));
     const label = prefix || "root";
@@ -524,11 +531,7 @@ async function planGroups(
 
     const lock = readLockfile(dir);
     const manifests = manifestsOf(dir, lock);
-    for (const { security_vulnerability: v } of alerts) {
-      const name = v.package.name;
-      if (!published.has(name) && copiesOf(lock, name).length > 0) published.set(name, await deps.fetchPublished(name));
-    }
-    const plan = buildPlan({
+    const input: PlanInput = {
       alerts,
       lock,
       manifests,
@@ -537,40 +540,142 @@ async function planGroups(
       published,
       updateWorkspaceMembers: cfg.updateWorkspaceMembers,
       manifestPrefix: prefix,
-    });
+      moveTogether: cfg.moveTogether,
+    };
+    const { plan, drivers } = await solvePlan(input, read);
     const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
     // npm writes to a shrinkwrap when there is one, so a failed run has to put it back too.
     const shrinkwrap = path.join(dir, "npm-shrinkwrap.json");
     const files = [...new Set([path.join(dir, "package.json"), path.join(dir, "package-lock.json"), ...(existsSync(shrinkwrap) ? [shrinkwrap] : []), ...manifestFiles])];
-    groups.push({ dir, label, prefix, manifests, before: lock, plan, files });
+    groups.push({ dir, label, prefix, manifests, before: lock, input, plan, drivers, files });
   }
   return groups;
 }
 
+/** Each package read at most once across a run's lockfiles and its retries. */
+function once(read: ReadPackage): ReadPackage {
+  const seen = new Map<string, Promise<PublishedPackage | null>>();
+  return (name) => {
+    const known = seen.get(name);
+    if (known) return known;
+    const reading = read(name);
+    seen.set(name, reading);
+    return reading;
+  };
+}
+
+/** How many times to retry one lockfile without what failed, before giving up on it. */
+const MAX_RETRIES = 5;
+
+/** The package a verification failure comes down to, if it names one that's moving. */
+function culpritOf(failure: VerificationFailure, group: Group, moving: Set<string>): string | null {
+  const named = (name: string | undefined): string | null => (name && moving.has(name) ? name : null);
+  switch (failure.check) {
+    case "fixed":
+    case "limits-held":
+      return failure.path ? named(group.before.entries.get(failure.path)?.name) : null;
+    case "tree-complete": {
+      const [from, to] = failure.detail.split(" -> ");
+      return named(group.before.entries.get(from)?.name) ?? named(/^(@?[^@]+)@/.exec(to ?? "")?.[1]);
+    }
+    case "run": {
+      // npm error Could not resolve dependency:
+      // npm error peer core@"1.2.25" from forms@1.2.25
+      const edge = /Could not resolve dependency:\s*npm error (?:(?:dev|optional|peer|peerOptional)\s+)?(@?[^@\s]+)@\S+(?: from (@?[^@\s]+)@)?/.exec(failure.detail);
+      return named(edge?.[1]) ?? named(edge?.[2]);
+    }
+    default:
+      return null;
+  }
+}
+
+/** The alerts on the copy a failure names, or on every copy of the package if it names none. */
+function alertsOnCopy(group: Group, failure: VerificationFailure, culprit: string): DependabotAlert[] {
+  const version = failure.path ? group.before.entries.get(failure.path)?.version : undefined;
+  return group.input.alerts.filter((alert) => {
+    const { package: pkg, vulnerable_version_range: range } = alert.security_vulnerability;
+    return pkg.name === culprit && (version === undefined || satisfiesVulnerableRange(version, range) !== false);
+  });
+}
+
 /**
- * Apply each group's plan. All or nothing: on the first failure every file in every
- * group is restored, the report is written, and the run exits with an error.
+ * Rule out every alert the failures come down to, and plan the group again without them.
+ * False if nothing could be ruled out: the failure isn't tied to any fix, so it stands.
  */
-function applyGroups(
+async function replanWithout(group: Group, failures: VerificationFailure[], read: ReadPackage): Promise<boolean> {
+  const moving = new Set([...group.plan.targets.keys()].flatMap((path) => group.before.entries.get(path)?.name ?? []));
+  const excluded = new Map(group.input.excluded);
+  const sizeBefore = excluded.size;
+  for (const failure of failures) {
+    const culprit = culpritOf(failure, group, moving);
+    if (!culprit) continue;
+    const detail = failure.detail.split("\n").slice(0, 3).join(" ").replace(/\.$/, "");
+    const block: Block = {
+      reason: "failed-verification",
+      detail: `The run couldn't move ${culprit} and pass verification, so this was left alone: ${detail}.`,
+    };
+    // What pushed it there goes first: on its own, the package may still take a lower fix.
+    if (ruleOut(group.input, group.plan, group.drivers.get(culprit) ?? new Set(), block, excluded)) continue;
+    for (const alert of alertsOnCopy(group, failure, culprit)) {
+      if (!excluded.has(alert)) excluded.set(alert, block);
+    }
+  }
+  if (excluded.size === sizeBefore) return false;
+  group.input = { ...group.input, excluded };
+  const { plan, drivers } = await solvePlan(group.input, read);
+  group.plan = plan;
+  group.drivers = drivers;
+  return true;
+}
+
+/** The report's view of every group's plan, as it stands. */
+function refreshBase(base: ReportBase, groups: Group[], unprocessed: AlertOutcome[], state: RunState): void {
+  base.alerts = [...groups.flatMap(reportedAlerts), ...unprocessed];
+  base.blockedCount = blockedCountOf(base.alerts);
+  base.movedWith = groups.flatMap((group) =>
+    (group.plan.movedWith ?? []).map((moved) => (groups.length > 1 ? { ...moved, because: `In ${group.label}: ${moved.because}` } : moved)),
+  );
+  state.alerts = base.alerts;
+}
+
+/**
+ * Apply each group's plan. What ends up in the files has passed every check. A failure tied to
+ * a package puts that lockfile's files back and tries again without the alerts it comes down to,
+ * which are reported as blocked. Any other failure, or one too many retries, restores every file
+ * in every group, writes the report, and exits with an error.
+ */
+async function applyGroups(
   groups: Group[],
   cfg: ResolvedConfig,
-  run: NpmRunner | undefined,
+  deps: TargetedDeps,
   base: ReportBase,
+  unprocessed: AlertOutcome[],
   snapshot: Snapshot,
   state: RunState,
-): number {
+): Promise<number> {
+  const read = once(deps.fetchPackage);
   let applied = 0;
   for (const group of groups) {
-    const planned = plannedChangesOf(group.plan);
-    if (planned > 0) log(`\n🔧 Applying ${group.label}`);
-    const failures = applyPlan(group.dir, group.plan, { limits: cfg.limits, manifests: group.manifests, run });
-    if (failures.length > 0) {
+    const groupSnapshot = snapshotFiles(group.files);
+    for (let attempt = 0; ; attempt++) {
+      const planned = plannedChangesOf(group.plan);
+      if (planned > 0) log(`\n🔧 Applying ${group.label}`);
+      const failures = applyPlan(group.dir, group.plan, { limits: cfg.limits, manifests: group.manifests, run: deps.run });
+      if (failures.length === 0) {
+        applied += planned;
+        break;
+      }
+      if (attempt < MAX_RETRIES && (await replanWithout(group, failures, read))) {
+        groupSnapshot.restore();
+        refreshBase(base, groups, unprocessed, state);
+        log(`   That didn't verify. Trying ${group.label} again without what failed:\n${failures.map((f) => `     ${f.check}: ${f.detail.split("\n")[0]}`).join("\n")}`);
+        continue;
+      }
       restoreAll(snapshot, state);
       const named = groups.length > 1 ? failures.map((f) => ({ ...f, detail: `In ${group.label}: ${f.detail}` })) : failures;
       publishFailed(named, base, cfg, state);
       exitWithError(failureMessage(group, failures, state));
     }
-    applied += planned;
   }
   return applied;
 }
@@ -627,15 +732,13 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
   refusePnpmLockAlerts(placed);
 
   const groups = await planGroups(cfg, deps, placed.processed, [...extraDirs, ...placed.addedDirs]);
-  const alerts = [...groups.flatMap(reportedAlerts), ...placed.unprocessed];
-  state.alerts = alerts;
-  const blockedCount = blockedCountOf(alerts);
-  const base: ReportBase = { dryRun: cfg.dryRun, blockedCount, alerts, npmVersion: state.npmVersion };
+  const base: ReportBase = { dryRun: cfg.dryRun, blockedCount: 0, alerts: [], npmVersion: state.npmVersion };
+  refreshBase(base, groups, placed.unprocessed, state);
 
   if (cfg.dryRun) {
     const removedOverrides = await previewOrphans(groups, ctx);
     const planned = groups.reduce((sum, g) => sum + plannedChangesOf(g.plan), 0) + removedOverrides.length;
-    const outcome = computeOutcome({ failed: false, changedFiles: planned, blockedCount });
+    const outcome = computeOutcome({ failed: false, changedFiles: planned, blockedCount: base.blockedCount });
     publish({ ...base, outcome, otherChanges: [], keptOverrides: [], removedOverrides, failures: [] }, cfg, state);
     return { overrideChanges: planned };
   }
@@ -645,14 +748,14 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
   const snapshot = snapshotFiles(files);
 
   try {
-    let overrideChanges = applyGroups(groups, cfg, deps.run, base, snapshot, state);
+    let overrideChanges = await applyGroups(groups, cfg, deps, base, placed.unprocessed, snapshot, state);
     const orphans = await removeOrphansIn(groups, ctx, deps.run);
     overrideChanges += orphans.removed.length;
 
     // Bytes, not planned changes: a run that rewrote nothing is clean or blocked-only.
     const changedFiles = files.filter((file) => !sameBytes(bytesBefore.get(file) ?? null, readBytes(file))).length;
     const otherChanges = groups.flatMap((group) => otherChangesOf(group, readLockfile(group.dir)));
-    const outcome = computeOutcome({ failed: false, changedFiles, blockedCount });
+    const outcome = computeOutcome({ failed: false, changedFiles, blockedCount: base.blockedCount });
     const report: RunReport = { ...base, outcome, otherChanges, keptOverrides: orphans.kept, removedOverrides: orphans.removed, failures: [] };
     try {
       publish(report, cfg, state);

@@ -22,6 +22,7 @@ export interface ResolvedConfig {
   packages: string[]; // extra manifest dirs to always process (relative to root)
   updateWorkspaceMembers: boolean; // let the update pass rewrite workspace members' manifests
   limits: Record<string, string>; // targeted mode: package-name glob → semver range it must stay within
+  moveTogether?: string[][]; // targeted mode: groups of package names that must stay on one version
   reportDir?: string; // write a run report here (flag/env only)
   alertsFile?: string; // targeted mode: read alerts from this file, with no token (flag/env only)
 }
@@ -39,6 +40,7 @@ interface ConfigFile {
   packages?: string[];
   updateWorkspaceMembers?: boolean;
   limits?: Record<string, string>;
+  moveTogether?: string[][];
   token?: string; // not allowed — warned and ignored
 }
 
@@ -166,11 +168,15 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   // Targeted-mode version ceilings (config-file only). Validated up front so a
   // typo fails the run immediately instead of silently limiting nothing.
   const limits = parseLimits(config.limits);
+  const moveTogether = parseMoveTogether(config.moveTogether);
 
   const reportDir = args.reportDir || env.REPORT_DIR || undefined;
 
   if (Object.keys(limits).length > 0 && updateStrategy !== "targeted") {
     warn(`"limits" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
+  }
+  if (moveTogether.length > 0 && updateStrategy !== "targeted") {
+    warn(`"moveTogether" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
   }
   if (reportDir && updateStrategy !== "targeted") {
     warn(`"--report" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
@@ -213,6 +219,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     packages,
     updateWorkspaceMembers,
     limits,
+    moveTogether,
     reportDir,
     alertsFile,
   };
@@ -253,6 +260,22 @@ function parseLimits(value: unknown): Record<string, string> {
     }
   }
   return limits as Record<string, string>;
+}
+
+/** The config file's `moveTogether`: a typo here would quietly hold nothing together, so it stops the run. */
+function parseMoveTogether(value: unknown): string[][] {
+  if (value === undefined) return [];
+  const example = `such as [["@angular/ssr", "@angular/build"]]`;
+  if (!Array.isArray(value)) {
+    exitWithError(`Invalid "moveTogether" in the config file: ${JSON.stringify(value)} is not a list of groups of package names, ${example}.`);
+  }
+  for (const group of value as unknown[]) {
+    const names = Array.isArray(group) ? group : [];
+    if (names.length < 2 || names.some((name) => typeof name !== "string" || name.trim() === "")) {
+      exitWithError(`Invalid "moveTogether" group ${JSON.stringify(group)}: each group needs at least two package names, ${example}.`);
+    }
+  }
+  return value as string[][];
 }
 
 function parseStrategyEnv(value: string | undefined): UpdateStrategy | undefined {

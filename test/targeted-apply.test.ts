@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { applyPlan, bumpCommand, NpmRunner, resolveCommand, snapshotFiles, tryRemoveOverride } from "../src/targeted/apply.js";
+import { applyPlan, batchedBumpCommands, bumpCommand, NpmRunner, resolveCommand, snapshotFiles, tryRemoveOverride } from "../src/targeted/apply.js";
 import { DirectBump, ManifestInfo, Plan } from "../src/targeted/plan.js";
 
 function bump(over: Partial<DirectBump> = {}): DirectBump {
@@ -951,5 +951,263 @@ describe("what a failed npm step is called", () => {
     };
     const failures = applyPlan(project.dir, overridePlan(), { limits: {}, manifests: project.manifests, run });
     assert.deepEqual(failures.map((f) => f.check), ["stable"]);
+  });
+});
+
+describe("batchedBumpCommands", () => {
+  const family = (over: Partial<DirectBump>[]): Plan => ({
+    ...emptyPlan({ bumps: over.map((o) => bump(o)) }),
+    batched: new Set(over.map((o) => o.name!)),
+  });
+
+  it("installs a family at the root in one command, always saving a caret", () => {
+    const plan = family([
+      { name: "core", target: "1.2.25" },
+      { name: "forms", target: "1.2.25", operator: "~" },
+    ]);
+    assert.deepEqual(batchedBumpCommands(plan), [
+      'npm install core@1.2.25 forms@1.2.25 "--save-prefix=^" --save-exact=false --package-lock-only --ignore-scripts --no-audit --no-fund',
+    ]);
+  });
+
+  it("names every member that wants the same versions in one command", () => {
+    const plan = family([
+      { name: "core", target: "1.2.25", memberPath: "apps/tasks" },
+      { name: "core", target: "1.2.25", memberPath: "apps/admin" },
+    ]);
+    assert.match(batchedBumpCommands(plan)[0], /^npm install core@1\.2\.25 -w apps\/admin -w apps\/tasks /);
+    assert.equal(batchedBumpCommands(plan).length, 1);
+  });
+
+  it("gives a member wanting something different its own command, so nobody gains a dependency", () => {
+    const plan = family([
+      { name: "core", target: "1.2.25", memberPath: "apps/tasks" },
+      { name: "forms", target: "1.2.25", memberPath: "apps/tasks" },
+      { name: "core", target: "1.2.25", memberPath: "apps/admin" },
+    ]);
+    const commands = batchedBumpCommands(plan);
+    assert.equal(commands.length, 2);
+    assert.ok(commands.some((c) => c.startsWith("npm install core@1.2.25 -w apps/admin ")));
+    assert.ok(commands.some((c) => c.startsWith("npm install core@1.2.25 forms@1.2.25 -w apps/tasks ")));
+  });
+
+  it("keeps the root apart from a member: -w wouldn't reach it", () => {
+    const plan = family([
+      { name: "core", target: "1.2.25" },
+      { name: "core", target: "1.2.25", memberPath: "apps/tasks" },
+    ]);
+    const commands = batchedBumpCommands(plan);
+    assert.equal(commands.length, 2);
+    assert.ok(commands.some((c) => !c.includes(" -w ")));
+  });
+
+  it("leaves out anything not tied to the family", () => {
+    const plan = { ...emptyPlan({ bumps: [bump({ name: "core" }), bump({ name: "express" })] }), batched: new Set(["core"]) };
+    assert.equal(batchedBumpCommands(plan).length, 1);
+    assert.doesNotMatch(batchedBumpCommands(plan)[0], /express/);
+  });
+
+  it("is nothing at all for a plan with no family", () => {
+    assert.deepEqual(batchedBumpCommands(emptyPlan({ bumps: [bump()] })), []);
+  });
+});
+
+describe("moving a family in one install", () => {
+  interface FamilyProject {
+    dir: string;
+    rootFile: string;
+    lockFile: string;
+    manifests: ManifestInfo[];
+  }
+
+  function familyProject(formsSpec = "^1.1.0"): FamilyProject {
+    const dir = tempDir();
+    const rootFile = join(dir, "package.json");
+    const lockFile = join(dir, "package-lock.json");
+    const dependencies = { core: "^1.1.0", forms: formsSpec };
+    writeJson(rootFile, { name: "fx", version: "1.0.0", dependencies });
+    writeJson(lockFile, {
+      name: "fx",
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "fx", version: "1.0.0", dependencies },
+        "node_modules/core": { version: "1.1.2" },
+        "node_modules/forms": { version: "1.1.2", peerDependencies: { core: "1.1.2" } },
+      },
+    });
+    return { dir, rootFile, lockFile, manifests: [{ dir, lockPath: "", deps: [] }] };
+  }
+
+  const familyPlan = (project: FamilyProject, formsOperator: "^" | "~" = "^"): Plan => ({
+    ...emptyPlan({
+      bumps: [
+        bump({ manifestDir: project.dir, name: "core", from: "^1.1.0", target: "1.2.25" }),
+        bump({ manifestDir: project.dir, name: "forms", from: `${formsOperator}1.1.0`, operator: formsOperator, target: "1.2.25" }),
+      ],
+      targets: new Map([
+        ["node_modules/core", "1.2.25"],
+        ["node_modules/forms", "1.2.25"],
+      ]),
+    }),
+    batched: new Set(["core", "forms"]),
+  });
+
+  /** npm as testing showed it: it refuses while the old family is still in the lockfile, and saves whatever prefix it's given. */
+  function familyNpm(project: FamilyProject) {
+    const commands: string[] = [];
+    const run: NpmRunner = (command) => {
+      commands.push(command);
+      const lock = readJson(project.lockFile) as { packages: Record<string, Json> };
+      if (command.startsWith("npm install core@")) {
+        if (lock.packages["node_modules/core"] || lock.packages["node_modules/forms"]) throw new Error("ERESOLVE could not resolve");
+        const root = readJson(project.rootFile) as { dependencies: Record<string, string> };
+        root.dependencies = { core: "^1.2.25", forms: "^1.2.25" };
+        writeJson(project.rootFile, root);
+        lock.packages["node_modules/core"] = { version: "1.2.25" };
+        lock.packages["node_modules/forms"] = { version: "1.2.25", peerDependencies: { core: "1.2.25" } };
+      }
+      lock.packages[""].dependencies = (readJson(project.rootFile) as { dependencies: Json }).dependencies;
+      writeJson(project.lockFile, lock);
+    };
+    return { run, commands };
+  }
+
+  it("takes the old family out of the lockfile first, which is what lets npm install it", () => {
+    const project = familyProject();
+    const npm = familyNpm(project);
+    const failures = applyPlan(project.dir, familyPlan(project), { limits: {}, manifests: project.manifests, run: npm.run });
+    assert.deepEqual(failures, []);
+    const lock = readJson(project.lockFile) as { packages: Record<string, Json> };
+    assert.equal(lock.packages["node_modules/core"].version, "1.2.25");
+    assert.equal(lock.packages["node_modules/forms"].version, "1.2.25");
+  });
+
+  it("installs the family once, and not package by package", () => {
+    const project = familyProject();
+    const npm = familyNpm(project);
+    applyPlan(project.dir, familyPlan(project), { limits: {}, manifests: project.manifests, run: npm.run });
+    assert.equal(npm.commands.filter((c) => c !== resolveCommand()).length, 1);
+  });
+
+  it("puts a tilde range back after the install that saved it with a caret", () => {
+    const project = familyProject("~1.1.0");
+    const npm = familyNpm(project);
+    const failures = applyPlan(project.dir, familyPlan(project, "~"), { limits: {}, manifests: project.manifests, run: npm.run });
+    assert.deepEqual(failures, []);
+    const { dependencies } = readJson(project.rootFile) as { dependencies: Record<string, string> };
+    assert.deepEqual(dependencies, { core: "^1.2.25", forms: "~1.2.25" });
+  });
+
+  it("doesn't touch the lockfile's entries for a package outside the family", () => {
+    const project = familyProject();
+    const lock = readJson(project.lockFile) as { packages: Record<string, Json> };
+    lock.packages["node_modules/other"] = { version: "1.0.0" };
+    writeJson(project.lockFile, lock);
+    let seen: Json | undefined;
+    const npm = familyNpm(project);
+    const run: NpmRunner = (command, cwd) => {
+      seen ??= (readJson(project.lockFile) as { packages: Json }).packages as Json;
+      npm.run(command, cwd);
+    };
+    applyPlan(project.dir, familyPlan(project), { limits: {}, manifests: project.manifests, run });
+    assert.ok(seen && "node_modules/other" in seen);
+    assert.ok(!("node_modules/core" in seen));
+  });
+});
+
+describe("a planned copy npm carries past its target", () => {
+  /** parent -> nanoid: parent's new release accepts 3.3.16 up, so npm fetches the newest it can. */
+  function project() {
+    const dir = tempDir();
+    const rootFile = join(dir, "package.json");
+    const lockFile = join(dir, "package-lock.json");
+    const dependencies = { parent: "^1.0.0" };
+    writeJson(rootFile, { name: "fx", version: "1.0.0", dependencies });
+    writeJson(lockFile, {
+      name: "fx",
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "fx", version: "1.0.0", dependencies },
+        "node_modules/parent": { version: "1.0.0", dependencies: { nanoid: "^3.3.16" } },
+        "node_modules/nanoid": { version: "3.3.11" },
+      },
+    });
+    return { dir, rootFile, lockFile, manifests: [{ dir, lockPath: "", deps: [] }] as ManifestInfo[] };
+  }
+  const plan = (): Plan =>
+    emptyPlan({
+      addOverrides: { "nanoid@>=3.0.0 <3.3.16": "3.3.16" },
+      targets: new Map([["node_modules/nanoid", "3.3.16"]]),
+    });
+
+  /** Moves nanoid to whatever an override says, and otherwise to the newest in range unless it's already at or past what's asked. */
+  function npmFor(p: ReturnType<typeof project>) {
+    const seen: string[][] = [];
+    const run: NpmRunner = () => {
+      const { overrides = {} } = readJson(p.rootFile) as { overrides?: Record<string, string> };
+      seen.push(Object.keys(overrides));
+      const lock = readJson(p.lockFile) as { packages: Record<string, Json> };
+      const pulled = Object.keys(overrides).some((k) => k.startsWith("nanoid@>=3.3.16"));
+      const version = lock.packages["node_modules/nanoid"].version as string;
+      if (pulled) lock.packages["node_modules/nanoid"].version = "3.3.16";
+      else if (version === "3.3.11") lock.packages["node_modules/nanoid"].version = "3.3.20";
+      writeJson(p.lockFile, lock);
+    };
+    return { run, seen };
+  }
+
+  it("pulls it back down to the earliest fix", () => {
+    const p = project();
+    const failures = applyPlan(p.dir, plan(), { limits: {}, manifests: p.manifests, run: npmFor(p).run });
+    assert.deepEqual(failures, []);
+    assert.equal((readJson(p.lockFile) as { packages: Record<string, Json> }).packages["node_modules/nanoid"].version, "3.3.16");
+  });
+
+  it("leaves only the plan's override behind", () => {
+    const p = project();
+    applyPlan(p.dir, plan(), { limits: {}, manifests: p.manifests, run: npmFor(p).run });
+    assert.deepEqual((readJson(p.rootFile) as { overrides: Json }).overrides, { "nanoid@>=3.0.0 <3.3.16": "3.3.16" });
+  });
+
+  it("selects only what's at or above the target, so it can't argue with the plan's own override", () => {
+    const p = project();
+    const npm = npmFor(p);
+    applyPlan(p.dir, plan(), { limits: {}, manifests: p.manifests, run: npm.run });
+    assert.ok(npm.seen.flat().includes("nanoid@>=3.3.16 <4.0.0"), JSON.stringify(npm.seen));
+  });
+
+  it("leaves a path now holding another line of the package: that isn't an overshoot, and pulling it down would undo a dependent's move", () => {
+    const p = project();
+    const seen: string[][] = [];
+    const run: NpmRunner = () => {
+      seen.push(Object.keys((readJson(p.rootFile) as { overrides?: Json }).overrides ?? {}));
+      const lock = readJson(p.lockFile) as { packages: Record<string, Json> };
+      lock.packages["node_modules/nanoid"].version = "5.0.12";
+      writeJson(p.lockFile, lock);
+    };
+    applyPlan(p.dir, plan(), { limits: {}, manifests: p.manifests, run });
+    assert.equal(seen.flat().some((key) => key.startsWith("nanoid@>=3.3.16")), false);
+  });
+
+  it("does nothing extra when nothing overshot", () => {
+    const p = project();
+    const seen: string[][] = [];
+    const run: NpmRunner = () => {
+      seen.push(Object.keys((readJson(p.rootFile) as { overrides?: Json }).overrides ?? {}));
+      const lock = readJson(p.lockFile) as { packages: Record<string, Json> };
+      lock.packages["node_modules/nanoid"].version = "3.3.16";
+      writeJson(p.lockFile, lock);
+    };
+    applyPlan(p.dir, plan(), { limits: {}, manifests: p.manifests, run });
+    assert.equal(seen.flat().includes("nanoid@>=3.3.16 <4.0.0"), false);
+  });
+
+  it("leaves a package a manifest declares for the install command to answer for: npm refuses an override matching it", () => {
+    const p = project();
+    const manifests: ManifestInfo[] = [{ dir: p.dir, lockPath: "", deps: [{ name: "nanoid", spec: "^3.3.11", field: "dependencies" }] }];
+    const npm = npmFor(p);
+    const failures = applyPlan(p.dir, plan(), { limits: {}, manifests, run: npm.run });
+    assert.equal(npm.seen.flat().includes("nanoid@>=3.3.16 <4.0.0"), false);
+    assert.ok(failures.some((f) => f.check === "fixed"), JSON.stringify(failures));
   });
 });

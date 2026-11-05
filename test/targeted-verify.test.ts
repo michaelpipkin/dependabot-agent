@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { DirectBump, Plan } from "../src/targeted/plan.js";
-import { treeProblems, verify, type VerifyInput } from "../src/targeted/verify.js";
+import { treeProblems, unrequiredMoves, verify, type VerifyInput } from "../src/targeted/verify.js";
 import { makeLock } from "./helpers/lock.js";
 
 type Packages = Record<string, object>;
@@ -49,6 +49,128 @@ const globBefore = (): Packages => ({
   "node_modules/glob": { version: "13.0.0", dependencies: { minimatch: "^10.1.1" } },
   "node_modules/minimatch": { version: "10.1.1", dependencies: { "@isaacs/brace-expansion": "^5.0.0" } },
   "node_modules/@isaacs/brace-expansion": { version: "5.0.0" },
+});
+
+describe("a planned copy that a moved dependent no longer uses", () => {
+  // minimatch moved to a release that needs brace-expansion 5, so the planned 2.x copy is simply gone.
+  const before: Packages = {
+    "": { dependencies: { minimatch: "^9.0.0" } },
+    "node_modules/minimatch": { version: "9.0.0", dependencies: { "brace-expansion": "^2.0.1" } },
+    "node_modules/brace-expansion": { version: "2.0.1" },
+  };
+  const after = (version: string): Packages => ({
+    "": { dependencies: { minimatch: "^9.0.9" } },
+    "node_modules/minimatch": { version: "9.0.9", dependencies: { "brace-expansion": `^${version}` } },
+    "node_modules/brace-expansion": { version },
+  });
+  const planned = (ranges: string[]): Plan => ({
+    ...planOf({ "node_modules/minimatch": "9.0.9", "node_modules/brace-expansion": "2.1.7" }, [bump("minimatch", "dependencies", "9.0.9")]),
+    alertRanges: new Map([["brace-expansion", ranges]]),
+  });
+  const fixedFailures = (plan: Plan, version: string, gone: Packages) =>
+    verify({
+      before: makeLock(before),
+      after: makeLock(gone),
+      plan,
+      limits: {},
+      overrides: {},
+      pins: [],
+      changedManifests: ["package.json"],
+      expectedManifests: ["package.json"],
+      stable: true,
+    }).filter((f) => f.check === "fixed" && f.detail.includes(version));
+
+  /** The hoisted path is gone: the dependent got what it needs nested under it. */
+  const nested = (version: string): Packages => {
+    const { "node_modules/brace-expansion": _gone, ...rest } = after(version);
+    return { ...rest, "node_modules/minimatch/node_modules/brace-expansion": { version } };
+  };
+
+  it("counts it as fixed when what replaced it is outside every alert", () => {
+    assert.deepEqual(fixedFailures(planned([">= 2.0.0, < 2.1.7"]), "5.0.12", nested("5.0.12")), []);
+  });
+
+  it("fails when what replaced it is still inside an alert", () => {
+    const failures = fixedFailures(planned([">= 2.0.0, < 2.1.7", ">= 5.0.0, < 5.0.13"]), "5.0.12", nested("5.0.12"));
+    assert.equal(failures.length, 1);
+    assert.match(failures[0].detail, /5\.0\.12/);
+  });
+
+  it("fails when what replaced it is below the target, however clean it looks", () => {
+    const failures = fixedFailures(planned([">= 2.0.0, < 2.0.2"]), "2.0.1", nested("2.0.1"));
+    assert.equal(failures.length, 1);
+  });
+
+  it("fails when the plan doesn't say what the alerts cover", () => {
+    const plan = planOf({ "node_modules/minimatch": "9.0.9", "node_modules/brace-expansion": "2.1.7" }, [bump("minimatch", "dependencies", "9.0.9")]);
+    assert.equal(fixedFailures(plan, "5.0.12", nested("5.0.12")).length, 1);
+  });
+});
+
+describe("a planned path now holding another line of the package", () => {
+  // npm hoisted brace-expansion 5 for a moved minimatch, and nested the 1.x copy `old` still needs.
+  const before: Packages = {
+    "": { dependencies: { minimatch: "^9.0.0", old: "^1.0.0" } },
+    "node_modules/minimatch": { version: "9.0.0", dependencies: { "brace-expansion": "^1.1.0" } },
+    "node_modules/old": { version: "1.0.0", dependencies: { "brace-expansion": "^1.1.0" } },
+    "node_modules/brace-expansion": { version: "1.1.12" },
+  };
+  const after = (oldGets: string, hoisted = "5.0.12"): Packages => ({
+    "": { dependencies: { minimatch: "^9.0.9", old: "^1.0.0" } },
+    "node_modules/minimatch": { version: "9.0.9", dependencies: { "brace-expansion": "^5.0.0" } },
+    "node_modules/old": { version: "1.0.0", dependencies: { "brace-expansion": "^1.1.0" } },
+    "node_modules/old/node_modules/brace-expansion": { version: oldGets },
+    "node_modules/brace-expansion": { version: hoisted },
+  });
+  const fixedFailures = (gone: Packages, ranges = [">= 1.0.0, < 1.1.21"]) =>
+    verify({
+      before: makeLock(before),
+      after: makeLock(gone),
+      plan: {
+        ...planOf({ "node_modules/minimatch": "9.0.9", "node_modules/brace-expansion": "1.1.21" }, [bump("minimatch", "dependencies", "9.0.9")]),
+        alertRanges: new Map([["brace-expansion", ranges]]),
+      },
+      limits: {},
+      overrides: {},
+      pins: [],
+      changedManifests: ["package.json"],
+      expectedManifests: ["package.json"],
+      stable: true,
+    }).filter((f) => f.check === "fixed");
+
+  it("is fixed when every dependent got the target or something clear of the alerts", () => {
+    assert.deepEqual(fixedFailures(after("1.1.21")), []);
+  });
+
+  it("fails when a dependent still gets the vulnerable version", () => {
+    assert.equal(fixedFailures(after("1.1.12")).length, 1);
+  });
+
+  it("fails when what's at the path is itself inside an alert", () => {
+    assert.equal(fixedFailures(after("1.1.21"), [">= 1.0.0, < 1.1.21", ">= 5.0.0, < 5.0.13"]).length, 1);
+  });
+
+  it("still fails a copy on the target's own line that isn't at the target", () => {
+    const failures = fixedFailures(after("1.1.21", "1.1.30"));
+    assert.equal(failures.length, 1);
+    assert.match(failures[0].detail, /1\.1\.30/);
+  });
+});
+
+describe("unrequiredMoves", () => {
+  it("never offers a planned copy for putting back: that would restore the vulnerable version", () => {
+    const before = makeLock({
+      "": { dependencies: { parent: "^1.0.0" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { nanoid: "^3.3.0" } },
+      "node_modules/nanoid": { version: "3.3.11" },
+    });
+    const after = makeLock({
+      "": { dependencies: { parent: "^1.0.0" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { nanoid: "^3.3.0" } },
+      "node_modules/nanoid": { version: "3.3.20" },
+    });
+    assert.deepEqual(unrequiredMoves({ before, after, plan: planOf({ "node_modules/nanoid": "3.3.12" }) }), []);
+  });
 });
 
 describe("verify", () => {

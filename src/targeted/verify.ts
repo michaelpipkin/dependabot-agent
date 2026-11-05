@@ -1,4 +1,5 @@
 import semver from "semver";
+import { satisfiesVulnerableRange } from "../semver.js";
 import { edgesOf, LockEntry, LockIndex, reachableFrom, resolveDep } from "./lockfile.js";
 import { overrideKeyName } from "./override-keys.js";
 import { declaredRange, lineStart, matchesLimit, Plan, selectorCatches } from "./plan.js";
@@ -69,6 +70,18 @@ function safeAtOrAbove(version: string | undefined, target: string): boolean {
   }
 }
 
+/**
+ * Whether a dependent has left the planned copy behind for something better: a moved
+ * package can need a later line of a dependency altogether, which leaves nothing at the
+ * target to find. Above the target and clear of every open alert, so nothing vulnerable
+ * took the old copy's place. A range that can't be read clears nothing.
+ */
+function clearedAbove(plan: Plan, name: string, version: string | undefined, target: string): boolean {
+  const ranges = plan.alertRanges?.get(name);
+  if (!ranges || !version || !semver.valid(version) || !semver.gt(version, target)) return false;
+  return ranges.every((range) => satisfiesVulnerableRange(version, range) === false);
+}
+
 /** A path added by the run that carries the very name and version of a copy the plan meant to move. */
 function reappearedCopy(before: LockIndex, after: LockIndex, old: LockEntry): LockEntry | undefined {
   return [...after.entries.values()].find(
@@ -90,17 +103,20 @@ function stillDeclares(entry: LockEntry | undefined, name: string): boolean {
 /**
  * Every planned copy is fixed. A copy still at its path must be at the target.
  * A copy gone from its path (hoisting can relocate or merge it) is judged by the
- * dependents it had that still exist: each must now resolve to the target, or to
- * an untouched copy already at or above it on the same line. A planned copy with
- * no surviving dependents has nothing left to fix, and a dependent that no longer
- * resolves at all is for tree-complete to report.
+ * dependents it had that still exist: each must now resolve to the target, to an
+ * untouched copy already at or above it on the same line, or to a later version
+ * clear of every open alert. A planned copy with no surviving dependents has
+ * nothing left to fix, and a dependent that no longer resolves at all is for
+ * tree-complete to report.
  */
 function checkFixed({ before, after, plan }: VerifyInput): VerificationFailure[] {
   const out: VerificationFailure[] = [];
   const beforeEdges = edgesOf(before);
   for (const [path, target] of plan.targets) {
     const entry = after.entries.get(path);
-    if (entry) {
+    // Another line of the package, clear of the alerts: npm hoisted it for someone else, so the path says nothing about this copy.
+    const replaced = entry && clearedAbove(plan, entry.name, entry.version, target) && lineStart(entry.version!) !== lineStart(target);
+    if (entry && !replaced) {
       if (entry.version !== target) {
         out.push({
           check: "fixed",
@@ -126,6 +142,7 @@ function checkFixed({ before, after, plan }: VerifyInput): VerificationFailure[]
       if (!now || now.version === target) continue;
       const was = before.entries.get(now.path);
       if (was && sameEntry(was, now) && safeAtOrAbove(now.version, target)) continue;
+      if (clearedAbove(plan, edge.name, now.version, target)) continue;
       const dependent = edge.from || "(root)";
       out.push({
         check: "fixed",
@@ -159,6 +176,8 @@ export function unrequiredMoves(input: Pick<VerifyInput, "before" | "after" | "p
     const old = input.before.entries.get(path);
     const now = input.after.entries.get(path);
     if (old?.version === undefined || now?.version === undefined || old.inBundle || now.inBundle) return false;
+    // A planned copy that overshot still has to end at its target: its old entry is the vulnerable one.
+    if (input.plan.targets.has(path)) return false;
     return old.name === now.name && path.includes("node_modules/");
   };
   return checkNothingElseMoved(input).flatMap((failure) => (failure.path !== undefined && moved(failure.path) ? [failure.path] : []));

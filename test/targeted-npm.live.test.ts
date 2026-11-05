@@ -985,6 +985,63 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       });
     });
 
+    describe("Angular's packages, whose peers name each other exactly", () => {
+      const FRAMEWORK = { "@angular/common": "^21.1.0", "@angular/core": "^21.1.0", "@angular/forms": "^21.1.0", "@angular/platform-browser": "^21.1.0", rxjs: "~7.8.0", tslib: "^2.3.0" };
+      const CORE_ALERT = alert(1, "@angular/core", ">= 21.0.0, < 21.2.20", "21.2.20");
+      const reportFolder = (): string => {
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+        return reportDir;
+      };
+      const versionsOf = (dir: string): string[] =>
+        Object.keys(FRAMEWORK)
+          .filter((name) => name.startsWith("@angular/"))
+          .map((name) => readLockfile(dir).entries.get(`node_modules/${name}`)?.version ?? "absent");
+
+      it("moves all of them in one install, including the ones with no alert, and the tree installs", async () => {
+        const dir = project("2026-02-01", { root: { dependencies: FRAMEWORK } });
+        const reportDir = reportFolder();
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [CORE_ALERT] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        assert.equal(got.outcome, "changes");
+        assert.deepEqual(versionsOf(dir), ["21.2.20", "21.2.20", "21.2.20", "21.2.20"]);
+        assert.ok(got.movedWith?.some((m) => m.name === "@angular/forms"));
+        assert.equal(json(dir, "package.json").overrides, undefined);
+        npm(dir, `ci ${QUIET}`);
+      });
+
+      it("does the same when the tree lives in two workspace members", async () => {
+        const dir = project("2026-02-01", { members: { one: { dependencies: FRAMEWORK }, two: { dependencies: FRAMEWORK } } });
+        const reportDir = reportFolder();
+
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [CORE_ALERT] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        assert.deepEqual(versionsOf(dir), ["21.2.20", "21.2.20", "21.2.20", "21.2.20"]);
+        for (const member of ["one", "two"]) {
+          assert.equal((json(dir, "packages", member, "package.json").dependencies as Record<string, string>)["@angular/forms"], "^21.2.20");
+        }
+        npm(dir, `ci ${QUIET}`);
+      });
+
+      it("leaves everything alone when a limit rules the family's fix out", async () => {
+        const dir = project("2026-02-01", { root: { dependencies: FRAMEWORK } });
+        const reportDir = reportFolder();
+        const lockBefore = text(dir, "package-lock.json");
+
+        await runTargeted({ ...cfg(dir, reportDir), limits: { "@angular/forms": "<21.2" } }, { fetchAlerts: async () => [CORE_ALERT] });
+
+        const got = report(reportDir);
+        assert.equal(got.outcome, "blocked-only");
+        assert.equal(got.alerts[0].copies[0].reason, "moves-together");
+        assert.equal(text(dir, "package-lock.json"), lockBefore);
+      });
+    });
+
     describe("removing an override", () => {
       it("a real removal: the key goes, the outcome is changes, and the next run is clean", async () => {
         const key = MINIMATCH_KEY;

@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DepScope } from "../types.js";
-import type { AlertOutcome, CopyDecision } from "./plan.js";
+import type { AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
 import type { VerificationFailure } from "./verify.js";
 
 export type Outcome = "changes" | "blocked-only" | "clean" | "failed";
@@ -18,6 +18,8 @@ export interface RunReport {
   failures: VerificationFailure[];
   /** What `npm --version` said when the run started, or null if it couldn't be read. */
   npmVersion: string | null;
+  /** Packages that moved further than any alert of their own asks, because a fix can't install without it. */
+  movedWith?: MovedWith[];
   /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
   restoreError?: string;
 }
@@ -239,6 +241,16 @@ function buildSections(report: RunReport): Section[] {
     items: changeTable(withStatus("fixed")).items,
   });
 
+  sections.push({
+    heading: "Moved with a fix — review these",
+    intro: [
+      (planned ? "Each package below would move" : "Each package below moved") +
+        " further than any alert of its own asks, because a fix can't be installed without it. Its limits and pins were still honoured.",
+      "",
+    ],
+    items: (report.movedWith ?? []).map((m) => `- \`${m.name}\` ${arrow(m.from, m.to)}: ${m.because}.`),
+  });
+
   const partly = withStatus("partly-fixed");
   const partlyTable = changeTable(partly, "Still open", (a) => {
     const n = a.copies.filter(isBlocked).length;
@@ -339,6 +351,7 @@ const sectionText = (s: Section, items: string[]): string =>
 const PRIORITY = [
   "Failures",
   "Blocked",
+  "Moved with a fix — review these",
   "Applied past a declared range — review these",
   "Overrides removed",
   "Partly fixed",

@@ -252,7 +252,7 @@ const SAFE: Awaited<ReturnType<Dependents>> = { installedRange: "^6.5.3", latest
 function depsFor(alerts: DependabotAlert[], npm: { run: NpmRunner }, dependents?: Dependents): Partial<TargetedDeps> {
   return {
     fetchAlerts: async () => alerts,
-    fetchPublished: async (name) => PUBLISHED[name] ?? null,
+    fetchPackage: async (name) => (PUBLISHED[name] ? new Map(PUBLISHED[name].map((version) => [version, { dependencies: {}, peerDependencies: {} }])) : null),
     fetchDependents: dependents ?? (async () => ({ installedRange: null, latestRange: null, latestKnown: false })),
     run: npm.run,
     npmVersion: () => "11.16.0",
@@ -1735,4 +1735,275 @@ describe("the npm that ran", () => {
     assert.equal(reportIn(reportDir).npmVersion, null);
     assert.match(reportMd(reportDir), /npm version unknown/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// One stubborn package doesn't cost the others their fixes
+// ---------------------------------------------------------------------------
+
+describe("a package that won't verify", () => {
+  /** qs and ms, each reached only through a package that accepts its fix. */
+  const twoAlerts = (): ProjectSpec => ({
+    root: { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+    packages: {
+      "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+      "node_modules/qs": { version: "6.5.0" },
+      "node_modules/b": { version: "1.0.0", dependencies: { ms: "^2.0.0" } },
+      "node_modules/ms": { version: "2.0.0" },
+    },
+  });
+  const rootMs = (): DependabotAlert => alert(2, "ms", "< 2.0.5", "2.0.5");
+
+  /** While an override for ms is in place, npm leaves ms somewhere the plan doesn't say. */
+  const stubbornMs = (dir: string): void => {
+    const overrides = readJson(join(dir, "package.json")).overrides ?? {};
+    if (!Object.keys(overrides).some((key) => key.startsWith("ms@"))) return;
+    const lock = readLock(dir);
+    lock.packages["node_modules/ms"].version = "2.1.3";
+    writeLock(dir, lock);
+  };
+
+  it("blocks that package, keeps the other fix, and says why", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, twoAlerts());
+    const npm = fakeNpm({ onResolve: stubbornMs });
+
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), rootMs()], npm));
+
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "changes");
+    const status = Object.fromEntries(report.alerts.map((a) => [a.packageName, a.status]));
+    assert.deepEqual(status, { qs: "fixed", ms: "blocked" });
+    const ms = report.alerts.find((a) => a.packageName === "ms")!.copies[0];
+    assert.equal(ms.reason, "failed-verification");
+    assert.match(ms.detail!, /2\.1\.3/);
+    assert.match(reportMd(reportDir), /## Blocked[\s\S]*ms/);
+  });
+
+  it("leaves nothing of the failed attempt behind", async () => {
+    const dir = tempDir();
+    writeProject(dir, twoAlerts());
+    await runTargeted(cfgFor(dir), depsFor([qsAlert(), rootMs()], fakeNpm({ onResolve: stubbornMs })));
+
+    assert.deepEqual(readJson(join(dir, "package.json")).overrides, { [QS_KEY]: "6.5.3" });
+    const lock = readLock(dir);
+    assert.equal(lock.packages["node_modules/qs"].version, "6.5.3");
+    assert.equal(lock.packages["node_modules/ms"].version, "2.0.0");
+  });
+
+  it("ends blocked-only, with every file as it was, when that was the only fix", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, twoAlerts());
+    const before = treeOf(dir);
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([rootMs()], fakeNpm({ onResolve: stubbornMs })));
+    assert.equal(reportIn(reportDir).outcome, "blocked-only");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("keeps a fix already made in another lockfile while it retries this one", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    writeProject(join(dir, "functions"), functionsProject());
+    await runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), msAlert()], fakeNpm({ onResolve: stubbornMs })));
+
+    assert.equal(readLock(dir).packages["node_modules/qs"].version, "6.5.3");
+    assert.equal(readLock(join(dir, "functions")).packages["node_modules/ms"].version, "2.0.0");
+    const status = Object.fromEntries(reportIn(reportDir).alerts.map((a) => [a.packageName, a.status]));
+    assert.deepEqual(status, { qs: "fixed", ms: "blocked" });
+  });
+
+  it("stops retrying after a bound, restores everything, and fails", async () => {
+    const names = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { dependencies: Object.fromEntries(names.map((name) => [`via-${name}`, "^1.0.0"])) },
+      packages: Object.fromEntries(
+        names.flatMap((name) => [
+          [`node_modules/via-${name}`, { version: "1.0.0", dependencies: { [name]: "^1.0.0" } }],
+          [`node_modules/${name}`, { version: "1.0.0" }],
+        ]),
+      ),
+    });
+    const before = treeOf(dir);
+    // Only the first package still planned goes wrong, so each attempt rules out exactly one.
+    const onePerAttempt = (at: string): void => {
+      const overrides = readJson(join(at, "package.json")).overrides ?? {};
+      const first = names.find((name) => Object.keys(overrides).some((key) => key.startsWith(`${name}@`)));
+      if (!first) return;
+      const lock = readLock(at);
+      lock.packages[`node_modules/${first}`].version = "1.9.9";
+      writeLock(at, lock);
+    };
+    const npm = fakeNpm({ onResolve: onePerAttempt });
+    const deps = depsFor(names.map((name, i) => alert(10 + i, name, "< 1.0.5", "1.0.5")), npm);
+
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), {
+        ...deps,
+        fetchPackage: async () => new Map(["1.0.0", "1.0.5"].map((v) => [v, { dependencies: {}, peerDependencies: {} }])),
+      }),
+      /failed verification/,
+    );
+    assert.equal(reportIn(reportDir).outcome, "failed");
+    assert.deepEqual(treeOf(dir), before);
+  });
+
+  it("still stops the whole run on a failure nothing ties to a package", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, twoAlerts());
+    const before = treeOf(dir);
+    await assert.rejects(
+      runTargeted(cfgFor(dir, { reportDir }), depsFor([qsAlert(), rootMs()], fakeNpm({ failIn: dir }))),
+      /failed in root: run/,
+    );
+    assert.equal(reportIn(reportDir).outcome, "failed");
+    assert.deepEqual(treeOf(dir), before);
+  });
+});
+
+describe("what moved because a fix needed it", () => {
+  const project = (): ProjectSpec => ({
+    root: { dependencies: { core: "^1.1.0", forms: "^1.1.0" } },
+    packages: {
+      "node_modules/core": { version: "1.1.2" },
+      "node_modules/forms": { version: "1.1.2", peerDependencies: { core: "1.1.2" } },
+    },
+  });
+  const published = async (name: string) =>
+    name === "core"
+      ? new Map([["1.1.2", { dependencies: {}, peerDependencies: {} }], ["1.2.20", { dependencies: {}, peerDependencies: {} }]])
+      : new Map([["1.1.2", { dependencies: {}, peerDependencies: { core: "1.1.2" } }], ["1.2.20", { dependencies: {}, peerDependencies: { core: "1.2.20" } }]]);
+  const coreAlert = (): DependabotAlert => alert(1, "core", ">= 1.0.0, < 1.2.20", "1.2.20");
+
+  it("reads a plan's reason from the registry, and shows the unalerted package in the report", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, project());
+    await runTargeted(cfgFor(dir, { reportDir, dryRun: true }), { ...depsFor([coreAlert()], fakeNpm()), fetchPackage: published });
+
+    const report = reportIn(reportDir);
+    assert.deepEqual(
+      report.movedWith?.map((m) => `${m.name} ${m.from}>${m.to}`),
+      ["forms 1.1.2>1.2.20"],
+    );
+    const md = reportMd(reportDir);
+    assert.match(md, /## Moved with a fix/);
+    assert.match(md, /`forms`.*1\.1\.2 → 1\.2\.20/);
+    assert.match(md, /peers core at "1\.1\.2"/);
+  });
+
+  it("says nothing about it when nothing moved along", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    await runTargeted(cfgFor(dir, { reportDir, dryRun: true }), depsFor([qsAlert()], fakeNpm()));
+    assert.doesNotMatch(reportMd(reportDir), /Moved with a fix/);
+  });
+});
+
+describe("what a retry rules out", () => {
+  const noPeers = (versions: string[], deps: Record<string, Record<string, string>> = {}) =>
+    new Map(versions.map((v) => [v, { dependencies: deps[v] ?? {}, peerDependencies: {} }]));
+
+  it("takes the package driving a move first, so the moved package can still have its own earliest fix", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { dependencies: { top: "^1.0.0" } },
+      packages: {
+        "node_modules/top": { version: "1.0.0", dependencies: { parent: "^1.0.0", other: "^1.0.0" } },
+        "node_modules/parent": { version: "1.0.0", dependencies: { child: "^1.0.0" } },
+        "node_modules/other": { version: "1.0.0", dependencies: { child: "^1.0.0" } },
+        "node_modules/child": { version: "1.0.0" },
+      },
+    });
+    // child goes wrong only when something pushes it to the higher version.
+    const onResolve = (at: string): void => {
+      const overrides = readJson(join(at, "package.json")).overrides ?? {};
+      if (!Object.keys(overrides).some((key) => key.startsWith("child@") && key.endsWith("<1.0.5"))) return;
+      const lock = readLock(at);
+      lock.packages["node_modules/child"].version = "1.9.9";
+      writeLock(at, lock);
+    };
+    const npm = fakeNpm({ onResolve });
+    await runTargeted(cfgFor(dir, { reportDir }), {
+      ...depsFor([alert(1, "parent", "< 1.0.1", "1.0.1"), alert(2, "child", "< 1.0.2", "1.0.2")], npm),
+      fetchPackage: async (name) =>
+        name === "parent"
+          ? noPeers(["1.0.0", "1.0.1"], { "1.0.1": { child: "^1.0.5" } })
+          : noPeers(["1.0.0", "1.0.2", "1.0.5"]),
+    });
+
+    const status = Object.fromEntries(reportIn(reportDir).alerts.map((a) => [a.packageName, a.status]));
+    assert.deepEqual(status, { parent: "blocked", child: "fixed" });
+    assert.equal(readLock(dir).packages["node_modules/child"].version, "1.0.2");
+  });
+
+  it("leaves an alert on another line of the package alone", async () => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, {
+      root: { dependencies: { a: "^1.0.0", b: "^1.0.0" } },
+      packages: {
+        "node_modules/a": { version: "1.0.0", dependencies: { nanoid: "^3.0.0" } },
+        "node_modules/nanoid": { version: "3.3.0" },
+        "node_modules/b": { version: "1.0.0", dependencies: { nanoid: "^5.0.0" } },
+        "node_modules/b/node_modules/nanoid": { version: "5.0.0" },
+      },
+    });
+    const onResolve = (at: string): void => {
+      const overrides = readJson(join(at, "package.json")).overrides ?? {};
+      if (!Object.keys(overrides).some((key) => key.includes("<3.3.1"))) return;
+      const lock = readLock(at);
+      lock.packages["node_modules/nanoid"].version = "3.9.9";
+      writeLock(at, lock);
+    };
+    await runTargeted(cfgFor(dir, { reportDir }), {
+      ...depsFor([alert(1, "nanoid", ">= 3.0.0, < 3.3.1", "3.3.1"), alert(2, "nanoid", ">= 5.0.0, < 5.0.1", "5.0.1")], fakeNpm({ onResolve })),
+      fetchPackage: async () => noPeers(["3.3.0", "3.3.1", "5.0.0", "5.0.1"]),
+    });
+
+    const status = Object.fromEntries(reportIn(reportDir).alerts.map((a) => [a.number, a.status]));
+    assert.deepEqual(status, { 1: "blocked", 2: "fixed" });
+    assert.equal(readLock(dir).packages["node_modules/b/node_modules/nanoid"].version, "5.0.1");
+  });
+
+  for (const [label, edge] of [
+    ["a peer", `peer core@"1.2.25" from forms@1.2.25`],
+    ["a dev dependency", `dev core@"1.2.25" from the root project`],
+    ["a plain dependency", `core@"1.2.25" from the root project`],
+  ] as Array<[string, string]>) {
+    it(`reads the package from npm's ERESOLVE when the edge is ${label}`, async () => {
+      const dir = tempDir();
+      const reportDir = tempDir();
+      writeProject(dir, {
+        root: { dependencies: { core: "^1.0.0", a: "^1.0.0" } },
+        packages: {
+          "node_modules/core": { version: "1.0.0" },
+          "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } },
+          "node_modules/qs": { version: "6.5.0" },
+        },
+      });
+      const fake = fakeNpm();
+      const run: NpmRunner = (command, cwd) => {
+        if (command.startsWith("npm install core@")) {
+          throw Object.assign(new Error(`Command failed: ${command}`), {
+            stderr: `npm error code ERESOLVE\nnpm error ERESOLVE could not resolve\nnpm error\nnpm error While resolving: fx@1.0.0\nnpm error\nnpm error Could not resolve dependency:\nnpm error ${edge}\n`,
+          });
+        }
+        fake.run(command, cwd);
+      };
+      await runTargeted(cfgFor(dir, { reportDir }), {
+        ...depsFor([alert(1, "core", "< 1.2.25", "1.2.25"), qsAlert({})], { run }),
+        fetchPackage: async (name) => (name === "core" ? noPeers(["1.0.0", "1.2.25"]) : noPeers(["6.5.0", "6.5.3"])),
+      });
+      const status = Object.fromEntries(reportIn(reportDir).alerts.map((a) => [a.packageName, a.status]));
+      assert.deepEqual(status, { core: "blocked", qs: "fixed" });
+    });
+  }
 });
