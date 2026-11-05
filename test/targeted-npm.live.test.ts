@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
+import semver from "semver";
 import { readDirectDependencies } from "../src/manifest.js";
 import { readNpmOverrides } from "../src/override-source.js";
 import { applyPlan, NpmRunner, resolveCommand, snapshotFiles } from "../src/targeted/apply.js";
@@ -20,6 +21,9 @@ import type { RunReport } from "../src/targeted/report.js";
 const LIVE = process.env.DEPENDABOT_AGENT_LIVE_NPM === "1";
 
 const QUIET = "--ignore-scripts --no-audit --no-fund";
+
+// These tests name exact fix versions, so what's been published since mustn't move them. One test below asks for real.
+const noAdvisories = async (): Promise<Record<string, never>> => ({});
 
 function npm(dir: string, args: string): void {
   execSync(`npm ${args}`, { cwd: dir, stdio: "pipe" });
@@ -717,7 +721,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       const lockBefore = text(dir, "package-lock.json");
       const memberBefore = text(dir, "apps", "web", "site", "package.json");
 
-      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+      await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
 
       const r = report(reportDir);
       assert.equal(r.outcome, "blocked-only");
@@ -733,7 +737,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
       dirs.push(reportDir);
 
-      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+      await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
 
       assert.equal(report(reportDir).outcome, "changes");
       assert.deepEqual(json(dir, "apps", "web", "site", "package.json").dependencies, { minimatch: "^3.0.5" });
@@ -748,7 +752,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
       dirs.push(reportDir);
       const rootBefore = json(dir, "package.json");
 
-      await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+      await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
 
       assert.deepEqual(report(reportDir).failures, []);
       assert.deepEqual(json(dir, "package.json"), { ...rootBefore, overrides: { [MINIMATCH_KEY]: "3.0.5" } });
@@ -763,7 +767,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
 
         const direct = unseenMemberProject({}, { minimatch: "^3.0.4" }, [pattern], "apps/web");
-        await runTargeted(cfg(direct, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+        await runTargeted(cfg(direct, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
         assert.equal(report(reportDir).outcome, "changes");
         assert.deepEqual(json(direct, "apps", "web", "package.json").dependencies, { minimatch: "^3.0.5" });
         assert.equal(json(direct, "package.json").overrides, undefined);
@@ -771,7 +775,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
 
         const viaGlob = unseenMemberProject({}, { glob: "^7.1.6" }, [pattern], "apps/web");
         const rootBefore = json(viaGlob, "package.json");
-        await runTargeted(cfg(viaGlob, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+        await runTargeted(cfg(viaGlob, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
         assert.deepEqual(report(reportDir).failures, []);
         assert.deepEqual(json(viaGlob, "package.json"), { ...rootBefore, overrides: { [MINIMATCH_KEY]: "3.0.5" } });
         assert.equal(versions(viaGlob).get("node_modules/minimatch"), "3.0.5");
@@ -811,7 +815,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         const before = versions(dir);
         const open = [MINIMATCH_ALERT];
 
-        const result = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => open });
+        const result = await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => open });
 
         assert.deepEqual(movedBetween(before, versions(dir)), MOVED_ONE);
         assert.deepEqual(json(dir, "package.json").overrides, { [MINIMATCH_KEY]: "3.0.5" });
@@ -828,7 +832,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
 
         // The same alert, still open as GitHub hasn't rescanned: nothing to do.
         const settled = text(dir, "package-lock.json");
-        const again = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => open });
+        const again = await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => open });
         assert.equal(report(reportDir).outcome, "clean");
         assert.equal(report(reportDir).alerts[0].status, "awaiting-close");
         assert.equal(again.overrideChanges, 0);
@@ -836,7 +840,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
 
         // Once it is closed, glob 7.1.6 still declares ^3.0.4, so the override has to stay.
         const closed = [{ ...MINIMATCH_ALERT, state: "fixed" as const }];
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => closed });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => closed });
         assert.equal(report(reportDir).outcome, "clean");
         assert.deepEqual(json(dir, "package.json").overrides, { [MINIMATCH_KEY]: "3.0.5" });
         assert.equal(text(dir, "package-lock.json"), settled);
@@ -864,7 +868,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const rootLock = text(dir, "package-lock.json");
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [onX()] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [onX()] });
 
         const got = report(reportDir);
         assert.equal(got.outcome, "changes");
@@ -879,7 +883,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const rootLock = text(dir, "package-lock.json");
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [onX()] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [onX()] });
 
         assert.equal(readLockfile(join(dir, X)).entries.get("node_modules/minimatch")?.version, "3.0.5");
         assert.equal(text(dir, "package-lock.json"), rootLock);
@@ -891,7 +895,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const rootLock = text(dir, "package-lock.json");
 
-        await runTargeted({ ...cfg(dir, reportDir), discoverPackages: false }, { fetchAlerts: async () => [onX()] });
+        await runTargeted({ ...cfg(dir, reportDir), discoverPackages: false }, { fetchAdvisories: noAdvisories, fetchAlerts: async () => [onX()] });
 
         const got = report(reportDir);
         assert.equal(got.outcome, "blocked-only");
@@ -910,7 +914,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const before = text(dir, "package-lock.json");
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [ANSI_ALERT] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [ANSI_ALERT] });
 
         const got = report(reportDir);
         assert.equal(got.outcome, "blocked-only");
@@ -926,7 +930,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const before = versions(dir);
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [ANSI_ALERT] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [ANSI_ALERT] });
 
         const got = report(reportDir);
         assert.deepEqual(got.failures, []);
@@ -949,7 +953,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
           dirs.push(reportDir);
           const before = versions(dir);
 
-          await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [MINIMATCH_ALERT] });
+          await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [MINIMATCH_ALERT] });
 
           const got = report(reportDir);
           assert.deepEqual(got.failures, []);
@@ -975,7 +979,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
         dirs.push(reportDir);
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [alert(1, "nanoid", ">= 3.0.0, < 3.3.11", "3.3.11")] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [alert(1, "nanoid", ">= 3.0.0, < 3.3.11", "3.3.11")] });
 
         const got = report(reportDir);
         assert.deepEqual(got.failures, []);
@@ -1002,7 +1006,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         const dir = project("2026-02-01", { root: { dependencies: FRAMEWORK } });
         const reportDir = reportFolder();
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [CORE_ALERT] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [CORE_ALERT] });
 
         const got = report(reportDir);
         assert.deepEqual(got.failures, []);
@@ -1017,7 +1021,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         const dir = project("2026-02-01", { members: { one: { dependencies: FRAMEWORK }, two: { dependencies: FRAMEWORK } } });
         const reportDir = reportFolder();
 
-        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [CORE_ALERT] });
+        await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [CORE_ALERT] });
 
         const got = report(reportDir);
         assert.deepEqual(got.failures, []);
@@ -1033,12 +1037,29 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         const reportDir = reportFolder();
         const lockBefore = text(dir, "package-lock.json");
 
-        await runTargeted({ ...cfg(dir, reportDir), limits: { "@angular/forms": "<21.2" } }, { fetchAlerts: async () => [CORE_ALERT] });
+        await runTargeted({ ...cfg(dir, reportDir), limits: { "@angular/forms": "<21.2" } }, { fetchAdvisories: noAdvisories, fetchAlerts: async () => [CORE_ALERT] });
 
         const got = report(reportDir);
         assert.equal(got.outcome, "blocked-only");
         assert.equal(got.alerts[0].copies[0].reason, "moves-together");
         assert.equal(text(dir, "package-lock.json"), lockBefore);
+      });
+    });
+
+    describe("a fix version with an advisory of its own", () => {
+      it("moves past it to a clear version, using npm's real advisory data", async () => {
+        const dir = project("2026-02-01", { root: { dependencies: { hono: "^4.11.0" } } });
+        const reportDir = mkdtempSync(join(tmpdir(), "targeted-live-report-"));
+        dirs.push(reportDir);
+
+        // 4.13.7 fixes this, but is inside GHSA-5r4p-p66f-jhc7, which covers versions below 4.13.11.
+        await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [alert(1, "hono", ">= 4.0.0, < 4.13.7", "4.13.7")] });
+
+        const got = report(reportDir);
+        assert.deepEqual(got.failures, []);
+        const landed = readLockfile(dir).entries.get("node_modules/hono")?.version ?? "";
+        assert.ok(semver.gte(landed, "4.13.11"), landed);
+        assert.equal(got.advisoriesUnchecked, undefined);
       });
     });
 
@@ -1051,7 +1072,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
         dirs.push(reportDir);
         const before = versions(dir);
 
-        const first = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [closed] });
+        const first = await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [closed] });
 
         const got = report(reportDir);
         assert.deepEqual(got.failures, []);
@@ -1063,7 +1084,7 @@ describe("targeted npm, live", { skip: LIVE ? false : "set DEPENDABOT_AGENT_LIVE
 
         const settled = text(dir, "package-lock.json");
         const manifest = text(dir, "package.json");
-        const second = await runTargeted(cfg(dir, reportDir), { fetchAlerts: async () => [closed] });
+        const second = await runTargeted(cfg(dir, reportDir), { fetchAdvisories: noAdvisories, fetchAlerts: async () => [closed] });
         assert.equal(report(reportDir).outcome, "clean");
         assert.equal(second.overrideChanges, 0);
         assert.equal(text(dir, "package-lock.json"), settled);

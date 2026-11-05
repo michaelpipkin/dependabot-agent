@@ -4,7 +4,7 @@ import type { DirectDep } from "../src/manifest.js";
 import type { LockIndex } from "../src/targeted/lockfile.js";
 import type { ManifestInfo, Plan } from "../src/targeted/plan.js";
 import { buildPlan } from "../src/targeted/plan.js";
-import { planWithRequirements, type PublishedPackage, type ReadPackage } from "../src/targeted/requirements.js";
+import { planWithRequirements, solvePlan, type PublishedPackage, type ReadAdvisories, type ReadPackage } from "../src/targeted/requirements.js";
 import type { DependabotAlert } from "../src/types.js";
 import { makeLock } from "./helpers/lock.js";
 
@@ -563,5 +563,130 @@ describe("review findings", () => {
     };
     const plan = await planFor({ alerts: [coreAlert(), alert(2, "forms", ">= 0.9.0, < 0.9.5", "0.9.5")], lock, deps }, registry(published).read);
     assert.deepEqual(plan.movedWith?.filter((m) => m.name === "forms").map((m) => `${m.from}>${m.to}`), ["1.1.2>1.2.20"]);
+  });
+});
+
+describe("a fix version that has an advisory of its own", () => {
+  const lock = () =>
+    makeLock({
+      "": { dependencies: { parent: "^1.0.0" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { hono: "^4.0.0" } },
+      "node_modules/hono": { version: "4.11.7" },
+    });
+  const honoAlert = () => alert(1, "hono", ">= 4.0.0, < 4.13.7", "4.13.7");
+  const versions = coreVersions("4.11.7", "4.13.7", "4.13.11", "4.13.12", "4.13.16");
+  const advised = (...ranges: string[]) =>
+    async () => ({ hono: ranges.map((range, i) => ({ url: `https://example.test/advisory-${i}`, vulnerable_versions: range })) });
+  const solve = (readAdvisories: ReadAdvisories, over: Partial<ReturnType<typeof inputOf>> = {}, published: Record<string, Versions> = { hono: versions }) =>
+    solvePlan({ ...inputOf({ alerts: [honoAlert()], lock: lock(), deps: [] }), ...over }, registry(published).read, readAdvisories);
+
+  it("moves to the lowest later version clear of every advisory", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <4.13.11"));
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.11");
+    assert.deepEqual(plan.addOverrides, { "hono@>=4.0.0 <4.13.11": "4.13.11" });
+    assert.equal(plan.alerts[0].status, "fixed");
+  });
+
+  it("clears them all, not only the first it finds", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <4.13.11", ">=4.13.11 <4.13.12"));
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.12");
+  });
+
+  it("stays on the earliest fix when no advisory touches it", async () => {
+    const { plan } = await solve(advised("<4.11.0"));
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7");
+    assert.deepEqual(plan.advised ?? [], []);
+  });
+
+  it("says why it went further than the alert asks", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <4.13.11"));
+    const moved = plan.movedWith!.find((m) => m.name === "hono")!;
+    assert.equal(moved.to, "4.13.11");
+    assert.match(moved.because, /advisory-0/);
+  });
+
+  it("keeps the fix and reports it when nothing later on the line is clear", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <5.0.0"));
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7", "still better than what's installed");
+    assert.equal(plan.alerts[0].status, "fixed");
+    assert.deepEqual(plan.advised, [{ name: "hono", version: "4.13.7", advisory: "https://example.test/advisory-0" }]);
+  });
+
+  it("won't cross a major to get clear", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <5.0.0"), {}, { hono: coreVersions("4.11.7", "4.13.7", "5.0.0") });
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7");
+    assert.equal(plan.advised?.length, 1);
+  });
+
+  it("won't pass a limit to get clear: the alert's fix still lands", async () => {
+    const { plan } = await solve(advised(">=4.12.4 <4.13.11"), { limits: { hono: "<4.13.10" } });
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7");
+    assert.equal(plan.alerts[0].status, "fixed");
+    assert.equal(plan.advised?.length, 1);
+  });
+
+  it("gives up on going further, not on the fix, when the later version can't be reached", async () => {
+    // The root pins 4.13.8. An override reaching 4.13.11 would match that pin, which one reaching 4.13.7 doesn't.
+    const withPin = makeLock({
+      "": { dependencies: { parent: "^1.0.0", hono: "4.13.8" } },
+      "node_modules/parent": { version: "1.0.0", dependencies: { hono: "^4.0.0" } },
+      "node_modules/parent/node_modules/hono": { version: "4.11.7" },
+      "node_modules/hono": { version: "4.13.8" },
+    });
+    const manifests: ManifestInfo[] = [
+      { dir: "/repo", lockPath: "", deps: [{ name: "parent", spec: "^1.0.0", field: "dependencies" }, { name: "hono", spec: "4.13.8", field: "dependencies" }] },
+    ];
+    const { plan } = await solve(advised(">=4.12.4 <4.13.11"), { lock: withPin, manifests });
+    assert.equal(plan.targets.get("node_modules/parent/node_modules/hono"), "4.13.7");
+    assert.equal(plan.targets.has("node_modules/hono"), false, "the pin holds");
+    assert.equal(plan.alerts[0].status, "fixed");
+    assert.deepEqual(plan.advised, [{ name: "hono", version: "4.13.7", advisory: "https://example.test/advisory-0" }]);
+    assert.deepEqual(plan.addOverrides, { "hono@>=4.0.0 <4.13.7": "4.13.7" });
+  });
+
+  it("raises a whole family together when the version they'd share is inside an advisory", async () => {
+    const readAdvisories: ReadAdvisories = async () => ({ core: [{ url: "https://example.test/a", vulnerable_versions: ">=1.2.0 <1.2.25" }] });
+    const { plan } = await solvePlan(
+      inputOf({ alerts: [coreAlert()], ...family() }),
+      registry(familyPublished(["1.1.2", "1.2.20", "1.2.25"])).read,
+      readAdvisories,
+    );
+    assert.deepEqual(targetsOf(plan), { "node_modules/core": "1.2.25", "node_modules/common": "1.2.25", "node_modules/forms": "1.2.25" });
+    assert.ok(plan.batched?.has("forms"));
+  });
+
+  it("asks once for each package, about the versions on the fix's line at or above it", async () => {
+    const asked: Array<Record<string, string[]>> = [];
+    await solve(async (query) => {
+      asked.push(query);
+      return {};
+    });
+    assert.deepEqual(asked, [{ hono: ["4.13.7", "4.13.11", "4.13.12", "4.13.16"] }]);
+  });
+
+  it("doesn't ask at all when nothing is moving", async () => {
+    let asked = false;
+    await solve(
+      async () => {
+        asked = true;
+        return {};
+      },
+      { alerts: [] },
+    );
+    assert.equal(asked, false);
+  });
+
+  it("carries on and says so when the advisories can't be read", async () => {
+    const { plan } = await solve(async () => {
+      throw new Error("blocked by a proxy");
+    });
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7");
+    assert.match(plan.advisoriesUnchecked ?? "", /blocked by a proxy/);
+  });
+
+  it("skips the check entirely without a reader", async () => {
+    const { plan } = await solvePlan(inputOf({ alerts: [honoAlert()], lock: lock(), deps: [] }), registry({ hono: versions }).read);
+    assert.equal(plan.targets.get("node_modules/hono"), "4.13.7");
+    assert.equal(plan.advisoriesUnchecked, undefined);
   });
 });

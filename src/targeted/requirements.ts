@@ -1,7 +1,7 @@
 import semver from "semver";
 import type { DependabotAlert } from "../types.js";
 import { copiesOf, LockEntry, LockIndex, resolveDep } from "./lockfile.js";
-import { Block, buildPlan, declaredRange, lineStart, MovedWith, Plan, PlanInput, Requirement } from "./plan.js";
+import { Advised, Block, buildPlan, declaredRange, lineStart, matchesLimit, MovedWith, Plan, PlanInput, Requirement } from "./plan.js";
 
 /** What a published version asks of other packages. */
 export interface VersionInfo {
@@ -11,6 +11,13 @@ export interface VersionInfo {
 export type PublishedPackage = Map<string, VersionInfo>;
 /** A package's published versions, or null if the registry has no such package. Any other failure throws. */
 export type ReadPackage = (name: string) => Promise<PublishedPackage | null>;
+/** A published advisory, as npm's own audit reads it. */
+export interface Advisory {
+  url?: string;
+  vulnerable_versions: string;
+}
+/** The advisories touching any of the versions asked about, by package. Any failure throws. */
+export type ReadAdvisories = (query: Record<string, string[]>) => Promise<Record<string, Advisory[]>>;
 
 // npm's own edge validity test: loose parsing, pre-releases allowed.
 const NPM_RANGE = { loose: true, includePrerelease: true };
@@ -23,6 +30,8 @@ interface Need extends Requirement {
   drivers: Set<string>;
   /** Whether a peer is behind it, which ties the two packages to a single install. */
   tiedTo?: string;
+  /** Going further than the fix to get clear of an advisory: if it can't happen, the fix still stands. */
+  soft?: boolean;
 }
 /** A need nothing published can meet. */
 interface Dead {
@@ -75,28 +84,31 @@ async function needsOfTargets(lock: LockIndex, plan: Plan, required: Map<string,
 
       const because = `${entry.name}@${version} ${peer ? "peers" : "depends on"} ${name} at "${spec}"`;
       const next = lowestAbove((await read(copy.name))?.keys() ?? [], now, (v) => accepts(range, v));
-      if (peer) {
-        if (!next) return { needs, dead: { detail: `${because}, and no release of ${name} above ${now} fits.`, drivers } };
+      if (peer && next) {
         needs.push({ name: copy.name, version: next, from: copy.version, because, drivers, tiedTo: entry.name });
-      } else if (next && lineStart(next) === lineStart(now)) {
+      } else if (!peer && next && lineStart(next) === lineStart(now)) {
         needs.push({ name: copy.name, version: next, from: copy.version, because, drivers });
       } else {
-        // The dependency's fix is past what this release asks for, or on another line of it. A later
-        // release may agree; if not, npm can nest a copy or the override carries it, and verification judges that.
-        const later = await laterAgreeing(read, entry.name, version, name, now);
-        if (later) needs.push({ name: entry.name, version: later, from: entry.version, because: `${because}, and ${name} is moving to ${now}`, drivers });
+        // What it depends on is past what this release asks for, or on another line of it. A later release may
+        // agree. If not, npm can nest a plain dependency or an override carries it, and verification judges that.
+        // A peer can't be nested, so there nothing else can be done.
+        const later = await laterAgreeing(read, entry.name, version, name, now, peer);
+        const moving = `${because}, and ${name} is at ${now}`;
+        if (later) needs.push({ name: entry.name, version: later, from: entry.version, because: moving, drivers, ...(peer ? { tiedTo: copy.name } : {}) });
+        else if (peer) return { needs, dead: { detail: `${because}, and no release of ${name} above ${now} fits.`, drivers } };
       }
     }
   }
   return { needs, dead: null };
 }
 
-/** The lowest release of `name` on the same line as `version` whose own dependency on `dep` accepts where it's going. */
-async function laterAgreeing(read: ReadPackage, name: string, version: string, dep: string, going: string): Promise<string | null> {
+/** The lowest release of `name` on the same line as `version` whose own requirement of `dep` accepts where it's going. */
+async function laterAgreeing(read: ReadPackage, name: string, version: string, dep: string, going: string, peer: boolean): Promise<string | null> {
   const published = await read(name);
   if (!published) return null;
   const later = lowestAbove(published.keys(), version, (v) => {
-    const asks = published.get(v)?.dependencies[dep];
+    const info = published.get(v);
+    const asks = peer ? info?.peerDependencies[dep] : info?.dependencies[dep];
     const range = asks === undefined ? null : declaredRange(asks);
     return range !== null && accepts(range, going);
   });
@@ -157,6 +169,78 @@ async function needsOfDependents(lock: LockIndex, plan: Plan, required: Map<stri
   return { needs, dead: null };
 }
 
+/** What's known of each package's advisories. A failure to read them is kept, once, and everything carries on. */
+interface AdvisoryBook {
+  read?: ReadAdvisories;
+  found: Map<string, Advisory[]>;
+  asked: Set<string>;
+  unchecked?: string;
+}
+
+/** Ask once per release line, in one request, about every version on it from the target up. */
+async function loadAdvisories(book: AdvisoryBook, targets: Array<{ name: string; version: string }>, read: ReadPackage): Promise<void> {
+  if (!book.read || book.unchecked) return;
+  const query: Record<string, string[]> = {};
+  for (const { name, version } of targets) {
+    const line = `${name}@${lineStart(version)}`;
+    if (book.asked.has(line)) continue;
+    book.asked.add(line);
+    const onLine = [...((await read(name))?.keys() ?? [])].filter(
+      (v) => semver.valid(v) && !semver.prerelease(v) && semver.gte(v, version) && lineStart(v) === lineStart(version),
+    );
+    query[name] = [...(query[name] ?? []), ...onLine];
+  }
+  if (Object.keys(query).length === 0) return;
+  try {
+    for (const [name, advisories] of Object.entries(await book.read(query))) {
+      book.found.set(name, [...(book.found.get(name) ?? []), ...advisories]);
+    }
+  } catch (e) {
+    book.unchecked = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * Step D: an alert only speaks for the version installed, so its fix can land inside another
+ * advisory that didn't touch the old version. Go on to the lowest later version clear of them
+ * all, on the same line and within the limits. If there's none, the fix still beats what's
+ * there, so it stands, and the report says so.
+ */
+async function needsOfAdvisories(
+  input: PlanInput,
+  plan: Plan,
+  required: Map<string, Need>,
+  read: ReadPackage,
+  book: AdvisoryBook,
+  declined: Set<string>,
+): Promise<{ needs: Need[]; advised: Advised[] }> {
+  const targets = [...plan.targets].flatMap(([path, version]) => {
+    const entry = input.lock.entries.get(path);
+    return isInstalled(entry) ? [{ entry, name: entry.name, version }] : [];
+  });
+  await loadAdvisories(book, targets, read);
+
+  const needs: Need[] = [];
+  const advised = new Map<string, Advised>();
+  for (const { entry, name, version } of targets) {
+    const advisories = book.found.get(name) ?? [];
+    const hit = advisories.find((advisory) => accepts(advisory.vulnerable_versions, version));
+    if (!hit) continue;
+    const withinLimits = (v: string): boolean =>
+      Object.entries(input.limits).every(([pattern, range]) => !matchesLimit(name, pattern) || semver.satisfies(v, range));
+    const clear = (v: string): boolean =>
+      lineStart(v) === lineStart(version) && withinLimits(v) && advisories.every((advisory) => !accepts(advisory.vulnerable_versions, v));
+    const next = declined.has(name) ? null : lowestAbove((await read(name))?.keys() ?? [], version, clear);
+    const where = hit.url ?? `an advisory covering "${hit.vulnerable_versions}"`;
+    if (next) {
+      needs.push({ name, version: next, from: entry.version, because: `${name}@${version} is inside ${where}`, drivers: driversOf(name, plan, required), soft: true });
+    } else {
+      advised.set(`${name}@${version}`, { name, version, advisory: where });
+    }
+  }
+  return { needs, advised: [...advised.values()] };
+}
+
 /** Fold what was found into what's required. Returns whether anything changed. */
 function merge(required: Map<string, Need>, needs: Need[], batched: Set<string>): boolean {
   let changed = false;
@@ -169,6 +253,8 @@ function merge(required: Map<string, Need>, needs: Need[], batched: Set<string>)
       continue;
     }
     if (semver.lt(need.version, held.version)) continue;
+    // Something that has to happen stops being optional because something else also wants it.
+    if (!need.soft) held.soft = false;
     const before = held.drivers.size;
     for (const driver of need.drivers) held.drivers.add(driver);
     if (semver.lt(need.from, held.from)) {
@@ -238,7 +324,13 @@ export interface Solved {
  * met rules out the alert behind it, and the plan is made again without it, so nothing here
  * can leave a fix half-planned.
  */
-export async function solvePlan(input: PlanInput, readPackage: ReadPackage): Promise<Solved> {
+export async function solvePlan(input: PlanInput, readPackage: ReadPackage, readAdvisories?: ReadAdvisories): Promise<Solved> {
+  const book: AdvisoryBook = { read: readAdvisories, found: new Map(), asked: new Set() };
+  const finish = (plan: Plan, advised: Advised[]): Plan => {
+    if (advised.length > 0) plan.advised = advised;
+    if (book.unchecked) plan.advisoriesUnchecked = book.unchecked;
+    return plan;
+  };
   const cache = new Map<string, Promise<PublishedPackage | null>>();
   const read: ReadPackage = (name) => {
     let found = cache.get(name);
@@ -260,11 +352,23 @@ export async function solvePlan(input: PlanInput, readPackage: ReadPackage): Pro
   for (let restart = 0; restart <= input.alerts.length; restart++) {
     const required = new Map<string, Need>();
     const batched = new Set<string>();
+    const declined = new Set<string>();
     let moving: Map<string, string> | undefined;
     let restarted = false;
 
     for (let pass = 0; pass < MAX_PASSES && !restarted; pass++) {
       const plan = buildPlan({ ...input, required: [...required.values()], moving, excluded });
+
+      // Going further than a fix is worth trying, not worth losing the fix over.
+      const optional = [...(plan.unmet?.keys() ?? [])].filter((name) => required.get(name)?.soft);
+      if (optional.length > 0) {
+        for (const name of optional) {
+          declined.add(name);
+          required.delete(name);
+        }
+        if (required.size === 0) moving = undefined;
+        continue;
+      }
 
       const unmet = [...(plan.unmet ?? [])][0];
       const dead: Dead | null = unmet
@@ -281,24 +385,25 @@ export async function solvePlan(input: PlanInput, readPackage: ReadPackage): Pro
         const block: Block = { reason: "moves-together", detail: stop.detail };
         if (!ruleOut(input, plan, stop.drivers, block, excluded)) {
           const fallback = buildPlan({ ...input, excluded });
-          return { plan: fallback, drivers: new Map() };
+          return { plan: finish(fallback, []), drivers: new Map() };
         }
         restarted = true;
         continue;
       }
 
-      const changed = merge(required, [...a.needs, ...b.needs, ...c.needs], batched);
-      if (!changed && required.size === 0) return { plan, drivers: new Map() };
+      const d = await needsOfAdvisories(input, plan, required, read, book, declined);
+      const changed = merge(required, [...a.needs, ...b.needs, ...c.needs, ...d.needs], batched);
+      if (!changed && required.size === 0) return { plan: finish(plan, d.advised), drivers: new Map() };
       if (!changed && sameTargets(moving, plan.targets)) {
         plan.batched = new Set([...batched].filter((name) => [...plan.targets.keys()].some((path) => input.lock.entries.get(path)?.name === name)));
         plan.movedWith = movedWithOf(plan, input, required);
-        return { plan, drivers: new Map([...required].map(([name, need]) => [name, need.drivers])) };
+        return { plan: finish(plan, d.advised), drivers: new Map([...required].map(([name, need]) => [name, need.drivers])) };
       }
       moving = plan.targets;
     }
     if (!restarted) break;
   }
-  return { plan: buildPlan({ ...input, excluded }), drivers: new Map() };
+  return { plan: finish(buildPlan({ ...input, excluded }), []), drivers: new Map() };
 }
 
 /** The plan alone, for a caller with no use for who drove what. */

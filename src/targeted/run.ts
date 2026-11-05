@@ -14,7 +14,7 @@ import {
   resolvePmForDir,
 } from "../reconcile.js";
 import type { RunResult } from "../reconcile.js";
-import { fetchDependentRanges, readPublishedPackage, usableRange } from "../registry.js";
+import { fetchDependentRanges, readAdvisories, readPublishedPackage, usableRange } from "../registry.js";
 import { compareSemver, parseSemver, satisfiesVulnerableRange } from "../semver.js";
 import type { DependabotAlert, DependentRange } from "../types.js";
 import { AgentError, exitWithError, log, warn } from "../util.js";
@@ -28,7 +28,7 @@ import type { AlertOutcome, Block, ManifestInfo, Plan, PlanInput } from "./plan.
 import { computeOutcome, renderMarkdown, writeReport } from "./report.js";
 import type { RunReport } from "./report.js";
 import { ruleOut, solvePlan } from "./requirements.js";
-import type { PublishedPackage, ReadPackage, Solved } from "./requirements.js";
+import type { PublishedPackage, ReadAdvisories, ReadPackage, Solved } from "./requirements.js";
 import { treeProblems } from "./verify.js";
 import type { VerificationFailure } from "./verify.js";
 
@@ -36,6 +36,8 @@ export interface TargetedDeps {
   fetchAlerts: (cfg: ResolvedConfig) => Promise<DependabotAlert[]>;
   /** A package's published versions and what each asks of others, null if the registry has no such package. Any other failure throws. */
   fetchPackage: ReadPackage;
+  /** The advisories touching the versions asked about. A failure throws, and the report says the check didn't run. */
+  fetchAdvisories: ReadAdvisories;
   /** What a dependent declares for a package at its latest release (its installed range comes from the lockfile). */
   fetchDependents: typeof fetchDependentRanges;
   /** The npm this run uses, or null if it can't be read. */
@@ -47,6 +49,7 @@ const defaultDeps: TargetedDeps = {
   fetchAlerts: async (cfg) =>
     cfg.alertsFile ? readDependabotAlertsFile(cfg.alertsFile) : fetchDependabotAlerts({ owner: cfg.owner, name: cfg.name, token: cfg.token }),
   fetchPackage: readPublishedPackage,
+  fetchAdvisories: readAdvisories,
   fetchDependents: fetchDependentRanges,
   npmVersion,
 };
@@ -462,7 +465,7 @@ const restoreNote = (state: RunState): string =>
     ? `Restoring the files failed, so the working tree may hold partial changes: ${state.restoreError}`
     : "Every file was restored to how it was before the run.";
 
-type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith">;
+type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith" | "advised" | "advisoriesUnchecked">;
 
 /** Write the report if asked to, and print it. A write that fails says so, and names the directory. */
 function publish(report: RunReport, cfg: ResolvedConfig, state: RunState): void {
@@ -542,7 +545,7 @@ async function planGroups(
       manifestPrefix: prefix,
       moveTogether: cfg.moveTogether,
     };
-    const { plan, drivers } = await solvePlan(input, read);
+    const { plan, drivers } = await solvePlan(input, read, deps.fetchAdvisories);
     const manifestFiles = manifests.filter((m) => !m.external).map((m) => path.join(m.dir, "package.json"));
     // npm writes to a shrinkwrap when there is one, so a failed run has to put it back too.
     const shrinkwrap = path.join(dir, "npm-shrinkwrap.json");
@@ -602,7 +605,7 @@ function alertsOnCopy(group: Group, failure: VerificationFailure, culprit: strin
  * Rule out every alert the failures come down to, and plan the group again without them.
  * False if nothing could be ruled out: the failure isn't tied to any fix, so it stands.
  */
-async function replanWithout(group: Group, failures: VerificationFailure[], read: ReadPackage): Promise<boolean> {
+async function replanWithout(group: Group, failures: VerificationFailure[], read: ReadPackage, readAdvisoriesOf: ReadAdvisories): Promise<boolean> {
   const moving = new Set([...group.plan.targets.keys()].flatMap((path) => group.before.entries.get(path)?.name ?? []));
   const excluded = new Map(group.input.excluded);
   const sizeBefore = excluded.size;
@@ -622,7 +625,7 @@ async function replanWithout(group: Group, failures: VerificationFailure[], read
   }
   if (excluded.size === sizeBefore) return false;
   group.input = { ...group.input, excluded };
-  const { plan, drivers } = await solvePlan(group.input, read);
+  const { plan, drivers } = await solvePlan(group.input, read, readAdvisoriesOf);
   group.plan = plan;
   group.drivers = drivers;
   return true;
@@ -635,6 +638,12 @@ function refreshBase(base: ReportBase, groups: Group[], unprocessed: AlertOutcom
   base.movedWith = groups.flatMap((group) =>
     (group.plan.movedWith ?? []).map((moved) => (groups.length > 1 ? { ...moved, because: `In ${group.label}: ${moved.because}` } : moved)),
   );
+  base.advised = groups.flatMap((group) =>
+    (group.plan.advised ?? []).map((advised) => (groups.length > 1 ? { ...advised, name: `${advised.name} (in ${group.label})` } : advised)),
+  );
+  const unchecked = groups.find((group) => group.plan.advisoriesUnchecked)?.plan.advisoriesUnchecked;
+  if (unchecked) base.advisoriesUnchecked = unchecked;
+  else delete base.advisoriesUnchecked;
   state.alerts = base.alerts;
 }
 
@@ -665,7 +674,7 @@ async function applyGroups(
         applied += planned;
         break;
       }
-      if (attempt < MAX_RETRIES && (await replanWithout(group, failures, read))) {
+      if (attempt < MAX_RETRIES && (await replanWithout(group, failures, read, deps.fetchAdvisories))) {
         groupSnapshot.restore();
         refreshBase(base, groups, unprocessed, state);
         log(`   That didn't verify. Trying ${group.label} again without what failed:\n${failures.map((f) => `     ${f.check}: ${f.detail.split("\n")[0]}`).join("\n")}`);

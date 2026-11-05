@@ -116,6 +116,16 @@ export interface Plan {
   movedWith?: MovedWith[];
   /** Requirements that can't be met, by package, and why. */
   unmet?: Map<string, Block>;
+  /** Fixes that stay inside another advisory, because nothing later on their line is clear of it. */
+  advised?: Advised[];
+  /** Set when advisories couldn't be read: why fix versions weren't checked against them. */
+  advisoriesUnchecked?: string;
+}
+export interface Advised {
+  name: string;
+  version: string;
+  /** The advisory's URL, or its range if it has none. */
+  advisory: string;
 }
 
 // ---------------------------------------------------------------------------

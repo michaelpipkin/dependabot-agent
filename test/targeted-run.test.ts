@@ -253,6 +253,7 @@ function depsFor(alerts: DependabotAlert[], npm: { run: NpmRunner }, dependents?
   return {
     fetchAlerts: async () => alerts,
     fetchPackage: async (name) => (PUBLISHED[name] ? new Map(PUBLISHED[name].map((version) => [version, { dependencies: {}, peerDependencies: {} }])) : null),
+    fetchAdvisories: async () => ({}),
     fetchDependents: dependents ?? (async () => ({ installedRange: null, latestRange: null, latestKnown: false })),
     run: npm.run,
     npmVersion: () => "11.16.0",
@@ -2006,4 +2007,36 @@ describe("what a retry rules out", () => {
       assert.deepEqual(status, { core: "blocked", qs: "fixed" });
     });
   }
+});
+
+describe("advisories on a fix version, in the report", () => {
+  const dryRun = async (fetchAdvisories: TargetedDeps["fetchAdvisories"]) => {
+    const dir = tempDir();
+    const reportDir = tempDir();
+    writeProject(dir, qsProject());
+    await runTargeted(cfgFor(dir, { reportDir, dryRun: true }), { ...depsFor([qsAlert()], fakeNpm()), fetchAdvisories });
+    return reportDir;
+  };
+
+  it("lists a fix that stays inside another advisory, for a person to look at", async () => {
+    const reportDir = await dryRun(async () => ({ qs: [{ url: "https://example.test/advisory", vulnerable_versions: ">=6.0.0 <7.0.0" }] }));
+    assert.deepEqual(reportIn(reportDir).advised, [{ name: "qs", version: "6.5.3", advisory: "https://example.test/advisory" }]);
+    const md = reportMd(reportDir);
+    assert.match(md, /## Fix still inside another advisory/);
+    assert.match(md, /`qs` 6\.5\.3.*https:\/\/example\.test\/advisory/);
+  });
+
+  it("says when the check couldn't run, so a clean report isn't read as a clean check", async () => {
+    const reportDir = await dryRun(async () => {
+      throw new Error("blocked by a proxy");
+    });
+    assert.match(reportIn(reportDir).advisoriesUnchecked ?? "", /blocked by a proxy/);
+    assert.match(reportMd(reportDir), /weren't checked for advisories of their own.*blocked by a proxy/);
+  });
+
+  it("says nothing when the check ran and found nothing", async () => {
+    const md = reportMd(await dryRun(async () => ({})));
+    assert.doesNotMatch(md, /inside another advisory/);
+    assert.doesNotMatch(md, /weren't checked/);
+  });
 });
