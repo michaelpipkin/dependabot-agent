@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DepScope } from "../types.js";
-import type { AlertOutcome, CopyDecision } from "./plan.js";
+import type { Advised, AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
 import type { VerificationFailure } from "./verify.js";
 
 export type Outcome = "changes" | "blocked-only" | "clean" | "failed";
@@ -18,6 +18,12 @@ export interface RunReport {
   failures: VerificationFailure[];
   /** What `npm --version` said when the run started, or null if it couldn't be read. */
   npmVersion: string | null;
+  /** Packages that moved further than any alert of their own asks, because a fix can't install without it. */
+  movedWith?: MovedWith[];
+  /** Fixes that stay inside another advisory, because nothing later on their line is clear of it. */
+  advised?: Advised[];
+  /** Set when advisories couldn't be read: why fix versions weren't checked against them. */
+  advisoriesUnchecked?: string;
   /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
   restoreError?: string;
 }
@@ -239,6 +245,25 @@ function buildSections(report: RunReport): Section[] {
     items: changeTable(withStatus("fixed")).items,
   });
 
+  sections.push({
+    heading: "Moved with a fix — review these",
+    intro: [
+      (planned ? "Each package below would move" : "Each package below moved") +
+        " further than any alert of its own asks: a fix can't be installed without it, or the earliest fix has an advisory of its own. Its limits and pins were still honoured.",
+      "",
+    ],
+    items: (report.movedWith ?? []).map((m) => `- \`${m.name}\` ${arrow(m.from, m.to)}: ${m.because}.`),
+  });
+
+  sections.push({
+    heading: "Fix still inside another advisory — review these",
+    intro: [
+      `Each fix below ${planned ? "would land" : "landed"} on a version with an advisory of its own. It's still better than what was installed, but the run couldn't reach a later release on its line that's clear: there's none, or your limits, a pin or another package stop it. Expect a new alert until a person moves it further.`,
+      "",
+    ],
+    items: (report.advised ?? []).map((a) => `- \`${a.name}\` ${a.version}: inside ${a.advisory}`),
+  });
+
   const partly = withStatus("partly-fixed");
   const partlyTable = changeTable(partly, "Still open", (a) => {
     const n = a.copies.filter(isBlocked).length;
@@ -327,6 +352,9 @@ function headerBlock(report: RunReport): string {
     const verb = report.dryRun ? "would be removed" : "removed";
     lines.push("", `**${removed}** override${removed === 1 ? "" : "s"} ${verb} as no longer needed.`);
   }
+  if (report.advisoriesUnchecked) {
+    lines.push("", `> **Fix versions weren't checked for advisories of their own:** ${inline(report.advisoriesUnchecked)} A fix may raise a new alert.`);
+  }
   if (lines.at(-1) !== "") lines.push("");
   lines.push(report.npmVersion ? `Run with npm ${report.npmVersion}.` : "npm version unknown.");
   return lines.join("\n");
@@ -339,6 +367,8 @@ const sectionText = (s: Section, items: string[]): string =>
 const PRIORITY = [
   "Failures",
   "Blocked",
+  "Moved with a fix — review these",
+  "Fix still inside another advisory — review these",
   "Applied past a declared range — review these",
   "Overrides removed",
   "Partly fixed",

@@ -160,3 +160,37 @@ describe("resolveConfig — --report outside targeted mode", () => {
     assert.ok(!warnings({}).some((w) => w.includes("--report")));
   });
 });
+
+describe("resolveConfig — moveTogether", () => {
+  it("reads groups from the config file", () => {
+    const groups = [["@angular/ssr", "@angular/build"]];
+    const cfg = resolveConfig({ updateStrategy: "targeted" }, baseEnv(workspace({ moveTogether: groups })));
+    assert.deepEqual(cfg.moveTogether, groups);
+  });
+
+  it("defaults to no groups", () => {
+    assert.deepEqual(resolveConfig({ updateStrategy: "targeted" }, baseEnv(workspace())).moveTogether, []);
+  });
+
+  for (const [label, value] of [
+    ["not a list", { a: "b" }],
+    ["a flat list of names", ["a", "b"]],
+    ["a group of one", [["a"]]],
+    ["a blank name", [["a", " "]]],
+    ["a name that isn't a string", [["a", 1]]],
+  ] as Array<[string, unknown]>) {
+    it(`stops at startup on ${label}, naming the key`, () => {
+      assert.throws(
+        () => resolveConfig({ updateStrategy: "targeted" }, baseEnv(workspace({ moveTogether: value }))),
+        (e: unknown) => e instanceof AgentError && e.message.includes(`"moveTogether"`),
+      );
+    });
+  }
+
+  it("warns that it's ignored under another strategy", () => {
+    const warned = mock.method(console, "warn", () => {});
+    resolveConfig({ updateStrategy: "compatible" }, baseEnv(workspace({ moveTogether: [["a", "b"]] })));
+    assert.ok(warned.mock.calls.some((call) => String(call.arguments[0]).includes("moveTogether")));
+    mock.restoreAll();
+  });
+});

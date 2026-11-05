@@ -129,6 +129,17 @@ export async function fetchPublishedVersions(packageName: string): Promise<strin
  * package, and throws.
  */
 export async function readPublishedVersions(packageName: string): Promise<string[] | null> {
+  const versions = await readVersionList(packageName);
+  return versions && Object.keys(versions);
+}
+
+interface PublishedManifest {
+  dependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+}
+
+async function readVersionList(packageName: string): Promise<Record<string, PublishedManifest> | null> {
   const failed = (why: string): AgentError =>
     new AgentError(`Could not read ${packageName}'s published versions from the npm registry: ${why}.`);
 
@@ -143,14 +154,68 @@ export async function readPublishedVersions(packageName: string): Promise<string
   if (response.status === 404) return null;
   if (!response.ok) throw failed(`HTTP ${response.status}`);
 
-  let doc: { versions?: Record<string, unknown> };
+  let doc: { versions?: Record<string, PublishedManifest> };
   try {
-    doc = (await response.json()) as { versions?: Record<string, unknown> };
+    doc = (await response.json()) as { versions?: Record<string, PublishedManifest> };
   } catch {
     throw failed("the response wasn't JSON");
   }
   if (!doc.versions || typeof doc.versions !== "object") throw failed("the response has no version list");
-  return Object.keys(doc.versions);
+  return doc.versions;
+}
+
+/**
+ * The same read, with what each version asks of other packages, for a caller that has to
+ * know whether a version can be installed beside what's already there. Fails as above.
+ */
+export async function readPublishedPackage(
+  packageName: string,
+): Promise<Map<string, { dependencies: Record<string, string>; peerDependencies: Record<string, string> }> | null> {
+  const versions = await readVersionList(packageName);
+  if (!versions) return null;
+  return new Map(
+    Object.entries(versions).map(([version, manifest]) => [
+      version,
+      {
+        dependencies: { ...manifest.dependencies, ...manifest.optionalDependencies },
+        peerDependencies: { ...manifest.peerDependencies },
+      },
+    ]),
+  );
+}
+
+/**
+ * The advisories touching any of the given versions, by package, from the endpoint `npm audit`
+ * reads. Package names and versions are all it sends. Any failure throws, so a caller can say
+ * the check didn't run instead of reading it as nothing found.
+ */
+export async function readAdvisories(query: Record<string, string[]>): Promise<Record<string, Array<{ url?: string; vulnerable_versions: string }>>> {
+  const failed = (why: string): AgentError => new AgentError(`Could not read advisories from the npm registry: ${why}.`);
+
+  let response: Response;
+  try {
+    response = await fetch("https://registry.npmjs.org/-/npm/v1/security/advisories/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(query),
+    });
+  } catch (e) {
+    throw failed(e instanceof Error ? e.message : String(e));
+  }
+  if (!response.ok) throw failed(`HTTP ${response.status}`);
+
+  let doc: Record<string, Array<{ url?: string; vulnerable_versions?: string }>>;
+  try {
+    doc = (await response.json()) as typeof doc;
+  } catch {
+    throw failed("the response wasn't JSON");
+  }
+  return Object.fromEntries(
+    Object.entries(doc).map(([name, advisories]) => [
+      name,
+      advisories.flatMap(({ url, vulnerable_versions }) => (vulnerable_versions ? [{ url, vulnerable_versions }] : [])),
+    ]),
+  );
 }
 
 /**

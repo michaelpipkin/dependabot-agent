@@ -1,11 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import semver from "semver";
 import { isExactPin, topLevelValueRange } from "../manifest.js";
 import { readNpmOverrides } from "../override-source.js";
+import { compatibleCeiling, parseSemver } from "../semver.js";
 import { log, sortObjectKeys } from "../util.js";
 import { copiesOf, LockIndex, memberOwnersOf, readLockfile, resolveDep } from "./lockfile.js";
-import { DirectBump, ManifestInfo, Plan } from "./plan.js";
+import { DirectBump, lineStart, ManifestInfo, Plan } from "./plan.js";
 import { overrideRuleFor, overrideValue, unrequiredMoves, verify, VerificationFailure, VerifyInput } from "./verify.js";
 
 export type NpmRunner = (command: string, cwd: string) => void;
@@ -101,6 +103,97 @@ export function bumpCommand(bump: DirectBump): string {
 
 export function resolveCommand(): string {
   return `npm install ${FLAGS}`;
+}
+
+/**
+ * Packages tied by their peers can only move in one install: npm refuses each on its own,
+ * since the others still in the tree name the old version. Each manifest's own list goes in
+ * one command, shared with every member wanting exactly the same, because `-w` on a member
+ * that doesn't declare a package would add it. The prefix is always a caret: one command
+ * has only the one, and `restoreTildes` puts back what npm can't be told.
+ */
+export function batchedBumpCommands(plan: Plan): string[] {
+  const byManifest = new Map<string | null, string[]>();
+  for (const bump of plan.bumps) {
+    if (!plan.batched?.has(bump.name)) continue;
+    const spec = `${shellWord(bump.name, "package name")}@${shellWord(bump.target, "version")}`;
+    byManifest.set(bump.memberPath, [...(byManifest.get(bump.memberPath) ?? []), spec]);
+  }
+  const byList = new Map<string, Array<string | null>>();
+  for (const [memberPath, specs] of byManifest) {
+    const list = specs.sort().join(" ");
+    byList.set(list, [...(byList.get(list) ?? []), memberPath]);
+  }
+  return [...byList].flatMap(([list, memberPaths]) => {
+    const members = memberPaths.filter((path): path is string => path !== null).sort();
+    const command = (where: string): string => `npm install ${list}${where} "--save-prefix=^" --save-exact=false ${FLAGS}`;
+    return [
+      ...(memberPaths.includes(null) ? [command("")] : []),
+      ...(members.length > 0 ? [command(members.map((path) => ` -w ${shellWord(path, "workspace path")}`).join(""))] : []),
+    ];
+  });
+}
+
+/** npm can't move a family that's still in the lockfile. Everything else stays locked as it was. */
+function dropBatchedEntries(lockFile: string, before: LockIndex, plan: Plan): void {
+  const dropping = [...plan.targets.keys()].filter((path) => plan.batched?.has(before.entries.get(path)?.name ?? ""));
+  if (dropping.length === 0) return;
+  const lock = JSON.parse(readFileSync(lockFile, "utf-8")) as { packages: Record<string, unknown> };
+  for (const path of dropping) delete lock.packages[path];
+  writeFileSync(lockFile, JSON.stringify(lock, null, 2) + "\n");
+}
+
+/** Put back the `~` of any family member, which `batchedBumpCommands` had to save with a caret. */
+function restoreTildes(plan: Plan): void {
+  for (const bump of plan.bumps) {
+    if (bump.operator !== "~" || !plan.batched?.has(bump.name)) continue;
+    const file = join(bump.manifestDir, "package.json");
+    const text = readFileSync(file, "utf-8");
+    const range = topLevelValueRange(text, bump.field);
+    if (!range) continue;
+    const [start, end] = range;
+    const saved = `${JSON.stringify(bump.name)}: "^${bump.target}"`;
+    writeFileSync(file, text.slice(0, start) + text.slice(start, end).replace(saved, `${JSON.stringify(bump.name)}: "~${bump.target}"`) + text.slice(end));
+  }
+}
+
+/**
+ * npm fetches the newest version a dependent's range allows, which carries a planned copy past
+ * the earliest fix when its new dependent asks for that fix or more. An override for the fix's
+ * own version onwards brings it down, and the lockfile keeps it once the override goes, since
+ * the dependent's range accepts it. A package a manifest declares is left alone: npm refuses
+ * (EOVERRIDE) an override matching a root edge, and its install command landed it exactly.
+ */
+function pullDownOvershoots(dir: string, before: LockIndex, plan: Plan, manifests: ManifestInfo[], run: NpmRunner): void {
+  const now = readLockfile(dir);
+  const keys: Record<string, string> = {};
+  const names: string[] = [];
+  for (const [path, target] of plan.targets) {
+    const entry = now.entries.get(path);
+    const name = before.entries.get(path)?.name;
+    if (!entry?.version || !name || !semver.valid(entry.version) || !semver.gt(entry.version, target)) continue;
+    // Another line at this path isn't an overshoot: something else needs it there, and verification judges this copy by its dependents.
+    if (lineStart(entry.version) !== lineStart(target)) continue;
+    if (manifests.some((manifest) => manifest.deps.some((dep) => dep.name === name))) continue;
+    log(`   Pulling ${name} back from ${entry.version} to ${target}, the earliest fix.`);
+    keys[`${name}@>=${target} <${compatibleCeiling(parseSemver(target)!).join(".")}`] = target;
+    names.push(name);
+  }
+  if (names.length === 0) return;
+
+  const rootFile = join(dir, "package.json");
+  const saved = readFileSync(rootFile, "utf-8");
+  const { flat, nested } = readNpmOverrides(dir);
+  writeRootOverrides(dir, { ...flat, ...keys }, nested);
+  try {
+    run(resolveCommand(), dir);
+    const resolved = readLockfile(dir);
+    const stillOver = names.filter((name) => copiesOf(resolved, name).some((copy) => [...plan.targets].some(([path, target]) => path === copy.path && copy.version !== target)));
+    if (stillOver.length > 0) resolveThroughRoot(dir, resolved, stillOver, manifests, run);
+  } finally {
+    writeFileSync(rootFile, saved);
+  }
+  run(resolveCommand(), dir);
 }
 
 /** `overrides` rendered at the top level of a manifest with this indent and line ending. */
@@ -349,20 +442,23 @@ export function applyPlan(
   const run = opts.run ?? defaultRunner;
   const lockFile = join(dir, "package-lock.json");
   try {
-    const commands = plan.bumps.map(bumpCommand);
+    const commands = [...batchedBumpCommands(plan), ...plan.bumps.filter((bump) => !plan.batched?.has(bump.name)).map(bumpCommand)];
     const before = readLockfile(dir);
     const lockTextBefore = readFileSync(lockFile, "utf-8");
     const pins = pinsOf(before, opts.manifests);
     const manifestsBefore = readManifests(dir, opts.manifests);
 
     removeReplacedOverrides(dir, plan);
+    dropBatchedEntries(lockFile, before, plan);
     for (const command of commands) run(command, dir);
+    restoreTildes(plan);
     addOverrides(dir, plan);
     run(resolveCommand(), dir);
 
     const resolved = readLockfile(dir);
     const notMoved = namesNotMoved(before, resolved, plan);
     if (notMoved.length > 0) resolveThroughRoot(dir, resolved, notMoved, opts.manifests, run);
+    pullDownOvershoots(dir, before, plan, opts.manifests, run);
     putBackUnrequiredMoves(dir, before, lockTextBefore, plan, run);
 
     const settled = readFileSync(lockFile, "utf-8");

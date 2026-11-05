@@ -24,7 +24,9 @@ export type BlockReason =
   | "hand-written-override"
   | "selector-conflict"
   | "manifest-not-processed"
-  | "bundled";
+  | "bundled"
+  | "moves-together"
+  | "failed-verification";
 export type AlertStatus = "fixed" | "partly-fixed" | "blocked" | "awaiting-close" | "not-found";
 
 export interface CopyDecision {
@@ -76,6 +78,32 @@ export interface PlanInput {
   updateWorkspaceMembers: boolean;
   /** This lockfile's directory relative to the repository's root, as alerts name their manifests. Empty for the root. */
   manifestPrefix?: string;
+  /** Moves no alert asks for, that a planned target can't do without. */
+  required?: Requirement[];
+  /** Copies moving already: a peer they declare today says nothing about the version they're moving to. */
+  moving?: Map<string, string>;
+  /** Alerts ruled out by something beyond one package's own rows, and why. */
+  excluded?: Map<DependabotAlert, Block>;
+  /** Groups a person has said must stay on one version, where npm's own metadata doesn't say so. */
+  moveTogether?: string[][];
+  /** Packages not to take past their fix to clear an advisory: an earlier attempt that did failed. */
+  declinedRaises?: Set<string>;
+}
+export interface Requirement {
+  name: string;
+  /** The lowest version that does what's required. */
+  version: string;
+  /** The lowest installed version it applies from: a copy below this isn't concerned. */
+  from: string;
+  /** Who needs it, and how, for a person reading the report. */
+  because: string;
+}
+/** A package that moved further than any alert of its own asks, because a fix needs it. */
+export interface MovedWith {
+  name: string;
+  from: string;
+  to: string;
+  because: string;
 }
 export interface Plan {
   alerts: AlertOutcome[];
@@ -83,6 +111,23 @@ export interface Plan {
   addOverrides: Record<string, string>;
   removeOverrideKeys: string[];
   targets: Map<string, string>; // lock path → target version
+  /** Every open alert's vulnerable range, by package: what verification judges a copy that's gone by. */
+  alertRanges?: Map<string, string[]>;
+  /** Packages tied by their peers, which npm can only move in a single install. */
+  batched?: Set<string>;
+  movedWith?: MovedWith[];
+  /** Requirements that can't be met, by package, and why. */
+  unmet?: Map<string, Block>;
+  /** Fixes that stay inside another advisory, because nothing later on their line is clear of it. */
+  advised?: Advised[];
+  /** Set when advisories couldn't be read: why fix versions weren't checked against them. */
+  advisoriesUnchecked?: string;
+}
+export interface Advised {
+  name: string;
+  version: string;
+  /** The advisory's URL, or its range if it has none. */
+  advisory: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +213,7 @@ function lowestLowerBound(alerts: Iterable<DependabotAlert>): string | null {
 // One package's context
 // ---------------------------------------------------------------------------
 
-interface Block {
+export interface Block {
   reason: BlockReason;
   detail: string;
 }
@@ -182,6 +227,8 @@ interface PackageContext {
   edges: Edge[];
   /** Every edge to this package, for reporting who a fix lands past. */
   allEdges: Edge[];
+  /** Copies a moving package's peer lands on: that package will peer at the new version. */
+  peeredByMoving: Set<string>;
   handWritten: string | null;
   /** The agent's own existing keys for this package whose selector is a range. */
   agentKeys: AgentKey[];
@@ -354,6 +401,8 @@ function aliasBlock(ctx: PackageContext, copy: LockEntry): Block | null {
 
 /** The first row that stops `copy` taking `alert`'s patch, or null if nothing does. */
 function pairBlock(ctx: PackageContext, copy: LockEntry, alert: DependabotAlert): Block | null {
+  const excluded = ctx.input.excluded?.get(alert);
+  if (excluded) return excluded;
   const block = targetBlock(ctx, alert) ?? bundleBlock(ctx, copy) ?? aliasBlock(ctx, copy) ?? declarationBlock(ctx, copy);
   if (block) return block;
 
@@ -410,6 +459,16 @@ function isBumpedEdge(ctx: PackageContext, edge: Edge): boolean {
 /** Edges into `copy` that a bump won't rewrite. */
 function edgesStayingPut(ctx: PackageContext, copy: LockEntry): Edge[] {
   return ctx.edges.filter((edge) => edge.resolved?.path === copy.path && !isBumpedEdge(ctx, edge));
+}
+
+/**
+ * Nothing but packages moving with it depend on this copy, and it's moving because one of them
+ * requires that: the one install carries it, so no override is needed. A copy with an alert of
+ * its own that those packages merely accept stays where it is unless an override moves it.
+ */
+function reachedOnlyByMovingPeers(ctx: PackageContext, copy: LockEntry): boolean {
+  const required = ctx.input.required?.some((requirement) => requirement.name === ctx.name) === true;
+  return required && ctx.peeredByMoving.has(copy.path) && ctx.edges.every((edge) => edge.resolved?.path !== copy.path);
 }
 
 /** Whether this edge provably rejects `target`. A spec with no declared range can't be judged. */
@@ -559,7 +618,7 @@ function unreachableReason(
     return `${ctx.name}@${copy.version} at ${copy.path} is nested in a workspace member, and npm's override can't reach a copy there.`;
   }
   const edges = edgesStayingPut(ctx, copy);
-  if (edges.length === 0 && declarationsOf(ctx, copy).length === 0) {
+  if (edges.length === 0 && declarationsOf(ctx, copy).length === 0 && !ctx.peeredByMoving.has(copy.path)) {
     return `Nothing declares ${ctx.name}@${copy.version} at ${copy.path}, so an override can't reach it.`;
   }
   for (const edge of edges) {
@@ -666,7 +725,7 @@ function solveLine(ctx: PackageContext, copies: LockEntry[]): SolvedLine {
   // and no existing key is left to catch one.
   const needSelector = fixing.filter(
     (copy) =>
-      declarationsOf(ctx, copy).length === 0 ||
+      (declarationsOf(ctx, copy).length === 0 && !reachedOnlyByMovingPeers(ctx, copy)) ||
       replaced.length > 0 ||
       edgesRejecting(ctx, copy, target).length > 0 ||
       specsAfterFix(ctx, copy, target).some((spec) => others.some((k) => selectorCatches(spec, k.selector))),
@@ -860,7 +919,10 @@ function planPackage(
     return outcomes;
   }
 
-  const allEdges = edgesTo(input.lock, name);
+  const everyEdge = edgesTo(input.lock, name);
+  const isMovingPeer = (edge: Edge): boolean =>
+    input.moving?.has(edge.from) === true && input.lock.entries.get(edge.from)?.peerDependencies[edge.name] === edge.spec;
+  const allEdges = everyEdge.filter((edge) => !isMovingPeer(edge));
   const ctx: PackageContext = {
     input,
     name,
@@ -868,6 +930,7 @@ function planPackage(
     copies,
     edges: allEdges.filter((edge) => !input.lock.entries.get(edge.from)?.inBundle && !edge.resolved?.inBundle),
     allEdges,
+    peeredByMoving: new Set(everyEdge.filter(isMovingPeer).flatMap((edge) => edge.resolved?.path ?? [])),
     handWritten: findHandWritten(input.overrides, name),
     agentKeys: agentKeysOf(input.overrides.flat, name),
   };
@@ -886,12 +949,34 @@ function planPackage(
   return outcomes;
 }
 
+/** A requirement as an alert, so that it answers to everything an alert does: limits, pins, majors and overrides. */
+function asAlert(requirement: Requirement): DependabotAlert {
+  const vulnerability = {
+    package: { ecosystem: "npm", name: requirement.name },
+    vulnerable_version_range: `>= ${requirement.from}, < ${requirement.version}`,
+    first_patched_version: { identifier: requirement.version },
+  };
+  return {
+    number: 0,
+    state: "open",
+    dependency: { package: vulnerability.package, manifest_path: "" },
+    security_advisory: { summary: "", severity: "low", vulnerabilities: [vulnerability] },
+    security_vulnerability: vulnerability,
+  };
+}
+
+function firstBlock(outcome: AlertOutcome): Block | null {
+  const copy = outcome.copies.find((c) => c.action === "blocked");
+  return copy ? { reason: copy.reason ?? "target-unavailable", detail: copy.detail ?? "It can't move." } : null;
+}
+
 export function buildPlan(input: PlanInput): Plan {
   const plan: Plan = { alerts: [], bumps: [], addOverrides: {}, removeOverrideKeys: [], targets: new Map() };
   const open = input.alerts.filter((a) => a.state === "open");
+  const required = new Map((input.required ?? []).map((requirement) => [asAlert(requirement), requirement]));
 
   const byPackage = new Map<string, DependabotAlert[]>();
-  for (const alert of open) {
+  for (const alert of [...open, ...required.keys()]) {
     const name = alert.security_vulnerability.package.name;
     byPackage.set(name, [...(byPackage.get(name) ?? []), alert]);
   }
@@ -901,5 +986,18 @@ export function buildPlan(input: PlanInput): Plan {
     for (const [alert, outcome] of planPackage(input, name, alerts, plan)) outcomes.set(alert, outcome);
   }
   plan.alerts = open.map((alert) => outcomes.get(alert)!);
+
+  const openByPackage = new Map<string, string[]>();
+  for (const alert of open) {
+    const name = alert.security_vulnerability.package.name;
+    openByPackage.set(name, [...(openByPackage.get(name) ?? []), rangeOf(alert)]);
+  }
+  plan.alertRanges = openByPackage;
+
+  plan.unmet = new Map();
+  for (const [alert, requirement] of required) {
+    const block = firstBlock(outcomes.get(alert)!);
+    if (block) plan.unmet.set(requirement.name, block);
+  }
   return plan;
 }
