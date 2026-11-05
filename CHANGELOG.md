@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.3.1]
+
+Documentation only. No code changes: `targeted` behaves exactly as in 1.3.0.
+
+### Changed
+
+- **The README records a run of the published workflow.** `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm ran on a small npm workspace with a GitHub App: a dry run, a real run that opened an issue, and a real run that opened a pull request.
+- **The README's examples pin 1.3.1.**
+
 ## [1.3.0]
 
 Adds a `targeted` strategy for teams that don't allow a general `npm update`, with a reusable GitHub Actions workflow. Nothing changes unless you choose it: `compatible`, `latest` and pnpm produce the same overrides as before.
