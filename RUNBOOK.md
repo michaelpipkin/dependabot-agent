@@ -119,7 +119,9 @@ What these runs found, which is worth re-checking after any change to planning o
 
 The reusable workflow ran on both with a GitHub App: a dry run wrote nothing, a real run opened a pull request authored by the App with CI running on it, and a second run updated that pull request with no duplicate. That pull request moved `hono` to 4.13.11 and removed four overrides no longer needed, with no other version moving.
 
-These workflow runs used the workflow pinned to a commit, with a packed build passed by URL as `agent-version`. The published path, `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm, hasn't been run, so try it first on any repeat.
+These workflow runs used the workflow pinned to a commit, with a packed build passed by URL as `agent-version`.
+
+The published path, `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm, ran afterwards on `dependabot-agent-fixture-npm` with a GitHub App, on 2026-11-05. On `main`, whose exact pins block its 14 alerts, a dry run wrote nothing and a real run opened an issue with no pull request. On a temporary branch with the pins loosened and the overrides removed, a real run fixed 8 alerts and left 6 awaiting close, moved only `js-yaml`, opened a pull request authored by the App, and closed the issue. The fixture has no CI, so the build and test checks come from the Angular runs above. The workflow file and the branches were removed afterwards, so add the README's example again to repeat this.
 
 Merging it raised no new alerts. The `hono` alert closed in seconds on the workspace and after about twenty minutes on the single-package application. A further run on each left `minimatch` and `@hono/node-server` blocked, both needing a major upgrade, and opened one issue with no pull request. The single-package run fell inside those twenty minutes, and listed `hono` as awaiting close with nothing to change.
 
