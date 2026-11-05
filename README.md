@@ -127,7 +127,8 @@ Commit this file at the workspace root. It's auto-discovered — no `--config` f
   "discoverPackages": true,      // auto-discover isolated sub-packages
   "packages": [],                // extra manifest dirs to always process
   "updateWorkspaceMembers": true, // let the update pass bump workspace members too
-  "limits": {}
+  "limits": {},
+  "moveTogether": []
 }
 ```
 
@@ -430,7 +431,7 @@ dependabot-agent --update-strategy targeted --dry-run
 > **Status: new in 1.3.0.** It has been run end to end on two Angular 21 applications built to test it, one single-package and one npm workspace, with 174 open alerts each. Neither is a production application. See [What hasn't been tested](#what-hasnt-been-tested).
 >
 > - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
-> - On both applications, 173 of the 174 alerts were fixed, and the other was reported as blocked because it needs a major upgrade. `npm ci`, the build, the tests and linting passed on the pull requests. Dependabot closed all 173 within a minute of the merge and left the blocked one open. On a smaller test repository, closing took from seconds after a direct push to about ten minutes after a merged pull request, so a run in that gap reports alerts as awaiting close.
+> - On both applications, 173 of the 174 alerts were fixed, and the other was reported as blocked because it needs a major upgrade. `npm ci`, the build, the tests and linting passed on the pull requests. Dependabot closed all 173 within a minute of the merge and left the blocked one open. Closing isn't always that quick: after the next merge, the same alert closed in seconds on one application and took about twenty minutes on the other. A run in that gap reports the alert as awaiting close and changes nothing for it.
 >
 > **Follow [Trying it safely](#trying-it-safely) on a real repository first**, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests, because the agent doesn't build or test anything. On those applications, a lockfile that passed every check still failed its build until [`moveTogether`](#packages-that-must-move-together) was set.
 

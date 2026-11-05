@@ -117,6 +117,8 @@ What these runs found, which is worth re-checking after any change to planning o
 
 The reusable workflow ran on both with a GitHub App: a dry run wrote nothing, a real run opened a pull request authored by the App with CI running on it, and a second run updated that pull request with no duplicate. That pull request moved `hono` to 4.13.11 and removed four overrides no longer needed, with no other version moving.
 
+Merging it raised no new alerts. The `hono` alert closed in seconds on the workspace and after about twenty minutes on the single-package application. A further run on each left `minimatch` and `@hono/node-server` blocked, both needing a major upgrade, and opened one issue with no pull request. The single-package run fell inside those twenty minutes, and listed `hono` as awaiting close with nothing to change.
+
 ## Regenerating the captured fixtures
 
 `test/fixtures/` holds real output captured once. To refresh after an intentional format change:
