@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyAlerts, isFixed, type AlertFix } from "../src/report/alert-fixes.js";
-import { countChangedPackages } from "../src/tree.js";
+import { countChangedPackages, hasInstalledPackages } from "../src/tree.js";
 import type { DependabotAlert, InstalledTree, OverrideChange, TreeNode } from "../src/types.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "test", "fixtures");
@@ -180,6 +180,34 @@ describe("classifyAlerts", () => {
     assert.equal(fix.status, "awaiting-close");
   });
 
+  describe("with no installed copy before the run (nothing installed, or the tree couldn't be read)", () => {
+    it("calls a vulnerable copy after the run with a change targeting it override, not awaiting-close", () => {
+      const [fix] = classify(
+        [alert("follow-redirects", "< 1.16.2", "1.16.2")],
+        [],
+        tree({ "follow-redirects": "1.15.9" }),
+        [add("follow-redirects", ">=1.16.2 <2")],
+      );
+      assert.equal(fix.status, "override");
+      assert.deepEqual(fix.from, ["1.15.9"]);
+      assert.equal(fix.to, "≥ 1.16.2");
+      assert.equal(isFixed(fix), true);
+    });
+
+    it("calls a patched copy after the run update, from nothing to the versions installed", () => {
+      const [fix] = classify([alert("follow-redirects", "< 1.16.2", "1.16.2")], [], tree({ "follow-redirects": "1.16.2" }));
+      assert.equal(fix.status, "update");
+      assert.deepEqual(fix.from, []);
+      assert.equal(fix.to, "1.16.2");
+      assert.equal(isFixed(fix), true);
+    });
+
+    it("calls a vulnerable copy after the run with no change still-vulnerable", () => {
+      const [fix] = classify([alert("follow-redirects", "< 1.16.2", "1.16.2")], [], tree({ "follow-redirects": "1.15.9" }));
+      assert.equal(fix.status, "still-vulnerable");
+    });
+  });
+
   it("calls a still-vulnerable copy under an existing override, with no change, covered", () => {
     const [fix] = classify(
       [alert("glob", "< 10.5.0", "10.5.0")],
@@ -341,5 +369,20 @@ describe("countChangedPackages", () => {
     const after = nested({ x: "2.0.0" });
     after[0].dependencies!["other"] = { name: "other", version: "1.0.0", dependencies: { x: { name: "x", version: "2.1.0" } } };
     assert.equal(countChangedPackages(before, after), 1);
+  });
+});
+
+describe("hasInstalledPackages", () => {
+  it("is false for a workspace with no dependencies, as `npm ls` gives with no node_modules", () => {
+    assert.equal(hasInstalledPackages([{ name: "root", version: "1.0.0", path: "." }]), false);
+    assert.equal(hasInstalledPackages([]), false);
+  });
+
+  it("is true once any workspace holds a package, dev ones included", () => {
+    assert.equal(hasInstalledPackages(tree({ a: "1.0.0" })), true);
+    assert.equal(
+      hasInstalledPackages([{ name: "root", version: "1.0.0", path: ".", devDependencies: { d: { name: "d", version: "1.0.0" } } }]),
+      true,
+    );
   });
 });

@@ -192,7 +192,7 @@ describe("renderStrategyReport", () => {
   it("gives the reason for each kind of alert it did not fix", () => {
     const reasons: Array<[AlertFix["status"], string]> = [
       ["awaiting-close", "already patched, awaiting close"],
-      ["covered", "an existing override covers it from the next install"],
+      ["covered", "an existing override is meant to cover it"],
       ["no-patch", "no patched version"],
       ["not-installed", "not installed"],
       ["still-vulnerable", "still vulnerable after this run"],
@@ -206,6 +206,23 @@ describe("renderStrategyReport", () => {
       body,
       /\*\*Not addressed:\*\* \[#100\]\(https:\/\/github\.com\/o\/r\/security\/dependabot\/100\) `p0`: already patched, awaiting close; /,
     );
+  });
+
+  it("lists not-addressed alerts by alert number", () => {
+    const fixes = [12, 3, 40, 7].map((number) => fix({ number, packageName: `p${number}`, status: "no-patch", from: [], to: undefined }));
+    const body = renderStrategyReport(build(fixes, { packagesUpdated: 0 }));
+    const line = body.split("\n").find((l) => l.startsWith("**Not addressed:**"))!;
+    assert.deepEqual([...line.matchAll(/\[#(\d+)\]/g)].map((m) => Number(m[1])), [3, 7, 12, 40]);
+  });
+
+  it("keeps the 20 lowest alert numbers when it cuts the not-addressed list", () => {
+    const fixes = Array.from({ length: 25 }, (_, i) =>
+      fix({ number: 25 - i, packageName: `p${i}`, status: "no-patch", from: [], to: undefined }),
+    );
+    const body = renderStrategyReport(build(fixes, { packagesUpdated: 0 }));
+    const line = body.split("\n").find((l) => l.startsWith("**Not addressed:**"))!;
+    const shown = [...line.matchAll(/\[#(\d+)\]/g)].map((m) => Number(m[1]));
+    assert.deepEqual(shown, Array.from({ length: 20 }, (_, i) => i + 1));
   });
 
   it("lists at most 20 not-addressed alerts and counts the rest", () => {

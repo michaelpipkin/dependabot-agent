@@ -72,7 +72,7 @@ const REASON: Record<FixStatus, string> = {
   update: "updated",
   override: "overridden",
   "awaiting-close": "already patched, awaiting close",
-  covered: "an existing override covers it from the next install",
+  covered: "an existing override is meant to cover it",
   "no-patch": "no patched version",
   "not-installed": "not installed",
   "still-vulnerable": "still vulnerable after this run",
@@ -112,8 +112,10 @@ function sortedFixes(fixes: AlertFix[]): AlertFix[] {
   );
 }
 
+/** By alert number, so the cut keeps the oldest alerts. */
 function notAddressedLine(fixes: AlertFix[]): string {
-  const entries = fixes
+  const entries = [...fixes]
+    .sort((a, b) => a.number - b.number)
     .slice(0, MAX_NOT_ADDRESSED)
     .map((f) => inline(`${alertLink(f)} ${code(f.packageName)}: ${REASON[f.status]}`));
   const more = fixes.length - MAX_NOT_ADDRESSED;

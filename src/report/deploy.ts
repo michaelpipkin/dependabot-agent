@@ -138,6 +138,20 @@ function developmentLine(rec: DeployRecommendation, prefix: string): string[] {
   return [`${prefix}${cappedNames(rec.development.map((e) => e.packageName))}`];
 }
 
+/** An empty quote line, which ends a list inside the box. */
+const BLANK = "";
+
+/**
+ * Bullets, then the development line. A line straight after a list item is a lazy
+ * continuation of it in GFM, so without a blank quote line between them the
+ * development names would render inside the last bullet.
+ */
+function bulletsThenDevelopment(entries: DeployEntry[], rec: DeployRecommendation): string[] {
+  const bullets = cappedBullets(entries);
+  const dev = developmentLine(rec, "Development only: ");
+  return bullets.length > 0 && dev.length > 0 ? [...bullets, BLANK, ...dev] : [...bullets, ...dev];
+}
+
 /** The deploy section of a report: heading plus a GitHub alert box. Empty when there is nothing to say. */
 export function renderDeploySection(rec: DeployRecommendation): string {
   if (rec.outcome === "none") return "";
@@ -148,7 +162,7 @@ export function renderDeploySection(rec: DeployRecommendation): string {
   if (rec.outcome === "deploy") {
     type = "IMPORTANT";
     first = "🚀 **Deploy:** fixed packages are in production code";
-    body = [...cappedBullets(rec.production), ...developmentLine(rec, "Development only: ")];
+    body = bulletsThenDevelopment(rec.production, rec);
   } else if (rec.outcome === "no-deploy") {
     type = "TIP";
     first = "✅ **No deploy needed:** every fixed package is development-only";
@@ -156,14 +170,14 @@ export function renderDeploySection(rec: DeployRecommendation): string {
   } else if (rec.unknown.length > 0) {
     type = "WARNING";
     first = "❓ **Check before deciding:** couldn't tell whether these reach production";
-    body = [...cappedBullets(rec.unknown), ...developmentLine(rec, "Development only: ")];
+    body = bulletsThenDevelopment(rec.unknown, rec);
   } else {
     type = "WARNING";
     first = OVERRIDES_REMOVED_LINE;
     body = [`Overrides removed: ${cappedNames(rec.removedOverrides)}`];
   }
 
-  const box = [`[!${type}]`, first, ...body].map((line) => `> ${inline(line)}`);
+  const box = [`[!${type}]`, first, ...body].map((line) => (line === BLANK ? ">" : `> ${inline(line)}`));
   return ["## Deploy recommendation", "", ...box].join("\n");
 }
 

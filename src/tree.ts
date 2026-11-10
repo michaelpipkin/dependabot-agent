@@ -92,6 +92,11 @@ function collectInstalledVersions(tree: InstalledTree[]): Map<string, Set<string
   return found;
 }
 
+/** Whether the trees hold any installed package at all. `npm ls` with no node_modules gives workspaces with none. */
+export function hasInstalledPackages(tree: InstalledTree[]): boolean {
+  return collectInstalledVersions(tree).size > 0;
+}
+
 /**
  * How many package names have a different set of installed versions after the
  * run than before it — anywhere in the trees, counting names that were added or

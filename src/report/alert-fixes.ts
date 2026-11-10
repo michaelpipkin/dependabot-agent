@@ -7,9 +7,10 @@ import type { DependabotAlert, DepScope, InstalledTree, OverrideChange } from ".
  * What this run did to one alert.
  *
  *   update           the update pass moved the vulnerable copy to a patched version
+ *                    (or, with no copy in the before tree, installed a patched one)
  *   override         an override written this run forces a patched version
- *   awaiting-close   the copy was already patched before the run; the alert is open
- *                    only because GitHub hasn't re-scanned yet
+ *   awaiting-close   a copy was installed before the run and every copy was already
+ *                    patched; the alert is open only because GitHub hasn't re-scanned yet
  *   covered          an override from an earlier run already holds this package
  *   no-patch         the advisory has no patched version to move to
  *   not-installed    the package isn't in the tree, before or after
@@ -136,8 +137,12 @@ export function classifyAlerts(input: {
     const installedAfter = findInstalledVersions(packageName, after);
     if (installedBefore.length === 0 && installedAfter.length === 0) return { ...fix, status: "not-installed" };
 
+    // Awaiting close needs a copy before the run to have been patched. With none
+    // (nothing installed yet, or a tree that couldn't be read), the before tree
+    // says nothing, so the after tree decides: a patched copy is the update's doing,
+    // and a vulnerable one goes through the override rules below.
     const vulnerableBefore = installedBefore.filter(isVulnerable);
-    if (vulnerableBefore.length === 0) return { ...fix, status: "awaiting-close" };
+    if (installedBefore.length > 0 && vulnerableBefore.length === 0) return { ...fix, status: "awaiting-close" };
 
     const vulnerableAfter = installedAfter.filter(isVulnerable);
     if (vulnerableAfter.length === 0) {

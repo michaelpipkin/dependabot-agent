@@ -121,7 +121,7 @@ describe("renderDeploySection", () => {
     assert.ok(out.includes("> Development only: `follow-redirects`"));
     assert.equal(out.filter((l) => l.startsWith("> - `glob`")).length, 1);
     assert.ok(!text.includes("CAUTION"));
-    assert.ok(out.every((l, i) => i < 2 || l === "" || l.startsWith("> ")));
+    assert.ok(out.every((l, i) => i < 2 || l === "" || l === ">" || l.startsWith("> ")));
   });
 
   it("renders a tip box for dev-only fixes", () => {
@@ -139,6 +139,30 @@ describe("renderDeploySection", () => {
     assert.ok(out.includes("> ❓ **Check before deciding:** couldn't tell whether these reach production"));
     assert.ok(out.includes("> - `u`"));
     assert.ok(out.includes("> Development only: `follow-redirects`"));
+  });
+
+  // In GFM a line right after a list item is a lazy continuation of it, so without
+  // the blank quote line the development names render inside the last bullet.
+  it("puts a blank quote line between the bullets and the development line", () => {
+    const deploy = lines(renderDeploySection(recommendDeploy(inputs, [])));
+    const dev = deploy.indexOf("> Development only: `follow-redirects`");
+    assert.equal(deploy[dev - 1], ">");
+    assert.ok(deploy[dev - 2].startsWith("> - "));
+    const check = lines(
+      renderDeploySection(recommendDeploy([{ packageName: "u", scope: "unknown", manifest: "package.json", via: [] }, inputs[3]], [])),
+    );
+    assert.deepEqual(check.slice(-3), ["> - `u`", ">", "> Development only: `follow-redirects`"]);
+    const capped = lines(
+      renderDeploySection(
+        recommendDeploy([...many(31, "production"), { packageName: "d", scope: "dev", manifest: "package.json", via: [] }], []),
+      ),
+    );
+    assert.deepEqual(capped.slice(-3), ["> - …and 1 more", ">", "> Development only: `d`"]);
+  });
+
+  it("leaves the blank quote line out when there is no development line", () => {
+    const out = lines(renderDeploySection(recommendDeploy([inputs[0]], [])));
+    assert.ok(!out.includes(">"));
   });
 
   it("explains a check caused only by removed overrides", () => {

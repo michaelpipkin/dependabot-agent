@@ -22,7 +22,7 @@ import {
   satisfiesVulnerableRange,
 } from "./semver.js";
 import { runTargeted } from "./targeted/run.js";
-import { countChangedPackages, findInstalledVersions } from "./tree.js";
+import { countChangedPackages, findInstalledVersions, hasInstalledPackages } from "./tree.js";
 import { workspaceMemberDependents } from "./workspace.js";
 import {
   AlertRange,
@@ -1110,14 +1110,32 @@ async function processManifestGroup(
 
   // The tree before the update, to tell what the update pass fixed from what an
   // override did. pm.update skips itself on a dry run or skip-update; the tree
-  // read after it is then the same tree, so don't read it twice.
+  // read after it is then the same tree, so don't read it twice. The read is for
+  // the report only: a tree the package manager can't read yet (the update may
+  // repair it) mustn't stop the run, so a failure leaves it unknown.
   const updateRuns = !ctx.dryRun && !ctx.skipUpdate;
-  const treeBeforeUpdate = updateRuns ? pm.getInstalledTree(manifestDir) : undefined;
+  let treeBeforeUpdate: InstalledTree[] | null | undefined;
+  if (updateRuns) {
+    try {
+      treeBeforeUpdate = pm.getInstalledTree(manifestDir);
+    } catch {
+      treeBeforeUpdate = null;
+    }
+  }
 
   await pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
 
   const tree = pm.getInstalledTree(manifestDir);
-  const before = treeBeforeUpdate ?? tree;
+  // An empty before tree beside a full after tree means nothing was installed
+  // before the update (an isolated sub-package CI didn't install), not that the
+  // update installed everything; treat it as unknown too.
+  const beforeUnknown =
+    treeBeforeUpdate === null ||
+    (treeBeforeUpdate !== undefined && !hasInstalledPackages(treeBeforeUpdate) && hasInstalledPackages(tree));
+  if (beforeUnknown) {
+    log(`⚠️  Couldn't read the installed packages before the update in ${label}; the report treats them as unknown.`);
+  }
+  const before = beforeUnknown ? [] : (treeBeforeUpdate ?? tree);
   const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
 
   // Names the orphan pass judges removable (no open alert, upstream moved on).
@@ -1178,7 +1196,7 @@ async function processManifestGroup(
     multiLine: multiLine.length,
     fixes,
     deployInputs: deployInputsOf(fixes, impactOf),
-    packagesUpdated: countChangedPackages(before, tree),
+    packagesUpdated: beforeUnknown ? 0 : countChangedPackages(before, tree),
     removedOverrideKeys: changes.filter((c) => c.action === "remove").map((c) => c.packageName),
   };
 }
