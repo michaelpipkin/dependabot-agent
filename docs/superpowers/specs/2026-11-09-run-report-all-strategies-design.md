@@ -14,7 +14,7 @@ The agent already works this out and prints it to the log as "🚀 Deployment im
 
 1. `--report <dir>` works under every strategy (`compatible`, `latest`, `targeted`) and both package managers (npm, pnpm), and writes a description a workflow can use as the pull request body.
 2. The description leads with a one-line summary and the deploy recommendation, then a table of the packages fixed for an alert.
-3. The recommendation answers the reviewer's actual question: whether any package fixed for an alert **in this run** is in production code. That includes packages the update pass fixed, which today's recommendation misses (see "Recommendation logic").
+3. The recommendation answers the reviewer's actual question: whether any package fixed for an alert **in this run** is in production code. That includes packages the update pass fixed, and excludes open alerts the run didn't change, which today's recommendation counts (see "Recommendation logic").
 4. Users can see how to use the report in their own workflow (README).
 
 ## Non-goals
@@ -27,7 +27,7 @@ The agent already works this out and prints it to the log as "🚀 Deployment im
 ## Anti-goals
 
 - A recommendation that could be misread at a glance. A reviewer skimming must never read "Deploy" as "don't deploy", or the reverse. No stop-sign-like icons, no red, and the decision is stated in words, not only by colour or icon.
-- A recommendation that says "No deploy needed" when a production package changed for an alert in this run.
+- A recommendation that says "No deploy needed" when a production package changed for an alert in this run, or "Deploy" when no production package changed.
 - A description that breaks on GitHub: over the body size limit, or with markdown that renders wrongly.
 
 ## What the description looks like (decided by the user)
@@ -67,7 +67,7 @@ Only packages fixed for an alert in this run, one row per alert, with the column
 
 ## Recommendation logic (decided)
 
-- **Counts every package fixed for an alert in this run**, whether the update pass fixed it or an override did. Today the recommendation is built from the copies still vulnerable *after* the update pass, so a production package that `pnpm update` or `npm update` fixed is left out, and the result can wrongly read "branch push only".
+- **Counts every package fixed for an alert in this run**, whether the update pass fixed it or an override did, **and nothing else**. Today the recommendation is built from `findVulnerableInstalls`, which returns every installed package with an open alert whether or not its copies are still vulnerable. Update-pass fixes are therefore already counted, because their alerts are still open when the run happens. But so is every open alert the run didn't change, such as one awaiting close after an earlier merge, or one an existing override already covers. A production package in that state makes today's log say DEPLOY when nothing in production changed. *(Corrected 2026-11-09: an earlier draft said update-pass fixes were left out. They weren't; the flaw is the over-count.)*
 - **Scope comes from Dependabot first**, as `resolveScope` does today: the alert's `dependency.scope` describes the vulnerable copy, which is version-accurate. Under `compatible` and `latest`, the local tree walk is the fallback when GitHub doesn't say, and still supplies the "via" paths. Under `targeted`, see call 9.
 - **Duplicates are merged:** one entry per package, with every manifest it appears in. Today's log lists `minimatch` and `glob` twice for `pip-cost-sharing`.
 - **Production wins:** one production package makes the outcome Deploy, whatever else is unknown.
