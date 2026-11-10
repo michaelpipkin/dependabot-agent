@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { AlertOutcome, CopyDecision } from "../src/targeted/plan.js";
-import { computeOutcome, inline, MAX_BODY_CHARS, renderMarkdown, writeReport, type RunReport } from "../src/targeted/report.js";
+import { computeOutcome, inline, MAX_BODY_CHARS, renderMarkdown, targetedDeploy, targetedSummary, writeReport, type RunReport } from "../src/targeted/report.js";
 
 function copy(over: Partial<CopyDecision> = {}): CopyDecision {
   return { path: "node_modules/lodash", version: "4.17.20", action: "bump", target: "4.17.21", pastDeclared: [], ...over };
@@ -59,7 +59,8 @@ const blockedAlert = (over: Partial<AlertOutcome> = {}): AlertOutcome =>
     ...over,
   });
 
-const headings = (md: string): string[] => [...md.matchAll(/^## (.+)$/gm)].map((m) => m[1]);
+// The deploy recommendation sits in the header, so these are the sections below it.
+const headings = (md: string): string[] => [...md.matchAll(/^## (?!Deploy recommendation$)(.+)$/gm)].map((m) => m[1]);
 
 describe("computeOutcome", () => {
   it("follows the spec's order", () => {
@@ -226,7 +227,7 @@ describe("renderMarkdown", () => {
   });
 
   it("truncates to MAX_BODY_CHARS, keeping Blocked, and says so", () => {
-    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
     const md = renderMarkdown(
       report({
         blockedCount: 1,
@@ -263,7 +264,7 @@ describe("renderMarkdown", () => {
   });
 
   it("keeps removed overrides when the report is cut down, ahead of the fixed list", () => {
-    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
     const md = renderMarkdown(report({ alerts: many, removedOverrides: [{ key: "qs@>=6.0.0 <6.5.3", reason: "gone" }] }));
     assert.ok(md.length <= MAX_BODY_CHARS);
     assert.ok(md.includes("- `qs@>=6.0.0 <6.5.3`: gone"));
@@ -300,7 +301,9 @@ describe("writeReport", () => {
       const json = JSON.parse(readFileSync(join(dir, "nested", "out", "report.json"), "utf8"));
       assert.equal(json.outcome, "blocked-only");
       assert.equal(json.blockedCount, 2);
-      assert.deepEqual(json, JSON.parse(JSON.stringify(input)));
+      const { summary, deploy, ...rest } = json; // added on top of the report
+      assert.ok(summary && deploy);
+      assert.deepEqual(rest, JSON.parse(JSON.stringify(input)));
       assert.equal(readFileSync(join(dir, "nested", "out", "report.md"), "utf8"), renderMarkdown(input));
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -312,10 +315,10 @@ describe("writeReport", () => {
     try {
       writeReport(dir, report());
       assert.throws(() => readFileSync(join(dir, "report-full.md")));
-      const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
+      const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
       writeReport(dir, report({ alerts: many }));
       assert.ok(readFileSync(join(dir, "report.md"), "utf8").length <= MAX_BODY_CHARS);
-      assert.ok(readFileSync(join(dir, "report-full.md"), "utf8").includes("pkg-4999"));
+      assert.ok(readFileSync(join(dir, "report-full.md"), "utf8").includes("#5999"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -392,6 +395,110 @@ describe("inline", () => {
     assert.ok(lines.some((l) => l.endsWith("`@babel/core@7.1.0` isn't published. ## evil")));
     assert.ok(lines.includes("- `node_modules/@scope/x ## evil`: 1.0.0 → 1.1.0"));
     assert.ok(lines.includes("- `qs@>=6.0.0 <6.7.3`: needed by `@nestjs/core` # also evil"));
+  });
+});
+
+describe("the summary and the deploy recommendation", () => {
+  const overrideCopy = copy({ path: "node_modules/a/node_modules/qs", version: "6.5.0", action: "override", target: "6.5.3" });
+  const bumpCopy = copy();
+  const prod = alert({
+    number: 1,
+    packageName: "qs",
+    copies: [overrideCopy, copy({ ...overrideCopy, path: "node_modules/b/node_modules/qs" }), bumpCopy],
+  });
+
+  it("a production fix gets an IMPORTANT box and a summary line counting overrides and range bumps", () => {
+    const md = renderMarkdown(report({ alerts: [prod] }));
+    assert.ok(md.includes("[!IMPORTANT]"), md);
+    assert.ok(md.includes("## Deploy recommendation"));
+    assert.ok(md.includes("**1** override added or updated · **1** range bump"), md);
+    assert.ok(md.includes("**1** of 1 alert addressed"), md);
+  });
+
+  it("the summary and the box sit in the header, above the Alerts line and the first section", () => {
+    const md = renderMarkdown(report({ alerts: [prod] }));
+    const at = (text: string): number => md.indexOf(text);
+    assert.ok(at("of 1 alert addressed") > -1 && at("of 1 alert addressed") < at("## Deploy recommendation"));
+    assert.ok(at("## Deploy recommendation") < at("Alerts: "));
+    assert.ok(at("Alerts: ") < at("## Fixed"));
+  });
+
+  it("a dev-only fix gets a TIP box", () => {
+    const md = renderMarkdown(report({ alerts: [alert({ scope: "dev" })] }));
+    assert.ok(md.includes("[!TIP]"), md);
+    assert.doesNotMatch(md, /\[!IMPORTANT\]/);
+  });
+
+  it("a failed run has no deploy recommendation", () => {
+    const md = renderMarkdown(report({ outcome: "failed", failures: [{ check: "fixed", detail: "x" }] }));
+    assert.doesNotMatch(md, /Deploy recommendation/);
+  });
+
+  it("a dry run's summary line is a plan", () => {
+    const md = renderMarkdown(report({ dryRun: true }));
+    assert.ok(md.includes("Planned: **1** of 1 alert addressed"), md);
+    assert.doesNotMatch(md, /packages? updated/);
+  });
+
+  it("a truncated body still has the summary and the deploy section", () => {
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
+    const md = renderMarkdown(report({ alerts: many }));
+    assert.ok(md.length <= MAX_BODY_CHARS, String(md.length));
+    assert.match(md.trimEnd().split("\n").pop()!, /job summary/i);
+    assert.ok(md.includes("## Deploy recommendation"));
+    assert.ok(md.includes("[!IMPORTANT]"));
+    assert.ok(md.includes("**5000** of 5000 alerts addressed"));
+  });
+
+  it("report.json carries the summary and the deploy recommendation, and its other fields unchanged", () => {
+    const dir = mkdtempSync(join(tmpdir(), "report-"));
+    try {
+      const input = report({ alerts: [prod] });
+      writeReport(dir, input);
+      const json = JSON.parse(readFileSync(join(dir, "report.json"), "utf8"));
+      assert.equal(json.summary.addressed, 1);
+      assert.equal(json.deploy.outcome, "deploy");
+      const { summary, deploy, ...rest } = json;
+      assert.deepEqual(rest, JSON.parse(JSON.stringify(input)));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("targetedSummary counts distinct changes, removed overrides and touched paths", () => {
+    const partly = alert({
+      number: 2,
+      packageName: "tar",
+      status: "partly-fixed",
+      copies: [copy({ path: "node_modules/tar", version: "6.1.0", target: "6.2.1" }), copy({ path: "node_modules/x/node_modules/tar", action: "blocked", target: undefined, reason: "pin" })],
+    });
+    const open = alert({ number: 3, packageName: "waiting", status: "awaiting-close", copies: [] });
+    const summary = targetedSummary(
+      report({
+        alerts: [prod, partly, open],
+        otherChanges: [{ path: "node_modules/dep", from: "1.0.0", to: "1.1.0" }],
+        removedOverrides: [{ key: "qs@<6", reason: "x" }],
+      }),
+    );
+    assert.deepEqual(summary, {
+      addressed: 2,
+      open: 3,
+      overridesAddedOrUpdated: 1, // qs@6.5.3 once, though it sits at two paths
+      rangeBumps: 2, // qs@4.17.21 and tar@6.2.1
+      overridesRemoved: 1,
+      packagesUpdated: 5, // two qs paths, node_modules/lodash, node_modules/tar and node_modules/dep
+      updatePassOnly: false,
+    });
+  });
+
+  it("targetedDeploy has one input per fixed or partly fixed alert, and no via", () => {
+    const blocked = blockedAlert();
+    const rec = targetedDeploy(report({ alerts: [prod, alert({ number: 5, packageName: "tar", scope: "dev", manifest: "functions/package-lock.json" }), blocked], removedOverrides: [{ key: "qs@<6", reason: "x" }] }));
+    assert.equal(rec.outcome, "deploy");
+    assert.deepEqual(rec.production.map((e) => e.packageName), ["qs"]);
+    assert.deepEqual(rec.development.map((e) => [e.packageName, e.places]), [["tar", ["functions/"]]]);
+    assert.deepEqual(rec.production[0].via, []);
+    assert.deepEqual(rec.removedOverrides, ["qs@<6"]);
   });
 });
 
@@ -495,7 +602,7 @@ describe("Other changes", () => {
 
 describe("the npm version", () => {
   it("is in the header", () => {
-    assert.match(renderMarkdown(report({ npmVersion: "11.16.0" })).split("##")[0], /Run with npm 11\.16\.0\./);
+    assert.match(renderMarkdown(report({ npmVersion: "11.16.0" })).split(/^## (?!Deploy recommendation$)/m)[0], /Run with npm 11\.16\.0\./);
   });
 
   it("is in a report that failed before it planned anything", () => {

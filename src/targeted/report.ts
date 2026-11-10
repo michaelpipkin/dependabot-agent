@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cell, inline, MAX_BODY_CHARS, SCOPE_LABEL } from "../report/markdown.js";
+import { recommendDeploy, renderDeploySection, type DeployInput, type DeployRecommendation } from "../report/deploy.js";
+import { cell, inline, MAX_BODY_CHARS, renderSummaryLine, SCOPE_LABEL, type SummaryCounts } from "../report/markdown.js";
 import type { Advised, AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
 import type { VerificationFailure } from "./verify.js";
 
@@ -97,6 +98,31 @@ function changeTable(alerts: AlertOutcome[], extraHeader?: string, extra?: (aler
     intro: [`| ${head.join(" | ")} |`, `|${head.map(() => " --- ").join("|")}|`],
     items: alerts.flatMap((a) => changeRows(a, extra)),
   };
+}
+
+/** The counts behind the summary line: what this run did to the alerts it was given. */
+export function targetedSummary(report: RunReport): SummaryCounts {
+  const applied = report.alerts.flatMap((a) => a.copies.filter((c) => !isBlocked(c)).map((copy) => ({ alert: a, copy })));
+  const distinct = (action: CopyDecision["action"]): number =>
+    new Set(applied.filter((x) => x.copy.action === action).map((x) => `${x.alert.packageName}@${x.copy.target}`)).size;
+  const paths = new Set([...applied.map((x) => x.copy.path), ...report.otherChanges.map((c) => c.path)]);
+  return {
+    addressed: report.alerts.filter((a) => a.status === "fixed" || a.status === "partly-fixed").length,
+    open: report.alerts.length,
+    overridesAddedOrUpdated: distinct("override"),
+    rangeBumps: distinct("bump"),
+    overridesRemoved: report.removedOverrides.length,
+    packagesUpdated: paths.size,
+    updatePassOnly: false,
+  };
+}
+
+/** Whether fixed packages reach production. The lockfile is all this strategy reads, so no `via` is traced. */
+export function targetedDeploy(report: RunReport): DeployRecommendation {
+  const inputs: DeployInput[] = report.alerts
+    .filter((a) => a.status === "fixed" || a.status === "partly-fixed")
+    .map((a) => ({ packageName: a.packageName, scope: a.scope, manifest: a.manifest, via: [] }));
+  return recommendDeploy(inputs, report.removedOverrides.map((o) => o.key));
 }
 
 function summaryLine(alerts: AlertOutcome[], planned: boolean): string {
@@ -299,7 +325,13 @@ function headerBlock(report: RunReport): string {
   }
   // A failed run that never got as far as planning has no alerts to summarise.
   if (report.outcome !== "failed" || report.alerts.length > 0) {
-    lines.push(summaryLine(report.alerts, report.outcome === "failed" || report.dryRun));
+    const planned = report.outcome === "failed" || report.dryRun;
+    lines.push(renderSummaryLine(targetedSummary(report), planned), "");
+    if (report.outcome !== "failed") {
+      const deploy = renderDeploySection(targetedDeploy(report));
+      if (deploy) lines.push(deploy, "");
+    }
+    lines.push(summaryLine(report.alerts, planned));
   }
   const removed = report.removedOverrides.length;
   if (removed > 0) {
@@ -376,7 +408,8 @@ export function writeReport(dir: string, report: RunReport): void {
   mkdirSync(dir, { recursive: true });
   const body = renderMarkdown(report);
   writeFileSync(join(dir, "report.md"), body);
-  writeFileSync(join(dir, "report.json"), JSON.stringify(report, null, 2) + "\n");
+  const json = { ...report, summary: targetedSummary(report), deploy: targetedDeploy(report) };
+  writeFileSync(join(dir, "report.json"), JSON.stringify(json, null, 2) + "\n");
   // The cut-down body points at the job summary, so the full text has to exist for it.
   const full = renderMarkdown(report, { full: true });
   if (full !== body) writeFileSync(join(dir, "report-full.md"), full);
