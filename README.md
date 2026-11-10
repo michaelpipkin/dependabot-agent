@@ -628,7 +628,7 @@ If a failure can't be tied to a package, or the retries run out, **every file in
 `--report <dir>` writes a report under any strategy. For `compatible` and `latest` it holds:
 
 - `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, except in a dry run, packages updated by the update pass), then the deploy recommendation, then a `Packages` table with a row for each alert fixed in this run: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts this run didn't fix are on one "Not addressed" line, each with its reason, such as "already patched, awaiting close" or "no patched version"; it shows at most 20, then a count of the rest. It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
-- `report.json`: the same data, plus an `outcome` of `changes` or `clean`.
+- `report.json`: the same data, plus an `outcome`: `changes` when the run added, updated or removed an override or the update pass changed an installed version, otherwise `clean`.
 
 Targeted mode's report keeps its own sections, listed below, with the summary line and the deploy recommendation added at the top.
 
@@ -644,7 +644,7 @@ No box is written when no alert was fixed and no override was removed. Each list
 
 Targeted mode's `report.md` is the text for a pull request or issue. After the summary line and the deploy recommendation, the sections are Fixed, Moved with a fix, Fix still inside another advisory, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text. The summary line and the deploy recommendation are never cut. Its `report.json` holds the same data, including `summary` and `deploy`, plus an `outcome` that a workflow can act on.
 
-Every alert's line names the manifest GitHub raised it on, and the report says which npm ran.
+Every alert's line names the manifest GitHub raised it on, and the report says which npm ran. Targeted mode's `outcome` is one of these (for `compatible` and `latest`, see above):
 
 | `outcome` | Meaning |
 |---|---|
