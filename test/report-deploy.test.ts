@@ -56,6 +56,19 @@ describe("recommendDeploy", () => {
     assert.deepEqual(rec.production[0].via, ["@a/b", "c"]);
   });
 
+  it("drops via entries that are empty or name the package itself", () => {
+    const rec = recommendDeploy(
+      [
+        { packageName: "js-yaml", scope: "production", manifest: "pnpm-lock.yaml", via: [""] },
+        { packageName: "js-yaml", scope: "production", manifest: "package-lock.json", via: ["  ", "js-yaml@4.1.0", "foo@1.0.0"] },
+        { packageName: "bar", scope: "production", manifest: "package.json", via: ["bar"] },
+      ],
+      [],
+    );
+    assert.deepEqual(rec.production[0].via, ["foo"]);
+    assert.deepEqual(rec.production[1].via, []);
+  });
+
   it("merges a package's scope as production over dev over unknown", () => {
     const rec = recommendDeploy(
       [
@@ -203,7 +216,17 @@ describe("renderDeploySection", () => {
     for (const line of lines(text)) {
       assert.ok(!line.replace(/`[^`]*`/g, "").includes("@evil"), line);
     }
-    assert.ok(text.includes("> - `@evil` via `@evil`"));
+    assert.ok(text.includes("> - `@evil` via `a'`"));
+  });
+
+  it("renders a direct dependency with no via part, and keeps the other names", () => {
+    const bare = lines(renderDeploySection(recommendDeploy([{ packageName: "js-yaml", scope: "production", manifest: "pnpm-lock.yaml", via: [""] }], [])));
+    assert.ok(bare.includes("> - `js-yaml`"));
+    assert.ok(!bare.some((l) => l.includes("via")));
+    const some = lines(
+      renderDeploySection(recommendDeploy([{ packageName: "js-yaml", scope: "production", manifest: "pnpm-lock.yaml", via: ["js-yaml@4.1.0", "foo@1.0.0"] }], [])),
+    );
+    assert.ok(some.includes("> - `js-yaml` via `foo`"));
   });
 });
 
@@ -228,6 +251,12 @@ describe("logDeployRecommendation", () => {
   it("prints the no-deploy and check recommendations", () => {
     assert.equal(capture(recommendDeploy([inputs[3]], [])).at(-1), "   ✅ Recommendation: NO DEPLOY NEEDED — every fixed package is development-only.");
     assert.match(capture(recommendDeploy([], ["minimist"])).at(-1) ?? "", /^ {3}❓ Recommendation: CHECK BEFORE DECIDING — /);
+  });
+
+  it("prints no via part for a direct dependency", () => {
+    const out = capture(recommendDeploy([{ packageName: "js-yaml", scope: "production", manifest: "pnpm-lock.yaml", via: ["", "js-yaml@4.1.0"] }], []));
+    assert.ok(out.includes("      ⚠️  js-yaml"));
+    assert.ok(!out.some((l) => l.includes("via")));
   });
 
   it("prints nothing for none", () => {

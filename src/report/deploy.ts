@@ -68,7 +68,11 @@ export function recommendDeploy(inputs: DeployInput[], removedOverrides: string[
     }
     acc.scope = mergeScope(acc.scope, input.scope);
     acc.places.add(manifestLabel(input.manifest));
-    for (const v of input.via) acc.via.add(stripVersion(v));
+    for (const v of input.via) {
+      // A direct dependency's path is empty or names itself; neither says what pulled it in.
+      const name = stripVersion(v).trim();
+      if (name !== "" && name !== input.packageName) acc.via.add(name);
+    }
   }
 
   const production: DeployEntry[] = [];
