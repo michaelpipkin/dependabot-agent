@@ -137,7 +137,7 @@ describe("resolveConfig — updateStrategy in a config file", () => {
   });
 });
 
-describe("resolveConfig — --report outside targeted mode", () => {
+describe("resolveConfig — --report under every strategy", () => {
   const warnings = (args: Parameters<typeof resolveConfig>[0], env: NodeJS.ProcessEnv = {}): string[] => {
     const seen: string[] = [];
     const mocked = mock.method(console, "warn", (message: unknown) => seen.push(String(message)));
@@ -149,10 +149,11 @@ describe("resolveConfig — --report outside targeted mode", () => {
     return seen;
   };
 
-  it("warns under compatible and latest, whether it came from the flag or the environment", () => {
-    assert.ok(warnings({ reportDir: "out" }).some((w) => w.includes("--report") && w.includes("compatible")));
-    assert.ok(warnings({ reportDir: "out", updateStrategy: "latest" }).some((w) => w.includes("--report") && w.includes("latest")));
-    assert.ok(warnings({}, { REPORT_DIR: "out" }).some((w) => w.includes("--report")));
+  it("stays quiet under compatible and latest, from the flag or the environment, and keeps the directory", () => {
+    assert.ok(!warnings({ reportDir: "out" }).some((w) => w.includes("--report")));
+    assert.ok(!warnings({ reportDir: "out", updateStrategy: "latest" }).some((w) => w.includes("--report")));
+    assert.ok(!warnings({}, { REPORT_DIR: "out" }).some((w) => w.includes("--report")));
+    assert.equal(resolveConfig({ reportDir: "out", updateStrategy: "latest" }, baseEnv(workspace())).reportDir, "out");
   });
 
   it("stays quiet under targeted, and when no report was asked for", () => {

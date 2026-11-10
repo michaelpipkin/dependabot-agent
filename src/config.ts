@@ -178,9 +178,6 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   if (moveTogether.length > 0 && updateStrategy !== "targeted") {
     warn(`"moveTogether" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
   }
-  if (reportDir && updateStrategy !== "targeted") {
-    warn(`"--report" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
-  }
   const requestedAlertsFile = args.alertsFile || env.ALERTS_FILE || undefined;
   if (requestedAlertsFile && updateStrategy !== "targeted") {
     warn(`"--alerts-file" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);

@@ -37,7 +37,8 @@ Options:
                                    targeted: npm only; fix alerts with the smallest
                                    change instead of updating everything.
   --report <dir>                   Write a report of the run to this directory
-                                   (or env REPORT_DIR). Targeted strategy only.
+                                   (or env REPORT_DIR): a pull request description
+                                   with the deploy recommendation.
   --alerts-file <path>             Read alerts from this JSON file instead of GitHub, with
                                    no token (or env ALERTS_FILE). It holds what GitHub's
                                    alerts API returns, across all states. Targeted only.

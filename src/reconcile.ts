@@ -3,6 +3,9 @@ import { ResolvedConfig } from "./config.js";
 import { discoverIsolatedManifestDirs } from "./discover.js";
 import { fetchDependabotAlerts } from "./github.js";
 import { OverrideSource, selectOverrideSource } from "./override-source.js";
+import { AlertFix, classifyAlerts } from "./report/alert-fixes.js";
+import { DeployInput, logDeployRecommendation, recommendDeploy } from "./report/deploy.js";
+import { assembleStrategyReport, deployInputsOf, writeStrategyReport } from "./report/strategy-report.js";
 import {
   createPackageManager,
   detectPackageManager,
@@ -19,7 +22,7 @@ import {
   satisfiesVulnerableRange,
 } from "./semver.js";
 import { runTargeted } from "./targeted/run.js";
-import { findInstalledVersions } from "./tree.js";
+import { countChangedPackages, findInstalledVersions } from "./tree.js";
 import { workspaceMemberDependents } from "./workspace.js";
 import {
   AlertRange,
@@ -36,7 +39,7 @@ import {
   PackageManagerId,
   VulnerablePackage,
 } from "./types.js";
-import { exitWithError, log } from "./util.js";
+import { AgentError, exitWithError, log } from "./util.js";
 
 // ---------------------------------------------------------------------------
 // Determine which alerts still need overrides
@@ -998,58 +1001,6 @@ async function reconcileOrphanedOverride(
 }
 
 // ---------------------------------------------------------------------------
-// Deployment-impact reporting
-// ---------------------------------------------------------------------------
-
-function logDeploymentRecommendation(recommendations: DeploymentRecommendation[]): void {
-  if (recommendations.length === 0) return;
-
-  const needsDeploy = recommendations.filter((r) => r.scope === "production");
-  const devOnly = recommendations.filter((r) => r.scope === "dev");
-  const unknown = recommendations.filter((r) => r.scope === "unknown");
-
-  log("\n🚀 Deployment impact analysis:");
-
-  if (needsDeploy.length > 0) {
-    log("   Packages in PRODUCTION dependency graph (deployment recommended):");
-    for (const r of needsDeploy) {
-      // productionPaths comes from the local tree walk; scope can still be
-      // "production" from Dependabot's own classification when the walk resolved
-      // no path (a forced/deep transitive copy). Don't print a dangling "via:".
-      const via =
-        r.productionPaths.length > 0
-          ? ` — via: ${r.productionPaths.join(", ")}`
-          : " — flagged runtime by Dependabot (no local path resolved)";
-      log(`      ⚠️  ${r.packageName}${via}`);
-    }
-  }
-
-  if (devOnly.length > 0) {
-    log("   Packages in DEV/TEST dependencies only (branch push is sufficient):");
-    for (const r of devOnly) {
-      const via = r.devPaths.length > 0 ? ` — via: ${r.devPaths.join(", ")}` : "";
-      log(`      ✅ ${r.packageName}${via}`);
-    }
-  }
-
-  if (unknown.length > 0) {
-    log("   Packages with undetermined scope (review manually):");
-    for (const r of unknown) {
-      log(`      ❓ ${r.packageName}`);
-    }
-  }
-
-  log("");
-  if (needsDeploy.length > 0) {
-    log("   📦 Recommendation: DEPLOY — vulnerable packages are in production code.");
-  } else if (devOnly.length > 0) {
-    log("   📋 Recommendation: BRANCH PUSH ONLY — all vulnerable packages are dev/test only.");
-  } else {
-    log("   ❓ Recommendation: REVIEW MANUALLY — could not determine production impact.");
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Grouping
 // ---------------------------------------------------------------------------
 
@@ -1123,7 +1074,14 @@ interface GroupResult {
   removed: number;
   noInRangeFix: number;
   multiLine: number;
-  recommendations: DeploymentRecommendation[];
+  /** What this run did to each of the group's alerts. */
+  fixes: AlertFix[];
+  /** One per fixed alert, for the deploy recommendation. */
+  deployInputs: DeployInput[];
+  /** Installed package versions the update pass changed; 0 when it didn't run. */
+  packagesUpdated: number;
+  /** Override keys this group removed. */
+  removedOverrideKeys: string[];
 }
 
 /**
@@ -1150,9 +1108,16 @@ async function processManifestGroup(
   log("🗂️  Detecting override config location...");
   const source = selectOverrideSource(pmId, manifestDir, isRoot);
 
+  // The tree before the update, to tell what the update pass fixed from what an
+  // override did. pm.update skips itself on a dry run or skip-update; the tree
+  // read after it is then the same tree, so don't read it twice.
+  const updateRuns = !ctx.dryRun && !ctx.skipUpdate;
+  const treeBeforeUpdate = updateRuns ? pm.getInstalledTree(manifestDir) : undefined;
+
   await pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
 
   const tree = pm.getInstalledTree(manifestDir);
+  const before = treeBeforeUpdate ?? tree;
   const stillVulnerable = findVulnerableInstalls(groupAlerts, tree);
 
   // Names the orphan pass judges removable (no open alert, upstream moved on).
@@ -1179,6 +1144,8 @@ async function processManifestGroup(
   }
 
   const changes = computeOverrideChanges(source.overrides, stillVulnerable, orphanRemovedNames);
+  // The overrides as they stood before this run's changes, for the report.
+  const overridesBefore = { ...source.overrides };
   applyOverrideChanges(changes, source.overrides, source, cfg.dryRun, pmId);
   const escapedChanges = changes.filter((c) => c.noInRangeFix);
   // The tree was read without an update pass, so it is whatever was already on
@@ -1191,31 +1158,29 @@ async function processManifestGroup(
   const multiLine = findMultiLineAdvisories(stillVulnerable);
   logMultiLineAdvisories(multiLine, changes, source.overrides);
 
+  const fixes = classifyAlerts({ alerts: groupAlerts, before, after: tree, changes, overridesBefore });
+  // Several alerts can name the same package; walk its dependency paths once.
+  const impacts = new Map<string, DeploymentRecommendation>();
+  const impactOf = (name: string): DeploymentRecommendation => {
+    let impact = impacts.get(name);
+    if (!impact) {
+      impact = pm.analyseDeploymentImpact(name, manifestDir);
+      impacts.set(name, impact);
+    }
+    return impact;
+  };
+
   return {
     alerts: groupAlerts.length,
     added: changes.filter((c) => c.action !== "remove").length,
     removed: changes.filter((c) => c.action === "remove").length,
     noInRangeFix: escapedChanges.length + orphanEscapes.length,
     multiLine: multiLine.length,
-    recommendations: groupAlerts.length > 0 ? stillVulnerable.map((v) => resolveScope(v, pm, manifestDir)) : [],
+    fixes,
+    deployInputs: deployInputsOf(fixes, impactOf),
+    packagesUpdated: countChangedPackages(before, tree),
+    removedOverrideKeys: changes.filter((c) => c.action === "remove").map((c) => c.packageName),
   };
-}
-
-/**
- * Decide whether a vulnerable package is a deploy concern.
- *
- * Prefers Dependabot's scope, which describes the *vulnerable copy* and is
- * therefore version-accurate. Walking the local tree by name is not: with a
- * vulnerable and a safe copy both installed, it finds the safe copy's
- * production path and reports the package as production even when the copy
- * under alert is dev-only. Falls back to the local walk only when GitHub
- * doesn't say (older payloads).
- */
-function resolveScope(v: VulnerablePackage, pm: PackageManager, manifestDir: string): DeploymentRecommendation {
-  if (v.scope === "unknown") return pm.analyseDeploymentImpact(v.name, manifestDir);
-
-  const local = pm.analyseDeploymentImpact(v.name, manifestDir);
-  return { ...local, scope: v.scope };
 }
 
 /** Outcome of a run, for the caller to derive a process exit code from. */
@@ -1275,7 +1240,10 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   let totalAlerts = 0;
   let totalNoInRangeFix = 0;
   let totalMultiLine = 0;
-  const allRecommendations: DeploymentRecommendation[] = [];
+  let totalPackagesUpdated = 0;
+  const allFixes: AlertFix[] = [];
+  const allDeployInputs: DeployInput[] = [];
+  const allRemovedKeys = new Set<string>();
 
   // Names still load-bearing by alert state across every group — anything not
   // `fixed` (open, dismissed, auto_dismissed). Prevents a package from being
@@ -1299,7 +1267,10 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     totalRemoved += result.removed;
     totalNoInRangeFix += result.noInRangeFix;
     totalMultiLine += result.multiLine;
-    allRecommendations.push(...result.recommendations);
+    totalPackagesUpdated += result.packagesUpdated;
+    allFixes.push(...result.fixes);
+    allDeployInputs.push(...result.deployInputs);
+    for (const key of result.removedOverrideKeys) allRemovedKeys.add(key);
   }
 
   // Summary
@@ -1316,9 +1287,28 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     log(`   ⚠️  No in-range fix        : ${totalNoInRangeFix}  (escapes compatible range — verify dependents)`);
   }
 
-  if (allRecommendations.length > 0) {
-    log(`\n${"═".repeat(48)}`);
-    logDeploymentRecommendation(allRecommendations);
+  const removedKeys = [...allRemovedKeys];
+  const deploy = recommendDeploy(allDeployInputs, removedKeys);
+  if (deploy.outcome !== "none") log(`\n${"═".repeat(48)}`);
+  logDeployRecommendation(deploy);
+
+  if (cfg.reportDir) {
+    const report = assembleStrategyReport({
+      strategy: cfg.updateStrategy,
+      packageManager: rootPmId,
+      dryRun: cfg.dryRun,
+      fixes: allFixes,
+      deployInputs: allDeployInputs,
+      overridesAddedOrUpdated: totalAdded,
+      overridesRemoved: totalRemoved,
+      removedOverrideKeys: removedKeys,
+      packagesUpdated: totalPackagesUpdated,
+    });
+    try {
+      writeStrategyReport(cfg.reportDir, report);
+    } catch (e) {
+      throw new AgentError(`Could not write the report to ${cfg.reportDir}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   return { overrideChanges: totalAdded + totalRemoved };

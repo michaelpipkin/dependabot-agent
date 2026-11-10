@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import { parseArgs } from "../src/cli.js";
 
 describe("parseArgs — --exit-code", () => {
@@ -44,5 +44,21 @@ describe("parseArgs — --update-strategy targeted and --report", () => {
 
   it("leaves reportDir undefined when --report is absent", () => {
     assert.equal(parseArgs(["--dry-run"], "0.0.0").reportDir, undefined);
+  });
+});
+
+describe("parseArgs — --help", () => {
+  it("says --report writes the pull request description with the deploy recommendation", () => {
+    const printed: string[] = [];
+    mock.method(console, "log", (message: unknown) => printed.push(String(message)));
+    mock.method(process, "exit", () => undefined);
+    try {
+      parseArgs(["--help"], "0.0.0");
+    } finally {
+      mock.restoreAll();
+    }
+    const help = printed.join("\n");
+    assert.ok(help.includes("deploy recommendation"));
+    assert.ok(!help.includes("Targeted strategy only"));
   });
 });
