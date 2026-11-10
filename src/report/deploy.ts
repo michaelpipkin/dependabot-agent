@@ -29,6 +29,8 @@ export interface DeployRecommendation {
 }
 
 const MAX_VIA = 5;
+/** The most packages (or removed overrides) a list in the deploy box names; the header is never cut, so the box must stay small. */
+export const MAX_DEPLOY_ENTRIES = 30;
 const OVERRIDES_REMOVED_LINE =
   "❓ **Check before deciding:** overrides were removed, which can change installed versions at the next install";
 
@@ -112,9 +114,24 @@ function bullet(entry: DeployEntry): string {
   return text;
 }
 
+/** At most MAX_DEPLOY_ENTRIES names, then how many more. */
+function cappedNames(names: string[]): string {
+  const shown = names.slice(0, MAX_DEPLOY_ENTRIES).map(code).join(", ");
+  const more = names.length - MAX_DEPLOY_ENTRIES;
+  return more > 0 ? `${shown}, and ${more} more` : shown;
+}
+
+/** At most MAX_DEPLOY_ENTRIES bullets, then one line saying how many more. */
+function cappedBullets(entries: DeployEntry[]): string[] {
+  const lines = entries.slice(0, MAX_DEPLOY_ENTRIES).map((e) => `- ${bullet(e)}`);
+  const more = entries.length - MAX_DEPLOY_ENTRIES;
+  if (more > 0) lines.push(`- …and ${more} more`);
+  return lines;
+}
+
 function developmentLine(rec: DeployRecommendation, prefix: string): string[] {
   if (rec.development.length === 0) return [];
-  return [`${prefix}${rec.development.map((e) => code(e.packageName)).join(", ")}`];
+  return [`${prefix}${cappedNames(rec.development.map((e) => e.packageName))}`];
 }
 
 /** The deploy section of a report: heading plus a GitHub alert box. Empty when there is nothing to say. */
@@ -127,7 +144,7 @@ export function renderDeploySection(rec: DeployRecommendation): string {
   if (rec.outcome === "deploy") {
     type = "IMPORTANT";
     first = "🚀 **Deploy:** fixed packages are in production code";
-    body = [...rec.production.map((e) => `- ${bullet(e)}`), ...developmentLine(rec, "Development only: ")];
+    body = [...cappedBullets(rec.production), ...developmentLine(rec, "Development only: ")];
   } else if (rec.outcome === "no-deploy") {
     type = "TIP";
     first = "✅ **No deploy needed:** every fixed package is development-only";
@@ -135,11 +152,11 @@ export function renderDeploySection(rec: DeployRecommendation): string {
   } else if (rec.unknown.length > 0) {
     type = "WARNING";
     first = "❓ **Check before deciding:** couldn't tell whether these reach production";
-    body = [...rec.unknown.map((e) => `- ${bullet(e)}`), ...developmentLine(rec, "Development only: ")];
+    body = [...cappedBullets(rec.unknown), ...developmentLine(rec, "Development only: ")];
   } else {
     type = "WARNING";
     first = OVERRIDES_REMOVED_LINE;
-    body = [`Overrides removed: ${rec.removedOverrides.map(code).join(", ")}`];
+    body = [`Overrides removed: ${cappedNames(rec.removedOverrides)}`];
   }
 
   const box = [`[!${type}]`, first, ...body].map((line) => `> ${inline(line)}`);

@@ -227,7 +227,7 @@ describe("renderMarkdown", () => {
   });
 
   it("truncates to MAX_BODY_CHARS, keeping Blocked, and says so", () => {
-    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
     const md = renderMarkdown(
       report({
         blockedCount: 1,
@@ -264,7 +264,7 @@ describe("renderMarkdown", () => {
   });
 
   it("keeps removed overrides when the report is cut down, ahead of the fixed list", () => {
-    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
     const md = renderMarkdown(report({ alerts: many, removedOverrides: [{ key: "qs@>=6.0.0 <6.5.3", reason: "gone" }] }));
     assert.ok(md.length <= MAX_BODY_CHARS);
     assert.ok(md.includes("- `qs@>=6.0.0 <6.5.3`: gone"));
@@ -315,10 +315,10 @@ describe("writeReport", () => {
     try {
       writeReport(dir, report());
       assert.throws(() => readFileSync(join(dir, "report-full.md")));
-      const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
+      const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
       writeReport(dir, report({ alerts: many }));
       assert.ok(readFileSync(join(dir, "report.md"), "utf8").length <= MAX_BODY_CHARS);
-      assert.ok(readFileSync(join(dir, "report-full.md"), "utf8").includes("#5999"));
+      assert.ok(readFileSync(join(dir, "report-full.md"), "utf8").includes("pkg-4999"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -441,7 +441,7 @@ describe("the summary and the deploy recommendation", () => {
   });
 
   it("a truncated body still has the summary and the deploy section", () => {
-    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i % 20}` }));
+    const many = Array.from({ length: 5000 }, (_, i) => alert({ number: 1000 + i, packageName: `pkg-${i}` }));
     const md = renderMarkdown(report({ alerts: many }));
     assert.ok(md.length <= MAX_BODY_CHARS, String(md.length));
     assert.match(md.trimEnd().split("\n").pop()!, /job summary/i);

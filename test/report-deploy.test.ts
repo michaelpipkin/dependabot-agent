@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it, mock } from "node:test";
 import {
   logDeployRecommendation,
+  MAX_DEPLOY_ENTRIES,
   manifestLabel,
   recommendDeploy,
   renderDeploySection,
@@ -136,6 +137,45 @@ describe("renderDeploySection", () => {
 
   it("renders nothing when there is nothing to recommend", () => {
     assert.equal(renderDeploySection(recommendDeploy([], [])), "");
+  });
+
+  const many = (n: number, scope: DeployInput["scope"]): DeployInput[] =>
+    Array.from({ length: n }, (_, i) => ({ packageName: `pkg-${i}`, scope, manifest: "package.json", via: [] }));
+
+  it("names at most 30 production packages, then says how many more", () => {
+    assert.equal(MAX_DEPLOY_ENTRIES, 30);
+    const out = lines(renderDeploySection(recommendDeploy(many(31, "production"), [])));
+    assert.equal(out.filter((l) => l.startsWith("> - `pkg-")).length, 30);
+    assert.ok(out.includes("> - …and 1 more"));
+    assert.ok(!out.includes("> - `pkg-30`"));
+  });
+
+  it("names at most 30 undetermined packages, then says how many more", () => {
+    const out = lines(renderDeploySection(recommendDeploy(many(33, "unknown"), [])));
+    assert.equal(out.filter((l) => l.startsWith("> - `pkg-")).length, 30);
+    assert.ok(out.includes("> - …and 3 more"));
+  });
+
+  it("names at most 30 development-only packages, then says how many more", () => {
+    const tip = lines(renderDeploySection(recommendDeploy(many(32, "dev"), [])));
+    const names = tip.find((l) => l.startsWith("> `pkg-0`"))!;
+    assert.equal(names.split("`pkg-").length - 1, 30);
+    assert.ok(names.endsWith(", and 2 more"), names);
+    const withProd = lines(renderDeploySection(recommendDeploy([...many(1, "production"), ...many(32, "dev").map((d) => ({ ...d, packageName: `dev-${d.packageName}` }))], [])));
+    const dev = withProd.find((l) => l.startsWith("> Development only: "))!;
+    assert.ok(dev.endsWith(", and 2 more"), dev);
+  });
+
+  it("names at most 30 removed overrides, then says how many more", () => {
+    const keys = Array.from({ length: 31 }, (_, i) => `k${i}`);
+    const out = lines(renderDeploySection(recommendDeploy([], keys)));
+    assert.ok(out.find((l) => l.startsWith("> Overrides removed: "))!.endsWith(", and 1 more"));
+  });
+
+  it("says nothing about 'more' at exactly 30", () => {
+    const text = renderDeploySection(recommendDeploy([...many(30, "production"), ...many(30, "dev").map((d) => ({ ...d, packageName: `dev-${d.packageName}` }))], []));
+    assert.doesNotMatch(text, /more/);
+    assert.equal(lines(text).filter((l) => l.startsWith("> - `pkg-")).length, 30);
   });
 
   it("shows five via names, then how many more", () => {

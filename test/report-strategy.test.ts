@@ -257,6 +257,17 @@ describe("renderStrategyReport", () => {
   });
 });
 
+describe("a report with thousands of distinct fixed packages", () => {
+  it("keeps the body within the limit, with the summary and the deploy box", () => {
+    const fixes = Array.from({ length: 5000 }, (_, i) => fix({ number: i + 1, packageName: `distinct-package-${i}`, status: "update", scope: "production" }));
+    const body = renderStrategyReport(build(fixes));
+    assert.ok(body.length <= MAX_BODY_CHARS, `${body.length} chars`);
+    assert.match(body, /\[!IMPORTANT\]/);
+    assert.match(body, /\*\*5000\*\* of 5000 alerts addressed/);
+    assert.ok(body.includes("- …and 4970 more"));
+  });
+});
+
 describe("writeStrategyReport", () => {
   it("writes report.md and report.json, and no report-full.md when nothing was cut", () => {
     const dir = mkdtempSync(join(tmpdir(), "strategy-report-"));
