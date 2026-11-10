@@ -72,3 +72,39 @@ export function findInstalledVersions(pkgName: string, tree: InstalledTree[]): s
     return compareSemver(pa, pb);
   });
 }
+
+/** Every package name in the trees mapped to the set of versions installed anywhere. */
+function collectInstalledVersions(tree: InstalledTree[]): Map<string, Set<string>> {
+  const found = new Map<string, Set<string>>();
+  const walk = (deps: Record<string, TreeNode> | undefined): void => {
+    if (!deps) return;
+    for (const [name, entry] of Object.entries(deps)) {
+      let versions = found.get(name);
+      if (!versions) found.set(name, (versions = new Set()));
+      versions.add(entry.version);
+      walk(entry.dependencies);
+    }
+  };
+  for (const workspace of tree) {
+    walk(workspace.dependencies);
+    walk(workspace.devDependencies);
+  }
+  return found;
+}
+
+/**
+ * How many package names have a different set of installed versions after the
+ * run than before it — anywhere in the trees, counting names that were added or
+ * removed. A name counts once however many of its copies moved.
+ */
+export function countChangedPackages(before: InstalledTree[], after: InstalledTree[]): number {
+  const was = collectInstalledVersions(before);
+  const now = collectInstalledVersions(after);
+  let changed = 0;
+  for (const name of new Set([...was.keys(), ...now.keys()])) {
+    const a = was.get(name);
+    const b = now.get(name);
+    if (!a || !b || a.size !== b.size || [...a].some((v) => !b.has(v))) changed++;
+  }
+  return changed;
+}
