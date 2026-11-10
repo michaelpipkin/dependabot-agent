@@ -1,8 +1,10 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DepScope } from "../types.js";
+import { cell, inline, MAX_BODY_CHARS, SCOPE_LABEL } from "../report/markdown.js";
 import type { Advised, AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
 import type { VerificationFailure } from "./verify.js";
+
+export { inline, MAX_BODY_CHARS } from "../report/markdown.js";
 
 export type Outcome = "changes" | "blocked-only" | "clean" | "failed";
 
@@ -28,9 +30,6 @@ export interface RunReport {
   restoreError?: string;
 }
 
-/** GitHub rejects a PR or issue body over 65536 characters; leave room. */
-export const MAX_BODY_CHARS = 60000;
-
 /** The spec's order: a failure beats everything, then any changed file, then any blocked copy. */
 export function computeOutcome(input: { failed: boolean; changedFiles: number; blockedCount: number }): Outcome {
   if (input.failed) return "failed";
@@ -42,51 +41,6 @@ export function computeOutcome(input: { failed: boolean; changedFiles: number; b
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
-
-const SCOPE_LABEL: Record<DepScope, string> = {
-  production: "production",
-  dev: "dev/test only",
-  unknown: "undetermined",
-};
-
-// Left as written: a code span (paired backticks, matched left to right as markdown does)
-// or a link, whose text is cleaned separately and whose destination is kept.
-const SPAN = /`[^`]*`|\[([^\][]+)\]\(([^)\s]*)\)/g;
-// A bare @name. Not preceded by a word character, so a@b.com stays an email.
-const MENTION = /(?<!\w)@\w[^\s`]*/g;
-// Punctuation that ends a sentence, not a name.
-const TRAILING = ".,;:!?)]}'\"";
-
-/** Text outside any span. A backtick left here is unpaired: it becomes ' so it can't open a span later. */
-function plain(text: string): string {
-  return text.replaceAll("`", "'").replace(MENTION, (token) => {
-    let end = token.length;
-    while (end > 1 && TRAILING.includes(token[end - 1])) end--;
-    return `\`${token.slice(0, end)}\`${token.slice(end)}`;
-  });
-}
-
-/**
- * Free text made safe for a bullet or table cell. Line breaks become spaces, so text
- * can't start a heading or a new row. A bare @name, which GitHub treats as a mention
- * and notifies, goes in backticks, so it stays copyable and tells nobody anything.
- */
-export function inline(text: string): string {
-  const flat = text.replace(/\r?\n|\r/g, " ");
-  let out = "";
-  let last = 0;
-  for (const m of flat.matchAll(SPAN)) {
-    out += plain(flat.slice(last, m.index));
-    out += m[0].startsWith("`") ? m[0] : `[${inline(m[1])}](${m[2]})`;
-    last = m.index + m[0].length;
-  }
-  return out + plain(flat.slice(last));
-}
-
-/** A table cell: safe free text, and no pipes that would split the row. */
-function cell(text: string): string {
-  return inline(text).replace(/\|/g, "\\|");
-}
 
 function alertLink(alert: AlertOutcome): string {
   return alert.url ? `[#${alert.number}](${alert.url})` : `#${alert.number}`;
