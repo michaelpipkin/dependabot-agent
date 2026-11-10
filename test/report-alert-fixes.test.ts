@@ -117,6 +117,13 @@ describe("classifyAlerts", () => {
     assert.equal(fix.to, "1.19.3, 1.20.0");
   });
 
+  it("says the package was removed when the update pass dropped it from the tree", () => {
+    const [fix] = classify([alert("axios", "< 1.19.3", "1.19.3")], tree({ axios: "1.19.2" }), tree({ other: "1.0.0" }));
+    assert.equal(fix.status, "update");
+    assert.deepEqual(fix.from, ["1.19.2"]);
+    assert.equal(fix.to, "removed");
+  });
+
   it("calls an alert fixed by an override when the copy is still installed but a change targets it", () => {
     const [fix] = classify(
       [alert("follow-redirects", "< 1.16.2", "1.16.2", { scope: "development" })],
@@ -256,15 +263,58 @@ describe("classifyAlerts", () => {
       assert.deepEqual(fixes.find((f) => f.number === 2)!.from, ["3.14.1"]);
     });
 
-    it("falls back to the lowest floor when every floor is inside the range", () => {
+    it("does not call a 4.x alert fixed by a change that only touches the 3.x line", () => {
+      const [fix] = classify(
+        [multilineAlerts[0]],
+        jsYamlBothLines(),
+        jsYamlBothLines(),
+        [add("js-yaml@3", ">=3.15.0 <4")],
+        { "js-yaml@4": ">=4.2.0 <5" },
+      );
+      assert.equal(fix.status, "covered");
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("does not call a 3.x alert fixed by a change that only touches the 4.x line", () => {
+      const [fix] = classify(
+        [multilineAlerts[1]],
+        jsYamlBothLines(),
+        jsYamlBothLines(),
+        [add("js-yaml@4", ">=4.2.0 <5")],
+        { "js-yaml@3": ">=3.15.0 <4" },
+      );
+      assert.equal(fix.status, "covered");
+    });
+
+    it("is still-vulnerable, not override, when the other line's change is the only thing and nothing covered it before", () => {
+      const fixes = classify(
+        [multilineAlerts[0], multilineAlerts[1]],
+        jsYamlBothLines(),
+        jsYamlBothLines(),
+        [add("js-yaml@3", ">=3.15.0 <4")],
+      );
+      assert.deepEqual(fixes.map((f) => [f.number, f.status]), [[1, "still-vulnerable"], [2, "override"]]);
+    });
+
+    it("is not override when the only change's floor is still inside the alert's range", () => {
       const [fix] = classify(
         [alert("js-yaml", "< 9.0.0", "9.0.0")],
         jsYamlBothLines(),
         jsYamlBothLines(),
-        [add("js-yaml@4", ">=4.2.0 <5"), add("js-yaml@3", ">=3.15.0 <4")],
+        [add("js-yaml@4", ">=4.2.0 <5")],
+      );
+      assert.equal(fix.status, "still-vulnerable");
+    });
+
+    it("lets an unparseable floor count as clearing", () => {
+      const [fix] = classify(
+        [alert("js-yaml", "< 3.14.2", "3.14.2")],
+        tree({ "js-yaml": "3.14.1" }),
+        tree({ "js-yaml": "3.14.1" }),
+        [add("js-yaml", "latest")],
       );
       assert.equal(fix.status, "override");
-      assert.equal(fix.to, "≥ 3.15.0");
+      assert.equal(fix.to, "≥ latest");
     });
   });
 });

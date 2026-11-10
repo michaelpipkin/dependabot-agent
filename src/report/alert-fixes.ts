@@ -51,24 +51,49 @@ const byVersion = (a: string, b: string): number => {
 };
 
 /**
- * The floor to show for an alert fixed by an override. With scoped keys on several
- * lines (js-yaml@3 and js-yaml@4) each alert must show the floor that clears ITS
- * range: the lowest floor outside the alert's range that isn't below the lowest
- * copy still vulnerable. The second condition is what keeps a 4.x alert from
- * showing the 3.x line's floor — that floor is outside its range too, but it's a
- * downgrade, not a fix. Falls back to the lowest floor outside the range, then to
- * the lowest floor.
+ * The floor to show for an alert fixed by an override, or null when no change
+ * this run fixes THIS alert. A package can be held by scoped keys on several
+ * release lines (js-yaml@3 and js-yaml@4), and a change on another line says
+ * nothing about this alert, so a change qualifies only when
+ *
+ *   - its key reaches a copy that is still vulnerable: an unscoped key reaches
+ *     every copy, a scoped one (name@3) only copies on that major — otherwise a
+ *     js-yaml@4 change would "fix" an alert whose copy is on 3.x, since 4.2.0 is
+ *     neither below that copy nor inside its range;
+ *   - its floor isn't below the lowest of those copies (a lower floor is a
+ *     downgrade, not a fix); and
+ *   - its floor isn't known to sit inside the alert's range (an unparseable range
+ *     or floor counts as clearing, matching how an unparseable range counts as
+ *     vulnerable everywhere else).
+ *
+ * The lowest qualifying floor wins.
  */
-function floorFor(floors: string[], range: string, vulnerableAfter: string[]): string {
-  const outside = floors.filter((f) => satisfiesVulnerableRange(f, range) === false).sort(byVersion);
-  const lowestCopy = vulnerableAfter.length > 0 ? parseSemver(vulnerableAfter[0]) : null;
-  const notBelowCopy = lowestCopy
-    ? outside.filter((f) => {
-        const p = parseSemver(f);
-        return p !== null && compareSemver(p, lowestCopy) >= 0;
-      })
-    : outside;
-  return notBelowCopy[0] ?? outside[0] ?? [...floors].sort(byVersion)[0];
+function qualifyingFloor(
+  changes: OverrideChange[],
+  packageName: string,
+  range: string,
+  vulnerableAfter: string[],
+): string | null {
+  const floors: string[] = [];
+  for (const change of changes) {
+    if (change.action === "remove" || !change.newVersion) continue;
+    if (baseNameOfOverrideKey(change.packageName) !== packageName) continue;
+
+    const selector = change.packageName.slice(packageName.length + 1);
+    const line = /^\d+/.exec(selector)?.[0];
+    const reached =
+      line === undefined ? vulnerableAfter : vulnerableAfter.filter((v) => parseSemver(v)?.[0] === Number(line));
+    if (reached.length === 0) continue;
+
+    const floor = overrideFloor(change.newVersion);
+    const p = parseSemver(floor);
+    const lowest = parseSemver(reached[0]);
+    if (p && lowest && compareSemver(p, lowest) < 0) continue;
+    if (satisfiesVulnerableRange(floor, range) === true) continue;
+    floors.push(floor);
+  }
+  floors.sort(byVersion);
+  return floors[0] ?? null;
 }
 
 /**
@@ -116,15 +141,11 @@ export function classifyAlerts(input: {
 
     const vulnerableAfter = installedAfter.filter(isVulnerable);
     if (vulnerableAfter.length === 0) {
-      return { ...fix, status: "update", from: vulnerableBefore, to: installedAfter.join(", ") };
+      return { ...fix, status: "update", from: vulnerableBefore, to: installedAfter.length > 0 ? installedAfter.join(", ") : "removed" };
     }
 
-    const floors = changes
-      .filter((c) => c.action !== "remove" && c.newVersion && baseNameOfOverrideKey(c.packageName) === packageName)
-      .map((c) => overrideFloor(c.newVersion!));
-    if (floors.length > 0) {
-      return { ...fix, status: "override", from: vulnerableAfter, to: `≥ ${floorFor(floors, range, vulnerableAfter)}` };
-    }
+    const floor = qualifyingFloor(changes, packageName, range, vulnerableAfter);
+    if (floor !== null) return { ...fix, status: "override", from: vulnerableAfter, to: `≥ ${floor}` };
 
     if (Object.keys(overridesBefore).some((key) => baseNameOfOverrideKey(key) === packageName)) {
       return { ...fix, status: "covered", from: vulnerableAfter };
