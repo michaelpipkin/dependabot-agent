@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
-## [Unreleased]
+## [1.4.0]
+
+`--report` now works under every strategy and package manager, and every report leads with a summary line and the deploy recommendation. The overrides written for a given input are unchanged, and so are exit codes.
 
 ### Added
 
@@ -19,6 +21,7 @@ Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com
 - **The deploy recommendation counts only packages fixed for an alert in this run.** Before, the installed package behind every open alert counted, so an alert whose copy was already patched and only awaiting close could make it say DEPLOY. A package fixed in several manifests is now one entry naming each place, not one line per manifest.
 - **The console wording is now "NO DEPLOY NEEDED" and "CHECK BEFORE DECIDING"** (it was "BRANCH PUSH ONLY" and "REVIEW MANUALLY").
 - **A real `compatible` or `latest` run reads the installed tree once before the update pass,** to tell what the update pass fixed from what an override fixed. The overrides written are unchanged. If that read fails, or finds nothing installed (a sub-package CI didn't install first), the run logs a warning and goes on; the report then leaves the update pass's count at 0 and judges each alert by the tree after the update.
+- **The README's examples pin 1.4.0.**
 
 ## [1.3.1]
 
