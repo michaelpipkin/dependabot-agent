@@ -1,0 +1,196 @@
+import assert from "node:assert/strict";
+import { afterEach, describe, it, mock } from "node:test";
+import {
+  logDeployRecommendation,
+  manifestLabel,
+  recommendDeploy,
+  renderDeploySection,
+  type DeployInput,
+} from "../src/report/deploy.js";
+
+// Based on the pip-cost-sharing run of 2026-11-09.
+const inputs: DeployInput[] = [
+  { packageName: "@grpc/grpc-js", scope: "production", manifest: "pnpm-lock.yaml", via: ["@firebase/firestore@4.19.1", "google-gax@5.0.8"] },
+  { packageName: "glob", scope: "production", manifest: "pnpm-lock.yaml", via: ["rimraf@5.0.10", "replace-in-file@9.0.0", "rimraf@6.1.3"] },
+  { packageName: "glob", scope: "production", manifest: "functions/pnpm-lock.yaml", via: ["rimraf@5.0.10"] },
+  { packageName: "follow-redirects", scope: "dev", manifest: "pnpm-lock.yaml", via: ["axios@1.20.0"] },
+];
+
+const lines = (text: string): string[] => text.split("\n");
+
+describe("manifestLabel", () => {
+  it("labels a root manifest, an isolated lockfile directory and a workspace package", () => {
+    assert.equal(manifestLabel("package-lock.json"), "root");
+    assert.equal(manifestLabel("functions/pnpm-lock.yaml"), "functions/");
+    assert.equal(manifestLabel("packages/a/package.json"), "packages/a/");
+  });
+});
+
+describe("recommendDeploy", () => {
+  it("merges one entry per package across manifests", () => {
+    const rec = recommendDeploy(inputs, []);
+    assert.equal(rec.outcome, "deploy");
+    assert.deepEqual(rec.production.map((e) => e.packageName), ["@grpc/grpc-js", "glob"]);
+    const glob = rec.production[1];
+    assert.deepEqual(glob.places, ["root", "functions/"]);
+    assert.deepEqual(glob.via, ["rimraf", "replace-in-file"]);
+    assert.deepEqual(rec.development.map((e) => e.packageName), ["follow-redirects"]);
+    assert.deepEqual(rec.unknown, []);
+  });
+
+  it("puts root first and sorts the other places", () => {
+    const rec = recommendDeploy(
+      [
+        { packageName: "x", scope: "production", manifest: "packages/b/package.json", via: [] },
+        { packageName: "x", scope: "production", manifest: "package-lock.json", via: [] },
+        { packageName: "x", scope: "production", manifest: "packages/a/package.json", via: [] },
+      ],
+      [],
+    );
+    assert.deepEqual(rec.production[0].places, ["root", "packages/a/", "packages/b/"]);
+  });
+
+  it("keeps a leading @scope/ when stripping a version from a via name", () => {
+    const rec = recommendDeploy([{ packageName: "x", scope: "production", manifest: "package.json", via: ["@a/b@1.0.0", "@a/b@2.0.0", "c@1"] }], []);
+    assert.deepEqual(rec.production[0].via, ["@a/b", "c"]);
+  });
+
+  it("merges a package's scope as production over dev over unknown", () => {
+    const rec = recommendDeploy(
+      [
+        { packageName: "x", scope: "dev", manifest: "package.json", via: [] },
+        { packageName: "x", scope: "production", manifest: "functions/package.json", via: [] },
+        { packageName: "y", scope: "unknown", manifest: "package.json", via: [] },
+        { packageName: "y", scope: "dev", manifest: "functions/package.json", via: [] },
+      ],
+      [],
+    );
+    assert.deepEqual(rec.production.map((e) => e.packageName), ["x"]);
+    assert.deepEqual(rec.development.map((e) => e.packageName), ["y"]);
+    assert.deepEqual(rec.unknown, []);
+  });
+
+  it("is no-deploy when every fixed package is development-only", () => {
+    assert.equal(recommendDeploy([inputs[3]], []).outcome, "no-deploy");
+  });
+
+  it("is check when one package is undetermined and the rest are dev-only", () => {
+    const rec = recommendDeploy([{ packageName: "u", scope: "unknown", manifest: "package.json", via: [] }, inputs[3]], []);
+    assert.equal(rec.outcome, "check");
+  });
+
+  it("lets production win over unknown", () => {
+    const rec = recommendDeploy([{ packageName: "u", scope: "unknown", manifest: "package.json", via: [] }, inputs[0]], []);
+    assert.equal(rec.outcome, "deploy");
+  });
+
+  it("is check when only overrides were removed, and none when nothing happened", () => {
+    assert.equal(recommendDeploy([], ["minimist"]).outcome, "check");
+    assert.equal(recommendDeploy([], []).outcome, "none");
+  });
+
+  it("keeps dev-only fixes ahead of removed overrides", () => {
+    assert.equal(recommendDeploy([inputs[3]], ["minimist"]).outcome, "no-deploy");
+  });
+});
+
+describe("renderDeploySection", () => {
+  it("renders a deploy box with one line per package, naming every place", () => {
+    const text = renderDeploySection(recommendDeploy(inputs, []));
+    const out = lines(text);
+    assert.equal(out[0], "## Deploy recommendation");
+    assert.equal(out[1], "");
+    assert.ok(out.includes("> [!IMPORTANT]"));
+    assert.ok(out.includes("> 🚀 **Deploy:** fixed packages are in production code"));
+    assert.ok(out.includes("> - `glob` via `rimraf`, `replace-in-file` (root and `functions/`)"));
+    assert.ok(out.includes("> - `@grpc/grpc-js` via `@firebase/firestore`, `google-gax`"));
+    assert.ok(out.includes("> Development only: `follow-redirects`"));
+    assert.equal(out.filter((l) => l.startsWith("> - `glob`")).length, 1);
+    assert.ok(!text.includes("CAUTION"));
+    assert.ok(out.every((l, i) => i < 2 || l === "" || l.startsWith("> ")));
+  });
+
+  it("renders a tip box for dev-only fixes", () => {
+    const out = lines(renderDeploySection(recommendDeploy([inputs[3]], [])));
+    assert.ok(out.includes("> [!TIP]"));
+    assert.ok(out.includes("> ✅ **No deploy needed:** every fixed package is development-only"));
+    assert.ok(out.includes("> `follow-redirects`"));
+  });
+
+  it("renders a warning box listing the undetermined packages and the dev line", () => {
+    const out = lines(
+      renderDeploySection(recommendDeploy([{ packageName: "u", scope: "unknown", manifest: "package.json", via: [] }, inputs[3]], [])),
+    );
+    assert.ok(out.includes("> [!WARNING]"));
+    assert.ok(out.includes("> ❓ **Check before deciding:** couldn't tell whether these reach production"));
+    assert.ok(out.includes("> - `u`"));
+    assert.ok(out.includes("> Development only: `follow-redirects`"));
+  });
+
+  it("explains a check caused only by removed overrides", () => {
+    const out = lines(renderDeploySection(recommendDeploy([], ["minimist", "@scope/pkg"])));
+    assert.ok(out.includes("> [!WARNING]"));
+    assert.ok(out.includes("> ❓ **Check before deciding:** overrides were removed, which can change installed versions at the next install"));
+    assert.ok(out.includes("> Overrides removed: `minimist`, `@scope/pkg`"));
+  });
+
+  it("renders nothing when there is nothing to recommend", () => {
+    assert.equal(renderDeploySection(recommendDeploy([], [])), "");
+  });
+
+  it("shows five via names, then how many more", () => {
+    const via = ["a", "b", "c", "d", "e", "f", "g"];
+    const out = lines(renderDeploySection(recommendDeploy([{ packageName: "x", scope: "production", manifest: "package.json", via }], [])));
+    assert.ok(out.includes("> - `x` via `a`, `b`, `c`, `d`, `e`, and 2 more"));
+  });
+
+  it("joins three places as 'a, b and c'", () => {
+    const out = lines(
+      renderDeploySection(
+        recommendDeploy(
+          ["package.json", "packages/a/package.json", "packages/b/package.json"].map((manifest) => ({ packageName: "x", scope: "production" as const, manifest, via: [] })),
+          [],
+        ),
+      ),
+    );
+    assert.ok(out.includes("> - `x` (root, `packages/a/` and `packages/b/`)"));
+  });
+
+  it("never renders a bare mention, even for a hostile name", () => {
+    const text = renderDeploySection(
+      recommendDeploy([{ packageName: "@evil", scope: "production", manifest: "package.json", via: ["@evil", "a`@evil"] }], ["@evil"]),
+    );
+    for (const line of lines(text)) {
+      assert.ok(!line.replace(/`[^`]*`/g, "").includes("@evil"), line);
+    }
+    assert.ok(text.includes("> - `@evil` via `@evil`"));
+  });
+});
+
+describe("logDeployRecommendation", () => {
+  afterEach(() => mock.restoreAll());
+
+  const capture = (rec: ReturnType<typeof recommendDeploy>): string[] => {
+    const out: string[] = [];
+    mock.method(console, "log", (m?: unknown) => out.push(String(m)));
+    logDeployRecommendation(rec);
+    return out;
+  };
+
+  it("prints the heading, plain-text entries and the deploy recommendation", () => {
+    const out = capture(recommendDeploy(inputs, []));
+    assert.equal(out[0], "\n🚀 Deployment impact analysis:");
+    assert.ok(out.some((l) => l.includes("glob") && l.includes("rimraf, replace-in-file") && l.includes("root and functions/")));
+    assert.ok(out.some((l) => l.includes("follow-redirects")));
+    assert.equal(out.at(-1), "   🚀 Recommendation: DEPLOY — fixed packages are in production code.");
+  });
+
+  it("prints the no-deploy and check recommendations", () => {
+    assert.equal(capture(recommendDeploy([inputs[3]], [])).at(-1), "   ✅ Recommendation: NO DEPLOY NEEDED — every fixed package is development-only.");
+    assert.match(capture(recommendDeploy([], ["minimist"])).at(-1) ?? "", /^ {3}❓ Recommendation: CHECK BEFORE DECIDING — /);
+  });
+
+  it("prints nothing for none", () => {
+    assert.deepEqual(capture(recommendDeploy([], [])), []);
+  });
+});
