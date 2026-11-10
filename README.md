@@ -19,7 +19,7 @@ These are the default `compatible` and `latest` strategies. Targeted mode works 
 7. **Flags** the cases where no in-range fix exists — the earliest patched version sits outside what's installed can accept — separately from routine changes. See [No in-range fix](#no-in-range-fix).
 8. **Removes** overrides whose vulnerability has been resolved.
 9. **Leaves untouched** any overrides for packages that don't appear in any Dependabot alert (assumed intentional).
-10. **Reports** deployment impact — whether vulnerable packages are in your production graph (deploy recommended) or dev/test only (branch push sufficient).
+10. **Reports** deployment impact for the packages fixed in this run: whether any are in your production graph (deploy recommended) or all are dev/test only (a branch push is enough). It goes in the log and, with `--report`, at the top of the pull request description.
 
 ## Requirements
 
@@ -173,7 +173,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--dry-run` | `DRY_RUN=true` | `false` | Print planned changes without writing. |
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
-| `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory. Targeted strategy only: under `compatible` or `latest` it prints a warning and writes nothing. |
+| `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory, under any strategy. `report.md` is the text for a pull request: a summary line, the deploy recommendation and a table of the alerts fixed. `report.json` holds the same data, and `report-full.md` is written when `report.md` had to be cut. See [The report](#the-report). |
 | `--alerts-file <path>` | `ALERTS_FILE` | — | Read alerts from this JSON file instead of GitHub, with no token needed. It holds what GitHub's alerts API returns, across all states. Targeted strategy only: under `compatible` or `latest` it prints a warning and is ignored. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
@@ -625,10 +625,24 @@ If a failure can't be tied to a package, or the retries run out, **every file in
 
 ### The report
 
-`--report <dir>` writes:
+`--report <dir>` writes a report under any strategy. For `compatible` and `latest` it holds:
 
-- `report.md`: the text for a pull request or issue. Sections are Fixed, Moved with a fix, Fix still inside another advisory, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text.
-- `report.json`: the same data, plus an `outcome` that a workflow can act on.
+- `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, on a real run, packages updated by the update pass), then the deploy recommendation, then a `Packages` table with a row for each alert fixed in this run: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts this run didn't fix are on one "Not addressed" line, each with its reason, such as "already patched, awaiting close" or "no patched version". It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
+- `report.json`: the same data, plus an `outcome` of `changes` or `clean`.
+
+Targeted mode's report keeps its own sections, listed below, with the summary line and the deploy recommendation added at the top.
+
+**The deploy recommendation** counts only packages fixed for an alert in this run. An alert whose installed copy was already patched before the run, and is only waiting for Dependabot to close it, is never counted, so it can't make the report say to deploy. A package fixed in more than one manifest, such as the root and a `functions/` folder, is one entry naming both places. It is one of three boxes:
+
+| Box | First line | When |
+|---|---|---|
+| Important | 🚀 **Deploy:** fixed packages are in production code | At least one fixed package is in the production graph. The box lists those packages and what pulled each in. |
+| Tip | ✅ **No deploy needed:** every fixed package is development-only | Every fixed package is dev/test only. |
+| Warning | ❓ **Check before deciding:** couldn't tell whether these reach production | A fixed package's scope couldn't be determined, and none is in production. The box also appears, with a different first line, when the run removed overrides and fixed nothing else, since a removed override can change what the next install resolves. |
+
+Nothing is written when no alert was fixed and no override was removed. Each list in a box is cut to 30 entries, followed by "…and N more", so the first line is never lost. The console log lists every entry.
+
+Targeted mode's `report.md` is the text for a pull request or issue. After the summary line and the deploy recommendation, the sections are Fixed, Moved with a fix, Fix still inside another advisory, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text. The summary line and the deploy recommendation are never cut. Its `report.json` holds the same data, including `summary` and `deploy`, plus an `outcome` that a workflow can act on.
 
 Every alert's line names the manifest GitHub raised it on, and the report says which npm ran.
 
@@ -639,7 +653,7 @@ Every alert's line names the manifest GitHub raised it on, and the report says w
 | `clean` | Nothing changed and nothing is blocked. Alerts awaiting close or not found are in the job summary only, so they don't raise a false issue. |
 | `failed` | The run failed. Once targeted mode's run has begun, a failed report is written whatever stopped it, if `--report` is set. A config error or an undetected package manager stops the agent before that, with an error and no report; the workflow treats a missing report as `failed`. |
 
-A dry run produces the same report, labelled as a plan, and writes nothing.
+A dry run produces the same report, labelled as a plan (the title ends in "— plan" and the summary line starts with "Planned:"), and writes nothing.
 
 ### Running it in GitHub Actions
 
@@ -922,7 +936,7 @@ jobs:
         if: steps.mode.outputs.apply == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.DEPENDABOT_AGENT_TOKEN }}
-        run: pnpm deps:fix
+        run: pnpm deps:fix --report "$RUNNER_TEMP/agent-report" # npm: npm run deps:fix -- --report "$RUNNER_TEMP/agent-report"
 
       - name: Sync lockfile(s) to new overrides
         if: steps.mode.outputs.apply == 'true'
@@ -936,9 +950,11 @@ jobs:
           branch: dependabot-agent/reconcile-overrides
           commit-message: "chore: reconcile dependency overrides with Dependabot alerts"
           title: "chore: reconcile dependency overrides"
-          body: "Automated override reconciliation. **Merge only after CI passes** — the agent does not build or test."
+          body-path: ${{ runner.temp }}/agent-report/report.md
           labels: dependencies
 ```
+
+The pull request body is the agent's `report.md`: a summary line, the deploy recommendation and a table of the alerts fixed. As with `targeted`, the agent's text becomes the pull request body. The agent doesn't build or test, so **merge only after CI passes**.
 
 ### Gotchas
 

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+### Added
+
+- **`--report <dir>` under every strategy.** `compatible` and `latest` now write `report.md`, `report.json` and, when the body had to be cut to fit GitHub's size limit, `report-full.md`. `report.md` is a pull request description: a title, a summary line, the deploy recommendation, a table of the alerts fixed and a "Not addressed" line with each reason. Until now `--report` under these strategies printed a warning and wrote nothing.
+- **A summary line at the top of every report.** Alerts addressed, overrides added or updated, range bumps (targeted), overrides removed and, on a real run, packages updated. A dry run's line starts with "Planned:". Targeted reports gain it too, and their `report.json` gains `summary`.
+- **The deploy recommendation in the report.** A box at the top of `report.md` (and `deploy` in `report.json`): Deploy, No deploy needed, or Check before deciding. Each list in the box is cut to 30 entries, so the first line is never lost; the console log lists them all.
+
+### Changed
+
+- **The deploy recommendation counts only packages fixed for an alert in this run.** Before, the installed package behind every open alert counted, so an alert whose copy was already patched and only awaiting close could make it say DEPLOY. A package fixed in several manifests is now one entry naming each place, not one line per manifest.
+- **The console wording is now "NO DEPLOY NEEDED" and "CHECK BEFORE DECIDING"** (it was "BRANCH PUSH ONLY" and "REVIEW MANUALLY").
+- **A real `compatible` or `latest` run reads the installed tree once before the update pass,** to tell what the update pass fixed from what an override fixed. The overrides written are unchanged.
+
 ## [1.3.1]
 
 Documentation only. No code changes: `targeted` behaves exactly as in 1.3.0.
