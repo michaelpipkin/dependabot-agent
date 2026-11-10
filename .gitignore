@@ -38,3 +38,6 @@ coverage/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local scratch from Claude Code skills (brainstorm mockups, build logs)
+.superpowers/
