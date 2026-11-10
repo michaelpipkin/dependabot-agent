@@ -18,12 +18,12 @@ export interface StrategyReport {
   notAddressed: AlertFix[];
 }
 
-/** One deploy input per fixed alert. impactOf supplies the scope only where the alert's own is unknown. */
+/** One deploy input per fixed alert; the rest never count toward a deploy. impactOf supplies the scope only where the alert's own is unknown. */
 export function deployInputsOf(
   fixes: AlertFix[],
   impactOf: (packageName: string) => DeploymentRecommendation,
 ): DeployInput[] {
-  return fixes.map((f) => {
+  return fixes.filter(isFixed).map((f) => {
     const impact = impactOf(f.packageName);
     const scope = f.scope === "unknown" ? impact.scope : f.scope;
     // The paths that pulled it in: the production ones, the dev ones, or both when we can't tell.
@@ -80,6 +80,9 @@ const REASON: Record<FixStatus, string> = {
 
 const SCOPE_ORDER: Record<DepScope, number> = { production: 0, dev: 1, unknown: 2 };
 
+/** A name as a code span. Backticks can't appear inside one, so they become '. */
+const code = (text: string): string => `\`${text.replace(/`/g, "'")}\``;
+
 const alertLink = (f: AlertFix): string => (f.url ? `[#${f.number}](${f.url})` : `#${f.number}`);
 
 const TABLE_HEAD = ["Alert", "Severity", "Package", "Change", "How", "Scope", "Manifest"];
@@ -88,20 +91,23 @@ function row(f: AlertFix): string {
   const cols = [
     alertLink(f),
     f.severity,
-    `\`${f.packageName}\``,
+    code(f.packageName),
     `${f.from.length > 0 ? f.from.join(", ") : "?"} → ${f.to ?? "?"}`,
     f.status === "override" ? "override" : "update",
     SCOPE_LABEL[f.scope],
-    `\`${f.manifest}\``,
+    code(f.manifest),
   ];
   return `| ${cols.map(cell).join(" | ")} |`;
 }
+
+/** Plain code-unit order, so row order doesn't depend on the runtime's locale. */
+const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 function sortedFixes(fixes: AlertFix[]): AlertFix[] {
   return [...fixes].sort(
     (a, b) =>
       SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope] ||
-      a.packageName.localeCompare(b.packageName) ||
+      compareText(a.packageName, b.packageName) ||
       a.number - b.number,
   );
 }
@@ -109,7 +115,7 @@ function sortedFixes(fixes: AlertFix[]): AlertFix[] {
 function notAddressedLine(fixes: AlertFix[]): string {
   const entries = fixes
     .slice(0, MAX_NOT_ADDRESSED)
-    .map((f) => inline(`${alertLink(f)} \`${f.packageName.replace(/`/g, "'")}\`: ${REASON[f.status]}`));
+    .map((f) => inline(`${alertLink(f)} ${code(f.packageName)}: ${REASON[f.status]}`));
   const more = fixes.length - MAX_NOT_ADDRESSED;
   if (more > 0) entries.push(`and ${more} more`);
   return `**Not addressed:** ${entries.join("; ")}`;

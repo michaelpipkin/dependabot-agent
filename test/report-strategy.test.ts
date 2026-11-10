@@ -32,15 +32,13 @@ const impact = (over: Partial<DeploymentRecommendation> = {}) => (packageName: s
   ...over,
 });
 
-const isFixedStatus = (f: AlertFix): boolean => f.status === "update" || f.status === "override";
-
 const build = (fixes: AlertFix[], over: Partial<Parameters<typeof assembleStrategyReport>[0]> = {}): StrategyReport =>
   assembleStrategyReport({
     strategy: "latest",
     packageManager: "pnpm",
     dryRun: false,
     fixes,
-    deployInputs: deployInputsOf(fixes.filter(isFixedStatus), impact()),
+    deployInputs: deployInputsOf(fixes, impact()),
     overridesAddedOrUpdated: 0,
     overridesRemoved: 0,
     removedOverrideKeys: [],
@@ -76,6 +74,20 @@ describe("deployInputsOf", () => {
     const inputs = deployInputsOf(fixes, impact({ scope: "unknown" }));
     assert.deepEqual(inputs.map((i) => i.via), [["app-prod"], ["tool-dev"], ["app-prod", "tool-dev"]]);
     assert.equal(inputs[2].scope, "unknown");
+  });
+});
+
+describe("deployInputsOf with unfiltered alerts", () => {
+  it("leaves out alerts the run did not fix, so an already-patched production alert never recommends a deploy", () => {
+    const fixes = [
+      fix({ number: 1, packageName: "prod-pkg", status: "awaiting-close", scope: "production", from: [], to: undefined }),
+      fix({ number: 2, packageName: "dev-pkg", status: "override", scope: "dev", to: "≥ 2.0.0" }),
+    ];
+    const inputs = deployInputsOf(fixes, impact());
+    assert.deepEqual(inputs.map((i) => i.packageName), ["dev-pkg"]);
+    const body = renderStrategyReport(build(fixes, { packagesUpdated: 0, overridesAddedOrUpdated: 1 }));
+    assert.match(body, /\[!TIP\]/);
+    assert.doesNotMatch(body, /\[!IMPORTANT\]/);
   });
 });
 
@@ -204,6 +216,17 @@ describe("renderStrategyReport", () => {
     const line = body.split("\n").find((l) => l.startsWith("**Not addressed:**"))!;
     assert.equal(line.split("; ").length, 21);
     assert.ok(line.endsWith("; and 5 more"));
+  });
+
+  it("shows zero packages updated by the update pass in a real run", () => {
+    const body = renderStrategyReport(build([], { packagesUpdated: 0, overridesAddedOrUpdated: 1 }));
+    assert.match(body, /\*\*0\*\* packages updated by the update pass/);
+  });
+
+  it("neutralises backticks in package and manifest names", () => {
+    const body = renderStrategyReport(build([fix({ number: 1, packageName: "a`b", manifest: "x`y/package-lock.json", status: "update" })]));
+    assert.match(body, /\| `a'b` \|/);
+    assert.match(body, /\| `x'y\/package-lock\.json` \|/);
   });
 
   it("renders a dry run as a plan, without the packages-updated count", () => {
