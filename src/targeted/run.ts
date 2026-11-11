@@ -451,8 +451,7 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
   let readable = 0;
   for (const group of groups.filter((g) => g.input.alerts.length > 0)) {
     withAlerts++;
-    // package.json stands in for the override source file: this strategy has no use for it at the baseline.
-    const read = await readGroupBaseline(bctx, "npm", path.join(group.dir, "package-lock.json"), path.join(group.dir, "package.json"));
+    const read = await readGroupBaseline(bctx, "npm", path.join(group.dir, "package-lock.json"));
     warnings.push(...read.warnings);
     const fallback = fallbackOf(read.baseline, bctx.requested, group.label, read.reason);
     if (fallback) fallbacks.push(fallback);

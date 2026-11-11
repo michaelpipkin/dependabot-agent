@@ -685,13 +685,19 @@ describe("the deploy box and the Compared line against a baseline", () => {
     assert.ok(md.includes("Compared with the last commit (`0123456`)."), md);
   });
 
-  it("with no usable baseline it says the start of the run and keeps 1.4.0's rule for the box", () => {
+  it("names the baseline asked for even when no lockfile could be read at it, and keeps 1.4.0's rule for the box", () => {
     const input = report({ alerts: [awaiting({ number: 9 })], baseline: { kind: "commit", sha: "0123456789abcdef", fallbacks: [{ manifest: "root", kind: "run-start", reason: "not in the last commit" }] } });
     const md = renderMarkdown(input);
-    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
-    assert.ok(md.includes("compared with the packages installed at the start of the run"), md);
-    assert.doesNotMatch(md, /last commit/);
+    assert.ok(md.includes("Compared with the last commit (`0123456`)."), md);
+    assert.ok(md.includes("compared with the last commit"), md);
     assert.equal(targetedDeploy(input).production.length, 0);
+  });
+
+  it("the nothing-fixed box names the requested baseline in each of its three forms", () => {
+    const box = (baseline: RunReport["baseline"]): string => renderMarkdown(report({ alerts: [awaiting({ number: 9 })], baseline, baselineVulnerable: [] }));
+    assert.ok(box({ kind: "ref", ref: "release", fallbacks: [] }).includes("compared with `release`"));
+    assert.ok(box(COMMIT).includes("compared with the last commit"));
+    assert.ok(box({ kind: "run-start", fallbacks: [] }).includes("compared with the packages installed at the start of the run"));
   });
 
   it("without a baseline the header has no Compared line", () => {

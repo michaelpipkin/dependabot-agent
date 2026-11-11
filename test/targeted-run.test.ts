@@ -2173,7 +2173,8 @@ describe("compared with the deployed baseline", () => {
     assert.equal(report.baselineVulnerable, undefined);
     assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind]), [["root", "run-start"]]);
     assert.ok(md.includes("Couldn't read package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead."), md);
-    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
+    assert.ok(md.includes("Compared with the last commit ("), md);
+    assert.ok(!md.includes("Compared with the packages installed"), md);
     assert.equal(report.outcome, "clean");
   });
 
@@ -2183,6 +2184,7 @@ describe("compared with the deployed baseline", () => {
     const { report, md, urls } = await runIn(dir, { compareTo: "release" }, { "package-lock.json": release });
 
     assert.ok(urls.includes("https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"), urls.join(", "));
+    assert.deepEqual(urls.filter((u) => u.includes("/contents/")), ["https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"], "only the lockfile is read at the baseline");
     assert.deepEqual(report.baseline, { kind: "ref", ref: "release", fallbacks: [] });
     assert.deepEqual(report.baselineVulnerable, [1]);
     assert.ok(md.includes("Compared with `release` on GitHub."), md);
@@ -2195,6 +2197,7 @@ describe("compared with the deployed baseline", () => {
 
     assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind, f.reason]), [["root", "commit", "404"]]);
     assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.ok(md.includes('Compared with `release` on GitHub.'), md);
     assert.ok(md.includes(`Couldn't read package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
     assert.ok(md.includes("[!IMPORTANT]"), md);
     assert.equal(report.baseline?.kind, "ref");
@@ -2206,6 +2209,7 @@ describe("compared with the deployed baseline", () => {
 
     assert.deepEqual(urls.filter((u) => u.includes("/contents/")), []);
     assert.ok(md.includes('on "release" from GitHub (no token); compared with the last commit instead.'), md);
+    assert.ok(md.includes("Compared with `release` on GitHub."), md);
     assert.deepEqual(report.baselineVulnerable, [1]);
   });
 

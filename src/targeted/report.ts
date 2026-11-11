@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { comparedWithLine, type Baseline, type ReportBaseline } from "../baseline/source.js";
+import { comparedWithLine, type ReportBaseline } from "../baseline/source.js";
 import { recommendDeploy, renderDeploySection, type DeployInput, type DeployRecommendation } from "../report/deploy.js";
 import { cell, inline, MAX_BODY_CHARS, renderSummaryLine, SCOPE_LABEL, type SummaryCounts } from "../report/markdown.js";
 import type { Advised, AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
@@ -125,15 +125,6 @@ export function targetedSummary(report: RunReport): SummaryCounts {
     packagesUpdated: paths.size,
     updatePassOnly: false,
   };
-}
-
-/**
- * The baseline as the report names it. A run whose lockfiles couldn't be read at the
- * baseline has `baselineVulnerable` unset, and what it did compare with is the start of the run.
- */
-function shownBaseline(report: RunReport): Baseline | undefined {
-  if (!report.baseline) return undefined;
-  return report.baselineVulnerable ? report.baseline : { kind: "run-start" };
 }
 
 /**
@@ -355,7 +346,8 @@ function headerBlock(report: RunReport): string {
   if (report.outcome !== "failed" || report.alerts.length > 0) {
     const planned = report.outcome === "failed" || report.dryRun;
     lines.push(renderSummaryLine(targetedSummary(report), planned), "");
-    const baseline = shownBaseline(report);
+    // The baseline asked for, as in the other strategies; the warnings and `baseline.fallbacks` say where one couldn't be used.
+    const baseline = report.baseline;
     if (baseline) {
       lines.push(comparedWithLine(baseline));
       for (const warning of report.warnings ?? []) lines.push("", `_${inline(warning)}_`);

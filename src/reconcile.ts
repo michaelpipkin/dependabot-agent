@@ -1228,15 +1228,16 @@ export async function readGroupBaseline(
   bctx: BaselineContext,
   pmId: PackageManagerId,
   lockFile: string,
-  overrideFile: string,
+  /** The override source file, read at the baseline too; a caller with no use for it leaves it out. */
+  overrideFile?: string,
 ): Promise<GroupBaseline> {
   const lockPath = repoPathOf(bctx.repoRoot, lockFile);
-  const overridePath = repoPathOf(bctx.repoRoot, overrideFile);
+  const overridePath = overrideFile === undefined ? undefined : repoPathOf(bctx.repoRoot, overrideFile);
   const files = await readBaselineFiles({
     repo: bctx.repo,
     compareTo: bctx.compareTo,
     git: bctx.git,
-    repoPaths: [lockPath, overridePath],
+    repoPaths: overridePath === undefined ? [lockPath] : [lockPath, overridePath],
   });
   const warnings = [...files.warnings];
   // readBaselineFiles warns once per level it fell from: the last warning is
@@ -1270,7 +1271,7 @@ export async function readGroupBaseline(
     indexes,
     lockBefore,
     lockPath,
-    baselineOverridesText: files.texts.get(overridePath),
+    baselineOverridesText: overridePath === undefined ? undefined : files.texts.get(overridePath),
     warnings,
     reason,
   };
