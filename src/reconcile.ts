@@ -1,9 +1,17 @@
+import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
+import { Baseline, BaselineFallback, gitRepoInfo, readBaselineFiles } from "./baseline/source.js";
+import { countChangedVersions, lockfileName, lockfileVersions, VersionIndex } from "./baseline/versions.js";
 import { ResolvedConfig } from "./config.js";
 import { discoverIsolatedManifestDirs } from "./discover.js";
-import { fetchDependabotAlerts } from "./github.js";
-import { OverrideSource, selectOverrideSource } from "./override-source.js";
-import { AlertFix, classifyAlerts } from "./report/alert-fixes.js";
+import { fetchDependabotAlerts, GitHubRepoConfig } from "./github.js";
+import { OverrideSource, parseOverridesText, selectOverrideSource } from "./override-source.js";
+import {
+  AlertFix,
+  classifyAgainstBaseline,
+  classifyAlerts,
+  overridesRemovedSinceBaseline,
+} from "./report/alert-fixes.js";
 import { DeployInput, logDeployRecommendation, recommendDeploy } from "./report/deploy.js";
 import { assembleStrategyReport, deployInputsOf, writeStrategyReport } from "./report/strategy-report.js";
 import {
@@ -1078,10 +1086,169 @@ interface GroupResult {
   fixes: AlertFix[];
   /** One per fixed alert, for the deploy recommendation. */
   deployInputs: DeployInput[];
-  /** Installed package versions the update pass changed; 0 when it didn't run. */
+  /**
+   * Package names whose versions differ from the baseline's. Against the start of the
+   * run, the installed versions the update pass changed; 0 when it didn't run.
+   */
   packagesUpdated: number;
-  /** Override keys this group removed. */
+  /** Override keys this group removed, and those the baseline has that the working copy doesn't. */
   removedOverrideKeys: string[];
+  /** What this group was compared with: the baseline asked for, or what it fell back to. */
+  baseline: Baseline;
+  /** Set when the group couldn't use the baseline asked for. */
+  fallback: BaselineFallback | null;
+  /** Why the baseline isn't the one asked for, already logged. */
+  warnings: string[];
+  /** Alerts already patched in the baseline, open only until GitHub re-scans. */
+  awaitingClose: number;
+  /** Whether the working copy's lockfile changed during the run. */
+  lockfileChanged: boolean;
+}
+
+/** What every group needs to read its baseline. */
+interface BaselineContext {
+  /** The baseline the run was asked for: compareTo, else the last commit, else the start of the run. */
+  requested: Baseline;
+  repo: GitHubRepoConfig | null;
+  compareTo?: string;
+  git: { toplevel: string; headSha: string } | null;
+  /** What repo paths are relative to: git's top level, else the workspace root. */
+  repoRoot: string;
+}
+
+/** The path with symlinks and short names resolved, or as given when it can't be. */
+function realPath(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** `file` relative to `root` with forward slashes, as git and the contents API name it. The file needn't exist. */
+export function repoPathOf(root: string, file: string): string {
+  const rel = path.relative(realPath(root), path.join(realPath(path.dirname(file)), path.basename(file)));
+  return rel.split(path.sep).join("/");
+}
+
+function readTextOrNull(file: string): string | null {
+  try {
+    return readFileSync(file, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** An error as one short line: a YAML parse error carries a multi-line snippet, and warnings go in the report header. */
+function shortReason(e: unknown): string {
+  const first = (e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0].trim();
+  return first.length > 160 ? `${first.slice(0, 159)}…` : first;
+}
+
+/** A lockfile's versions, or why they can't be had. Never throws: pnpm's reader throws a YAMLException, npm's an Error. */
+function parseLockfile(pm: PackageManagerId, text: string | null): { index: VersionIndex } | { reason: string } {
+  if (text === null) return { reason: "not found" };
+  try {
+    return { index: lockfileVersions(pm, text) };
+  } catch (e) {
+    return { reason: shortReason(e) };
+  }
+}
+
+const RUN_START: Baseline = { kind: "run-start" };
+const TO_RUN_START = "compared with the packages installed at the start of the run instead.";
+
+/** The reason in a fallback warning: what lies between `opening` and "); compared with". The whole warning if it can't be found. */
+function reasonIn(warning: string, opening: string): string {
+  const start = warning.indexOf(opening);
+  const end = warning.lastIndexOf("); compared with ");
+  return start >= 0 && end >= start + opening.length ? warning.slice(start + opening.length, end) : warning;
+}
+
+/** Where a baseline's lockfile came from, as a fallback warning names it. */
+function baselineSource(b: Baseline): string {
+  return b.kind === "ref" ? `on "${b.ref}" from GitHub` : "from the last commit";
+}
+
+/** At most `max` warnings, duplicates dropped, then how many more: they go in the report header, which is never cut. */
+export function boundedWarnings(warnings: string[], max = 10): string[] {
+  const unique = [...new Set(warnings)];
+  return unique.length > max ? [...unique.slice(0, max), `…and ${unique.length - max} more`] : unique;
+}
+
+/** What a group compares with, settled before the update pass. */
+interface GroupBaseline {
+  baseline: Baseline;
+  /** The baseline's and the working copy's lockfile versions; null when the group compares with the start of the run. */
+  indexes: { baseline: VersionIndex; working: VersionIndex } | null;
+  /** The working copy's lockfile, read before the update; null when absent. */
+  lockBefore: string | null;
+  lockPath: string;
+  /** The baseline's copy of the override source file, when it could be read. */
+  baselineOverridesText: string | undefined;
+  /** Already logged. */
+  warnings: string[];
+  /** Why the group isn't on the baseline asked for, from its last warning; null with no warning. */
+  reason: string | null;
+}
+
+/**
+ * Reads a group's lockfile and override file at the baseline, and its working
+ * lockfile. Lockfile is compared with lockfile, never an installed tree with a
+ * lockfile, so a baseline lockfile is usable only beside a readable working one;
+ * otherwise the group compares installed trees from the start of the run, as 1.4.0
+ * did. Every failure is a warning; none stops the run.
+ */
+async function readGroupBaseline(
+  bctx: BaselineContext,
+  pmId: PackageManagerId,
+  lockFile: string,
+  overrideFile: string,
+): Promise<GroupBaseline> {
+  const lockPath = repoPathOf(bctx.repoRoot, lockFile);
+  const overridePath = repoPathOf(bctx.repoRoot, overrideFile);
+  const files = await readBaselineFiles({
+    repo: bctx.repo,
+    compareTo: bctx.compareTo,
+    git: bctx.git,
+    repoPaths: [lockPath, overridePath],
+  });
+  const warnings = [...files.warnings];
+  // readBaselineFiles warns once per level it fell from: the last warning is
+  // about the level just above the one it settled on.
+  let reason: string | null = null;
+  const lastRead = warnings.at(-1);
+  if (lastRead !== undefined) {
+    const fellFrom = files.baseline.kind === "run-start" ? "from the last commit" : `on "${bctx.compareTo}" from GitHub`;
+    reason = reasonIn(lastRead, `${lockPath} ${fellFrom} (`);
+  }
+
+  const lockBefore = readTextOrNull(lockFile);
+  let indexes: GroupBaseline["indexes"] = null;
+  if (files.baseline.kind !== "run-start") {
+    const atBaseline = parseLockfile(pmId, files.texts.get(lockPath) ?? null);
+    const working = parseLockfile(pmId, lockBefore);
+    if ("reason" in atBaseline) {
+      reason = atBaseline.reason;
+      warnings.push(`⚠️  Couldn't read ${lockPath} ${baselineSource(files.baseline)} (${reason}); ${TO_RUN_START}`);
+    } else if ("reason" in working) {
+      reason = working.reason;
+      warnings.push(`⚠️  Couldn't read the working copy's ${lockPath} (${reason}); ${TO_RUN_START}`);
+    } else {
+      indexes = { baseline: atBaseline.index, working: working.index };
+    }
+  }
+  for (const warning of warnings) log(warning);
+
+  return {
+    baseline: indexes ? files.baseline : RUN_START,
+    indexes,
+    lockBefore,
+    lockPath,
+    baselineOverridesText: files.texts.get(overridePath),
+    warnings,
+    reason,
+  };
 }
 
 /**
@@ -1096,6 +1263,7 @@ async function processManifestGroup(
   rootPmId: PackageManagerId,
   loadBearingNames: Set<string>,
   everAlertedNames: Set<string>,
+  bctx: BaselineContext,
 ): Promise<GroupResult> {
   const isRoot = manifestDir === cfg.workspaceRoot;
   const label = isRoot ? "root" : path.relative(cfg.workspaceRoot, manifestDir);
@@ -1108,14 +1276,21 @@ async function processManifestGroup(
   log("🗂️  Detecting override config location...");
   const source = selectOverrideSource(pmId, manifestDir, isRoot);
 
-  // The tree before the update, to tell what the update pass fixed from what an
-  // override did. pm.update skips itself on a dry run or skip-update; the tree
-  // read after it is then the same tree, so don't read it twice. The read is for
-  // the report only: a tree the package manager can't read yet (the update may
-  // repair it) mustn't stop the run, so a failure leaves it unknown.
+  const lockFile = path.join(manifestDir, lockfileName(pmId));
+  const group = await readGroupBaseline(bctx, pmId, lockFile, source.filePath);
+  const { lockBefore, lockPath, warnings } = group;
+  let baseline = group.baseline;
+  let reason = group.reason;
+
+  // Against the start of the run: the tree before the update, to tell what the
+  // update pass fixed from what an override did. pm.update skips itself on a dry
+  // run or skip-update; the tree read after it is then the same tree, so don't
+  // read it twice. The read is for the report only: a tree the package manager
+  // can't read yet (the update may repair it) mustn't stop the run, so a failure
+  // leaves it unknown.
   const updateRuns = !ctx.dryRun && !ctx.skipUpdate;
   let treeBeforeUpdate: InstalledTree[] | null | undefined;
-  if (updateRuns) {
+  if (updateRuns && group.indexes === null) {
     try {
       treeBeforeUpdate = pm.getInstalledTree(manifestDir);
     } catch {
@@ -1125,14 +1300,34 @@ async function processManifestGroup(
 
   await pm.update(manifestDir, [...new Set(groupAlerts.map((a) => a.security_vulnerability.package.name))]);
 
+  const lockAfter = readTextOrNull(lockFile);
+  // Rare: the lockfile read before the update but not after it. The tree before
+  // the update wasn't read, so the start of the run is unknown, as when that read fails.
+  let indexes: { baseline: VersionIndex; current: VersionIndex } | null = null;
+  let lockfileLostInUpdate = false;
+  if (group.indexes !== null) {
+    // Unchanged (a dry run, or an update that moved nothing): no need to parse it again.
+    const after = lockAfter === lockBefore ? { index: group.indexes.working } : parseLockfile(pmId, lockAfter);
+    if ("index" in after) indexes = { baseline: group.indexes.baseline, current: after.index };
+    else {
+      const warning = `⚠️  Couldn't read the working copy's ${lockPath} after the update (${after.reason}); ${TO_RUN_START}`;
+      log(warning);
+      warnings.push(warning);
+      baseline = RUN_START;
+      reason = after.reason;
+      lockfileLostInUpdate = true;
+    }
+  }
+
   const tree = pm.getInstalledTree(manifestDir);
   // An empty before tree beside a full after tree means nothing was installed
   // before the update (an isolated sub-package CI didn't install), not that the
   // update installed everything; treat it as unknown too.
   const beforeUnknown =
+    lockfileLostInUpdate ||
     treeBeforeUpdate === null ||
     (treeBeforeUpdate !== undefined && !hasInstalledPackages(treeBeforeUpdate) && hasInstalledPackages(tree));
-  if (beforeUnknown) {
+  if (beforeUnknown && !lockfileLostInUpdate) {
     log(`⚠️  Couldn't read the installed packages before the update in ${label}; the report treats them as unknown.`);
   }
   const before = beforeUnknown ? [] : (treeBeforeUpdate ?? tree);
@@ -1176,7 +1371,38 @@ async function processManifestGroup(
   const multiLine = findMultiLineAdvisories(stillVulnerable);
   logMultiLineAdvisories(multiLine, changes, source.overrides);
 
-  const fixes = classifyAlerts({ alerts: groupAlerts, before, after: tree, changes, overridesBefore });
+  let fixes: AlertFix[];
+  let packagesUpdated: number;
+  let removedSinceBaseline: string[] = [];
+  if (indexes !== null) {
+    // The baseline's overrides, from the same file the run found them in; unreadable
+    // there, every override counts as in the baseline (1.4.0's behaviour).
+    const baselineOverrides =
+      group.baselineOverridesText === undefined
+        ? overridesBefore
+        : parseOverridesText(path.basename(source.filePath), pmId, group.baselineOverridesText);
+    fixes = classifyAgainstBaseline({
+      alerts: groupAlerts,
+      baseline: indexes.baseline,
+      current: indexes.current,
+      changes,
+      overridesNow: overridesBefore,
+      baselineOverrides,
+    });
+    packagesUpdated = countChangedVersions(indexes.baseline, indexes.current);
+    removedSinceBaseline = overridesRemovedSinceBaseline(baselineOverrides, overridesBefore);
+  } else {
+    fixes = classifyAlerts({ alerts: groupAlerts, before, after: tree, changes, overridesBefore });
+    packagesUpdated = beforeUnknown ? 0 : countChangedPackages(before, tree);
+  }
+
+  // A group's kind is "ref" only when the run asked for a ref, so a group that
+  // differs fell back to the last commit or the start of the run.
+  const fallback: BaselineFallback | null =
+    baseline.kind !== bctx.requested.kind && baseline.kind !== "ref"
+      ? { manifest: label.split(path.sep).join("/"), kind: baseline.kind, reason: reason ?? "" }
+      : null;
+
   // Several alerts can name the same package; walk its dependency paths once.
   const impacts = new Map<string, DeploymentRecommendation>();
   const impactOf = (name: string): DeploymentRecommendation => {
@@ -1196,8 +1422,16 @@ async function processManifestGroup(
     multiLine: multiLine.length,
     fixes,
     deployInputs: deployInputsOf(fixes, impactOf),
-    packagesUpdated: beforeUnknown ? 0 : countChangedPackages(before, tree),
-    removedOverrideKeys: changes.filter((c) => c.action === "remove").map((c) => c.packageName),
+    packagesUpdated,
+    removedOverrideKeys: [
+      ...changes.filter((c) => c.action === "remove").map((c) => c.packageName),
+      ...removedSinceBaseline,
+    ],
+    baseline,
+    fallback,
+    warnings,
+    awaitingClose: fixes.filter((f) => f.status === "awaiting-close").length,
+    lockfileChanged: lockBefore !== lockAfter,
   };
 }
 
@@ -1262,6 +1496,28 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   const allFixes: AlertFix[] = [];
   const allDeployInputs: DeployInput[] = [];
   const allRemovedKeys = new Set<string>();
+  const fallbacks: BaselineFallback[] = [];
+  const allWarnings: string[] = [];
+  let totalAwaitingClose = 0;
+  // Whether this run changed what's on disk: a lockfile, or against the start of
+  // the run (1.4.0's rule) the installed packages. Never how far the baseline is.
+  let anyInstallChanged = false;
+
+  // The baseline the run is asked for. Each group reads its own files at it and
+  // falls back on its own when it can't, so a missing file in one isolated package
+  // doesn't move the rest.
+  const git = gitRepoInfo(cfg.workspaceRoot);
+  const bctx: BaselineContext = {
+    requested: cfg.compareTo
+      ? { kind: "ref", ref: cfg.compareTo }
+      : git
+        ? { kind: "commit", sha: git.headSha }
+        : { kind: "run-start" },
+    repo: cfg.token ? { owner: cfg.owner, name: cfg.name, token: cfg.token } : null,
+    compareTo: cfg.compareTo,
+    git,
+    repoRoot: git?.toplevel ?? cfg.workspaceRoot,
+  };
 
   // Names still load-bearing by alert state across every group — anything not
   // `fixed` (open, dismissed, auto_dismissed). Prevents a package from being
@@ -1278,6 +1534,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
       rootPmId,
       loadBearingNames,
       everAlertedNames,
+      bctx,
     );
 
     totalAlerts += result.alerts;
@@ -1289,6 +1546,12 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     allFixes.push(...result.fixes);
     allDeployInputs.push(...result.deployInputs);
     for (const key of result.removedOverrideKeys) allRemovedKeys.add(key);
+    if (result.fallback) fallbacks.push(result.fallback);
+    allWarnings.push(...result.warnings);
+    totalAwaitingClose += result.awaitingClose;
+    if (result.lockfileChanged || (result.baseline.kind === "run-start" && result.packagesUpdated > 0)) {
+      anyInstallChanged = true;
+    }
   }
 
   // Summary
@@ -1306,9 +1569,12 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   }
 
   const removedKeys = [...allRemovedKeys];
-  const deploy = recommendDeploy(allDeployInputs, removedKeys);
-  if (deploy.outcome !== "none") log(`\n${"═".repeat(48)}`);
-  logDeployRecommendation(deploy);
+  // Every open alert the groups classified; the console and the report say the same.
+  const openAlerts = allFixes.length;
+  const deploy = recommendDeploy(allDeployInputs, removedKeys, { openAlerts });
+  // With a count of open alerts the block always prints, if only to say there were none.
+  log(`\n${"═".repeat(48)}`);
+  logDeployRecommendation(deploy, { baseline: bctx.requested, openAlerts, awaitingClose: totalAwaitingClose });
 
   if (cfg.reportDir) {
     const report = assembleStrategyReport({
@@ -1321,11 +1587,10 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
       overridesRemoved: totalRemoved,
       removedOverrideKeys: removedKeys,
       packagesUpdated: totalPackagesUpdated,
-      // Until the run reads a baseline, the report compares with the start of the run, as 1.4.0 did.
-      baseline: { kind: "run-start", fallbacks: [] },
-      warnings: [],
-      openAlerts: allFixes.length,
-      changedThisRun: totalAdded > 0 || totalRemoved > 0 || totalPackagesUpdated > 0,
+      baseline: { ...bctx.requested, fallbacks },
+      warnings: boundedWarnings(allWarnings),
+      openAlerts,
+      changedThisRun: totalAdded + totalRemoved > 0 || anyInstallChanged,
     });
     try {
       writeStrategyReport(cfg.reportDir, report);
