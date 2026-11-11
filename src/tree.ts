@@ -65,6 +65,11 @@ export function findInstalledVersions(pkgName: string, tree: InstalledTree[]): s
     const allDeps = { ...workspace.dependencies, ...workspace.devDependencies };
     for (const hit of findPackageInTree(pkgName, allDeps)) versions.add(hit.version);
   }
+  return sortVersions(versions);
+}
+
+/** Versions ascending by semver, falling back to a string compare for any that don't parse. */
+export function sortVersions(versions: Iterable<string>): string[] {
   return [...versions].sort((a, b) => {
     const pa = parseSemver(a);
     const pb = parseSemver(b);
@@ -74,7 +79,7 @@ export function findInstalledVersions(pkgName: string, tree: InstalledTree[]): s
 }
 
 /** Every package name in the trees mapped to the set of versions installed anywhere. */
-function collectInstalledVersions(tree: InstalledTree[]): Map<string, Set<string>> {
+export function collectInstalledVersions(tree: InstalledTree[]): Map<string, Set<string>> {
   const found = new Map<string, Set<string>>();
   const walk = (deps: Record<string, TreeNode> | undefined): void => {
     if (!deps) return;
