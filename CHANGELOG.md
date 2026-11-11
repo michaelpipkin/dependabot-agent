@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [Unreleased]
+
+The deploy recommendation now answers "do I need to deploy?" by comparing your working copy with what's deployed, instead of with the start of the run. The overrides written for a given input are unchanged, and so are exit codes.
+
+### Added
+
+- **`compareTo` setting** (`--compare-to <ref>`, `COMPARE_TO`, or `compareTo` in `dependabot-agent.config.json`): a branch, tag or commit that stands for what's deployed, for example `release`. The agent reads the lockfile, and the override file, at that ref from GitHub through the contents API, so the branch needn't exist locally and CI needs no `fetch-depth` change. Setting it in the config file makes local and CI runs give the same answer. The token needs **Contents: Read** (fine-grained) or `repo` (classic, private repository) in addition; without `compareTo`, no new permission is needed. If the ref can't be read, the run warns and compares with the last commit.
+- **A "Compared with ..." line** in every report and at the top of the console's deployment block, naming the baseline: the last commit, a ref on GitHub, or the packages installed at the start of the run. `report.json` gains `baseline`, including `fallbacks` for a manifest group that couldn't use the baseline the others did.
+- **A "No deploy needed" box for a run that fixed nothing:** `no package was fixed for an alert compared with ...`, shown when there are open alerts and none counts as fixed. In `report.json`, `deploy.outcome` is `no-deploy` and `summary.addressed` is `0`.
+- **New reasons on the "Not addressed" line:** `not vulnerable in <baseline>; an override covers it`, `not vulnerable in <baseline>; still vulnerable here` and `not in <baseline>`.
+
+### Changed
+
+- **The recommendation compares with the last commit, or with `compareTo`, instead of the start of the run.** It reads the lockfile as committed at `HEAD` (read-only `git show`, never a fetch). Before, a project whose updates were made but not yet committed showed every alert as already patched and awaiting close, and the console printed no recommendation. Both sides of the comparison are lockfiles, not `node_modules`, so an out-of-date install doesn't change the answer. A dry run uses the baseline too.
+- **An alert counts as fixed only when the baseline had a vulnerable copy.** That is a version change since the baseline, or an override that reaches the copy that remains, whether this run wrote it or it is in the working copy and not in the baseline. An alert patched in both is "awaiting close". A package added or downgraded since the baseline is never counted and never called awaiting close.
+- **The recommendation is never silent.** The console always prints the deployment block, with the baseline, what was fixed and how many alerts are awaiting close, or `No open alerts to assess.`
+- **The summary line counts packages changed since the baseline,** not only what the update pass moved.
+- **`outcome` still describes the run,** not the distance from the baseline: `changes` when this run changed an override or the working copy's lockfile, so a workflow that opens a pull request on `changes` doesn't open empty ones.
+- **A real `compatible` or `latest` run no longer reads the installed tree before the update pass** when a baseline from git or GitHub is available. It still does when it falls back to comparing with the start of the run.
+- **`targeted` uses the baseline for its deploy box and its "Compared with" line only.** Its summary line, sections, statuses and `outcome` are unchanged. An alert the plan marks awaiting close counts toward the box when its package was vulnerable in the baseline. In the reusable workflow, the planning job holds no token, so `compareTo` can't be read there; it compares with the last commit and warns.
+- **A manifest group that can't use the requested baseline falls back on its own,** with a warning that names it. With no usable baseline at all, the report compares with the packages installed at the start of the run, as earlier releases did, and says so.
+
 ## [1.4.0]
 
 `--report` now works under every strategy and package manager, and every report leads with a summary line and the deploy recommendation. The overrides written for a given input are unchanged, and so are exit codes.

@@ -19,7 +19,7 @@ These are the default `compatible` and `latest` strategies. Targeted mode works 
 7. **Flags** the cases where no in-range fix exists — the earliest patched version sits outside what's installed can accept — separately from routine changes. See [No in-range fix](#no-in-range-fix).
 8. **Removes** overrides whose vulnerability has been resolved.
 9. **Leaves untouched** any overrides for packages that don't appear in any Dependabot alert (assumed intentional).
-10. **Reports** deployment impact for the packages fixed in this run: whether any are in your production graph (deploy recommended) or all are dev/test only (a branch push is enough). It goes in the log and, with `--report`, at the top of the pull request description.
+10. **Reports** whether you need to deploy. It compares your working copy's lockfile with a baseline standing for what's deployed (the last commit, or the branch you name with `compareTo`) and says whether a package fixed for an alert is in your production graph (deploy), is dev/test only (a branch push is enough), or whether nothing was fixed. It goes in the log and, with `--report`, at the top of the pull request description. See [The report](#the-report).
 
 ## Requirements
 
@@ -33,6 +33,8 @@ These are the default `compatible` and `latest` strategies. Targeted mode works 
   Actions injects cannot read the Dependabot alerts API under any circumstance. See
   [CI integration](#ci-integration-github-actions) below. Targeted mode's
   [reusable workflow](#running-it-in-github-actions) also accepts a GitHub App.
+
+  **If you set [`compareTo`](#comparing-with-whats-deployed), the same token needs one more permission,** because the agent then reads files from the repository: **Contents: Read** for a fine-grained token, or the `repo` scope for a classic token on a private repository. In Actions, the token that reads the alerts is already a personal access token or an App token, since `GITHUB_TOKEN` can't read alerts, and that is the one that needs it. Without `compareTo`, no extra permission is needed.
 
 ## Install & invoke
 
@@ -175,7 +177,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
 | `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory, under any strategy. `report.md` is the text for a pull request: a summary line, the deploy recommendation and a table of the alerts fixed. `report.json` holds the same data, and `report-full.md` is written when `report.md` had to be cut. See [The report](#the-report). |
-| `--compare-to <ref>` | `COMPARE_TO` | last commit | Compare the deploy recommendation with this branch, tag or commit on GitHub, instead of the last commit. Also settable as `compareTo` in the config file. |
+| `--compare-to <ref>` | `COMPARE_TO` | last commit | Compare the deploy recommendation with this branch, tag or commit on GitHub, instead of the last commit. The token then also needs permission to read the repository's contents. Also settable as `compareTo` in the config file. See [Comparing with what's deployed](#comparing-with-whats-deployed). |
 | `--alerts-file <path>` | `ALERTS_FILE` | — | Read alerts from this JSON file instead of GitHub, with no token needed. It holds what GitHub's alerts API returns, across all states. Targeted strategy only: under `compatible` or `latest` it prints a warning and is ignored. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
@@ -480,6 +482,7 @@ Run locally, the agent holds whatever token you give it, and talks to `api.githu
 
 - It runs no project code. Every npm command it runs has `--package-lock-only --ignore-scripts`, and it needs no `node_modules`.
 - It only writes `package.json` and `package-lock.json` files, and the report. If a check fails, it restores them.
+- It reads your git history through `git rev-parse` and `git show`, to read the lockfile as last committed. It never runs `git fetch`, and never writes to git.
 - It has two runtime dependencies, `js-yaml` and `semver`. Releases are published from GitHub Actions with npm provenance, which `npm audit signatures` can check.
 
 #### What leaves the machine
@@ -487,6 +490,7 @@ Run locally, the agent holds whatever token you give it, and talks to `api.githu
 - **To `registry.npmjs.org`:** the names of alerted packages found in your lockfile, and of packages a fix would need to move with them, to read their published versions and what those require. The names of the packages the plan would move, with their versions from the fix upward on that release line, posted to the advisory endpoint `npm audit` uses. When it's deciding whether an override it wrote can be removed, also the name and version of each installed package that depends on that override's package. **This address is fixed, and doesn't follow `.npmrc`,** so **a private package's name can reach the public registry** if it's in one of those lists. If that registry is blocked, the run fails and changes nothing. If only the advisory endpoint fails, the run carries on, and the report says fix versions weren't checked.
 - **To your npm registry, through npm:** what `npm install --package-lock-only` normally requests.
 - **To GitHub:** the pull request, the issue, the job summary and the artifacts. These hold package names and versions, advisory severities, and what was fixed or blocked, and are as visible as your repository's Actions runs. See the note on public repositories [below](#what-the-agents-code-can-reach).
+- **To GitHub, only if you set `compareTo`:** the agent reads the lockfile and the override file at that ref from the repository, through the contents API (`GET /repos/{owner}/{repo}/contents/{path}?ref={ref}`), using the same token as for alerts. It reads nothing else from the repository. Without `compareTo`, it makes no such call.
 - Nothing else: the agent has no telemetry.
 
 #### What hasn't been tested
@@ -630,20 +634,68 @@ If a failure can't be tied to a package, or the retries run out, **every file in
 
 `--report <dir>` writes a report under any strategy. For `compatible` and `latest` it holds:
 
-- `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, except in a dry run, packages updated by the update pass), then the deploy recommendation, then a `Packages` table with a row for each alert fixed in this run: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts this run didn't fix are on one "Not addressed" line, each with its reason, such as "already patched, awaiting close" or "no patched version"; it shows at most 20, then a count of the rest. It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
-- `report.json`: the same data, plus an `outcome`: `changes` when the run added, updated or removed an override or the update pass changed an installed version, otherwise `clean`.
+- `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, except in a dry run, packages changed), then a line saying what the run was compared with, then the deploy recommendation, then a `Packages` table with a row for each alert fixed: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts that weren't fixed are on one "Not addressed" line, each with its reason (listed below); it shows at most 20, then a count of the rest. It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
+- `report.json`: the same data, plus `baseline` (what the run was compared with, and any manifest that couldn't use it) and an `outcome`: `changes` when this run added, updated or removed an override or changed the working copy's lockfile, otherwise `clean`. `outcome` describes the run, not how far the working copy is from the baseline, so a workflow that opens a pull request on `changes` doesn't open empty ones because your branch differs from `release`.
 
-Targeted mode's report keeps its own sections, listed below, with the summary line and the deploy recommendation added at the top.
+Targeted mode's report keeps its own sections, listed below, with the summary line, the "Compared with" line and the deploy recommendation added at the top.
 
-**The deploy recommendation** counts only packages fixed for an alert in this run. An alert whose installed copy was already patched before the run, and is only waiting for Dependabot to close it, is never counted, so it can't make the report say to deploy. A package fixed in more than one manifest, such as the root and a `functions/` folder, is one entry naming both places. It is one of three boxes:
+#### What the report compares with
+
+The deploy recommendation answers one question: **do you need to deploy?** To answer it, the agent compares the lockfile in your working copy, after the update pass, with a **baseline** that stands for what's deployed. Both sides are lockfiles, not `node_modules`, so a checkout that was never installed gives the same answer as one that was. A dry run uses the baseline the same way, so it shows the answer a real run would give, apart from the update pass it skips. The report says which baseline it used:
+
+| Line under the summary | Baseline | When |
+|---|---|---|
+| Compared with the last commit (`c2b8101`). | The lockfile as committed at `HEAD`, read with `git show`. | The default, when the repository has a commit that contains the lockfile. |
+| Compared with `release` on GitHub. | The lockfile on the branch, tag or commit you set as [`compareTo`](#comparing-with-whats-deployed), read from GitHub through the API. | `compareTo` is set. If it can't be read, a warning right below this line says what was used instead. |
+| Compared with the packages installed at the start of the run. | The installed packages before the run. | Neither of the above could be read. |
+
+An alert counts as fixed, and so can make the report say to deploy, **only when what's deployed has the vulnerable version.** That means one of these:
+
+- The baseline has a vulnerable copy of the package and the working copy no longer does. This covers the update pass in this run and any update you made earlier and haven't committed or deployed.
+- The baseline has a vulnerable copy, a copy remains, and an override reaches it: one this run writes, or one already in your working copy that the baseline doesn't have.
+
+If production never had the vulnerable version, deploying isn't needed for that alert, and its fix goes out with your next normal release. So an alert whose package is patched in both the baseline and the working copy is only **awaiting close**: the patch is already deployed and Dependabot hasn't closed the alert yet. An alert whose package is *not* vulnerable in the baseline but is in the working copy (a dependency you added or downgraded since) is never counted as fixed, and isn't called awaiting close either, since it won't close until a fix is merged.
+
+The "Not addressed" line gives one of these reasons for each alert: `already patched, awaiting close` (patched in both), `not vulnerable in <baseline>; an override covers it` or `not vulnerable in <baseline>; still vulnerable here` (the vulnerable copy is newer than the baseline), `not in <baseline>` (the package is new since the baseline, and already patched), `no patched version`, `not installed`, `an existing override is meant to cover it`, and `still vulnerable after this run`.
+
+The summary line counts `packages changed since the last commit` (or since `release`): every package whose version differs between the baseline's lockfile and the working copy's, not only what this run's update pass moved.
+
+**Overrides.** To tell overrides that are already deployed from new ones, the agent also reads the override file (`package.json` or `pnpm-workspace.yaml`, wherever it found the overrides) at the baseline. If it can't read that file there, it treats every override in the working copy as already deployed. An override that's in the baseline but missing from the working copy counts as removed, like one this run removes.
+
+**When the baseline can't be read.** Reading a baseline never fails a run and never changes which overrides are written; it only changes what the report says.
+
+- If `compareTo` can't be read (no token, an unknown branch, missing permission, no lockfile on that ref, no network), the agent prints a warning and repeats it under the "Compared with" line, then compares with the last commit instead, for example `Couldn't read pnpm-lock.yaml on "release" from GitHub (404); compared with the last commit instead.` The "Compared with" line still names the ref you asked for, so read the warning beneath it: it says what the numbers were compared with.
+- If there's no usable last commit either (not a git repository, git isn't installed, or the lockfile isn't committed yet), or the working copy's lockfile can't be read, it compares with the packages installed at the start of the run, and says so. This is the rule earlier releases used for everything: an alert counts as fixed only if this run changed what's installed, a package already patched at the start is awaiting close, and the packages count is what the update pass moved.
+- A manifest group with its own lockfile, such as `functions/`, reads its own lockfile at the baseline. If one can't use the baseline the others use, that group alone falls back, with a warning that names it, and `report.json` lists it under `baseline.fallbacks`.
+
+**The deploy recommendation** is built from the alerts counted as fixed. A package fixed in more than one manifest, such as the root and a `functions/` folder, is one entry naming both places. It is one of four boxes:
 
 | Box | First line | When |
 |---|---|---|
 | Important | 🚀 **Deploy:** fixed packages are in production code | At least one fixed package is in the production graph. The box lists those packages and what pulled each in. |
 | Tip | ✅ **No deploy needed:** every fixed package is development-only | Every fixed package is dev/test only. |
-| Warning | ❓ **Check before deciding:** couldn't tell whether these reach production | A fixed package's scope couldn't be determined, and none is in production. The box also appears, with a different first line, when the run removed overrides and fixed nothing else, since a removed override can change what the next install resolves. |
+| Tip | ✅ **No deploy needed:** no package was fixed for an alert compared with the last commit | There are open alerts, and none was fixed compared with the baseline. The line names the baseline: `the last commit`, a `release` ref in code style, or `the packages installed at the start of the run`. In `report.json`, `deploy.outcome` is `no-deploy`, the same as for dev-only; `summary.addressed` is `0`. |
+| Warning | ❓ **Check before deciding:** couldn't tell whether these reach production | A fixed package's scope couldn't be determined, and none is in production. The box also appears, with a different first line, when overrides were removed and nothing else was fixed, since a removed override can change what the next install resolves. |
 
-No box is written when no alert was fixed and no override was removed. Each list in a box is cut to 30 entries, followed by a count of the rest, so the first line is never lost. The console log lists every entry.
+No box is written when there are no open alerts and no override was removed. Each list in a box is cut to 30 entries, followed by a count of the rest, so the first line is never lost.
+
+The console is never silent about it. Under `compatible` and `latest`, the "Deployment impact analysis" block is printed on every run that reaches the alerts: it opens with the same "Compared with" line, lists every entry, and ends with the recommendation. When nothing was fixed it says `NO DEPLOY NEEDED — no package was fixed for an alert compared with the last commit` and how many alerts were already patched there and are awaiting close; with no open alerts, it says `No open alerts to assess.`
+
+**In targeted mode,** only the deploy box and the "Compared with" line use the baseline. Its summary line, sections, statuses and `outcome` are computed from the plan, as before. An alert the plan marks awaiting close counts toward the box when its package was vulnerable in the baseline, so the box can name a package that the "Awaiting close or not found" section lists; the "Compared with" line says why. In the reusable workflow, the job that runs the agent holds no token, so `compareTo` can't be read there: it compares with the last commit of the checked-out base branch and warns.
+
+#### Comparing with what's deployed
+
+The last commit is a good stand-in for what's deployed when you deploy from every commit. If you deploy from a branch or a tag, name it, and the agent compares with that instead. Put it in `dependabot-agent.config.json`, so local runs and CI runs give the same answer for the same code:
+
+```json
+{
+  "compareTo": "release"
+}
+```
+
+`compareTo` takes any branch, tag or commit SHA that GitHub's contents API accepts, also as `--compare-to release` or `COMPARE_TO=release`. The agent reads the lockfile (and the override file) at that ref from GitHub, so the branch needn't exist locally, can't be stale, and the checkout needn't be deeper than the default: no `fetch-depth` change is needed in CI. It never runs `git fetch` or anything else that changes your git state; the only git commands it runs are `git rev-parse` and `git show`, to read the last commit.
+
+The token needs one more permission for this, since it reads files rather than alerts: **Contents: Read** on a fine-grained token, or the `repo` scope on a classic token for a private repository. If it's missing, the run warns and compares with the last commit instead.
 
 Targeted mode's `report.md` is the text for a pull request or issue. After the summary line and the deploy recommendation, the sections are Fixed, Moved with a fix, Fix still inside another advisory, Partly fixed, Applied past a declared range, Blocked, Awaiting close or not found, Other changes, and the overrides removed or kept. It is cut to fit GitHub's size limit with a note if it would be too long; in that case `report-full.md` also exists with the complete text. The summary line and the deploy recommendation are never cut. Its `report.json` holds the same data, including `summary` and `deploy`, plus an `outcome` that a workflow can act on.
 
@@ -965,6 +1017,8 @@ jobs:
 ```
 
 The pull request body is the agent's `report.md`: a summary line, the deploy recommendation and a table of the alerts fixed. As with `targeted`, the agent's text becomes the pull request body. When `report.md` is cut to fit GitHub's size limit, it says the complete report is in the job summary, so the summary step above writes `report-full.md` there, or `report.md` when nothing was cut. The agent doesn't build or test, so **merge only after CI passes**.
+
+To compare with what's deployed rather than the last commit, set `compareTo` in `dependabot-agent.config.json`, or add `--compare-to release` to the commands above. Keep `actions/checkout`'s default `fetch-depth`: the agent reads that branch from GitHub, so no deeper checkout is needed. The secret in `DEPENDABOT_AGENT_TOKEN` then also needs **Contents: Read** (fine-grained) or `repo` (classic, private repository).
 
 ### Gotchas
 
