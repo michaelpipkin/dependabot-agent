@@ -437,7 +437,7 @@ dependabot-agent --update-strategy targeted --dry-run
 >
 > - Use **npm 11.3 or newer**. See [Supported npm versions](#supported-npm-versions).
 > - On both applications, 173 of the 174 alerts were fixed, and the other was reported as blocked because it needs a major upgrade. `npm ci`, the build, the tests and linting passed on the pull requests. Dependabot closed all 173 within a minute of the merge and left the blocked one open. Closing isn't always that quick: after the next merge, the same alert closed in seconds on one application and took about twenty minutes on the other. A run in that gap reports the alert as awaiting close and changes nothing for it.
-> - The published workflow, `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm, also ran on a small npm workspace with a GitHub App: a dry run, a real run that opened an issue, and a real run that opened a pull request. 1.3.1 changed only documentation, and 1.4.0 adds the summary line and the deploy recommendation to the report; what `targeted` changes in a repository is the same as in 1.3.0.
+> - The published workflow, `targeted-reconcile.yml@v1.3.0` with `agent-version: "1.3.0"` from npm, also ran on a small npm workspace with a GitHub App: a dry run, a real run that opened an issue, and a real run that opened a pull request. 1.3.1 changed only documentation,, 1.4.0 adds the summary line and the deploy recommendation to the report, and 1.5.0 makes that recommendation compare with what's deployed; what `targeted` changes in a repository is the same as in 1.3.0.
 >
 > **Follow [Trying it safely](#trying-it-safely) on a real repository first**, and review the first pull request closely. CI on that pull request is what proves the result builds and passes your tests, because the agent doesn't build or test anything. On those applications, a lockfile that passed every check still failed its build until [`moveTogether`](#packages-that-must-move-together) was set.
 
@@ -451,7 +451,7 @@ Each step needs more access than the one before, so you can stop at any of them.
 
 ```bash
 export GITHUB_TOKEN=<token> # PowerShell: $env:GITHUB_TOKEN = "<token>"
-npx -y dependabot-agent@1.4.0 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
+npx -y dependabot-agent@1.5.0 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
 ```
 
 This reads the alerts and the lockfile, and looks up published versions, what they require and their advisories. It needs no `node_modules`, changes nothing in the repository, and writes only the report. Read `report.md`. **A dry run only plans: it never resolves anything with npm,** so it can't show every conflict npm would refuse, `legacy-peer-deps` problems or a failed check.
@@ -734,10 +734,10 @@ jobs:
     permissions: # a called workflow can't hold more than its caller grants
       contents: read
       issues: write
-    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@v1.4.0 # pin a tag or a commit SHA
+    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@v1.5.0 # pin a tag or a commit SHA
     with:
       base-branch: main
-      agent-version: "1.4.0" # keep this in step with the workflow's version
+      agent-version: "1.5.0" # keep this in step with the workflow's version
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:
       alerts-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
@@ -749,7 +749,7 @@ To use a GitHub App instead of tokens, replace the two tokens with the App's Cli
 ```yaml
     with:
       base-branch: main
-      agent-version: "1.4.0"
+      agent-version: "1.5.0"
       app-client-id: ${{ vars.DEPENDABOT_APP_CLIENT_ID }}
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:

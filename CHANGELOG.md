@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
-## [Unreleased]
+## [1.5.0]
 
 The deploy recommendation now answers "do I need to deploy?" by comparing your working copy with what's deployed, instead of with the start of the run. The overrides written for a given input are unchanged, and so are exit codes.
 
@@ -27,6 +27,7 @@ The deploy recommendation now answers "do I need to deploy?" by comparing your w
 - **A real `compatible` or `latest` run no longer reads the installed tree before the update pass** when a baseline from git or GitHub is available. It still does when it falls back to comparing with the start of the run.
 - **`targeted` uses the baseline for its deploy box and its "Compared with" line only.** Its summary line, sections, statuses and `outcome` are unchanged. An alert the plan marks awaiting close counts toward the box when its package was vulnerable in the baseline. In the reusable workflow, the planning job holds no token, so `compareTo` can't be read there; it compares with the last commit and warns.
 - **A manifest group that can't use the requested baseline falls back on its own,** with a warning that names it. With no usable baseline at all, the report compares with the packages installed at the start of the run, as earlier releases did, and says so.
+- **The README's examples pin 1.5.0.**
 
 ## [1.4.0]
 

@@ -98,7 +98,7 @@ describe("git readers", () => {
     const info = gitRepoInfo(dir);
     assert.ok(info);
     assert.match(info.headSha, /^[0-9a-f]{40}$/);
-    assert.equal(fs.realpathSync(info.toplevel), fs.realpathSync(dir));
+    assert.equal(fs.realpathSync.native(info.toplevel), fs.realpathSync.native(dir));
 
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "baseline-nogit-"));
     assert.equal(gitRepoInfo(outside), null);
