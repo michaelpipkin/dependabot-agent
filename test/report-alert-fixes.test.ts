@@ -3,7 +3,14 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { classifyAlerts, isFixed, type AlertFix } from "../src/report/alert-fixes.js";
+import {
+  classifyAgainstBaseline,
+  classifyAlerts,
+  isFixed,
+  overridesRemovedSinceBaseline,
+  type AlertFix,
+} from "../src/report/alert-fixes.js";
+import type { VersionIndex } from "../src/baseline/versions.js";
 import { countChangedPackages, hasInstalledPackages } from "../src/tree.js";
 import type { DependabotAlert, InstalledTree, OverrideChange, TreeNode } from "../src/types.js";
 
@@ -384,5 +391,251 @@ describe("hasInstalledPackages", () => {
       hasInstalledPackages([{ name: "root", version: "1.0.0", path: ".", devDependencies: { d: { name: "d", version: "1.0.0" } } }]),
       true,
     );
+  });
+});
+
+const index = (versions: Record<string, string[]>): VersionIndex => new Map(Object.entries(versions));
+
+const classifyBase = (
+  alerts: DependabotAlert[],
+  baseline: Record<string, string[]>,
+  current: Record<string, string[]>,
+  extra: { changes?: OverrideChange[]; overridesNow?: Record<string, string>; baselineOverrides?: Record<string, string> } = {},
+): AlertFix[] =>
+  classifyAgainstBaseline({
+    alerts,
+    baseline: index(baseline),
+    current: index(current),
+    changes: extra.changes ?? [],
+    overridesNow: extra.overridesNow ?? {},
+    baselineOverrides: extra.baselineOverrides ?? {},
+  });
+
+describe("classifyAgainstBaseline", () => {
+  it("calls an alert fixed by an uncommitted update (baseline vulnerable, working lockfile patched) as an update", () => {
+    const [fix] = classifyBase([alert("zod", "< 4.6.6", "4.6.6")], { zod: ["4.6.5"] }, { zod: ["4.6.6"] });
+    assert.equal(fix.status, "update");
+    assert.deepEqual(fix.from, ["4.6.5"]);
+    assert.equal(fix.to, "4.6.6");
+    assert.equal(isFixed(fix), true);
+  });
+
+  it("says removed when the package is gone from the current lockfile", () => {
+    const [fix] = classifyBase([alert("zod", "< 4.6.6", "4.6.6")], { zod: ["4.6.5"] }, {});
+    assert.equal(fix.status, "update");
+    assert.equal(fix.to, "removed");
+  });
+
+  it("joins every current version in `to`", () => {
+    const [fix] = classifyBase([alert("zod", "< 4.6.6", "4.6.6")], { zod: ["4.6.5"] }, { zod: ["4.6.6", "4.7.0"] });
+    assert.equal(fix.to, "4.6.6, 4.7.0");
+  });
+
+  it("keeps the alert's metadata", () => {
+    const [fix] = classifyBase(
+      [alert("zod", "< 4.6.6", "4.6.6", { number: 9, url: "https://example.test/9", manifest: "pnpm-lock.yaml", scope: "development" })],
+      { zod: ["4.6.5"] },
+      { zod: ["4.6.6"] },
+    );
+    assert.equal(fix.number, 9);
+    assert.equal(fix.url, "https://example.test/9");
+    assert.equal(fix.manifest, "pnpm-lock.yaml");
+    assert.equal(fix.scope, "dev");
+    assert.equal(fix.severity, "high");
+  });
+
+  it("calls a copy patched in the baseline and still patched awaiting-close", () => {
+    const [fix] = classifyBase([alert("undici", "< 22.2.1", "22.2.1")], { undici: ["22.2.5"] }, { undici: ["22.2.5"] });
+    assert.equal(fix.status, "awaiting-close");
+    assert.deepEqual(fix.from, []);
+    assert.equal(isFixed(fix), false);
+  });
+
+  it("keeps awaiting-close when an override exists for a package patched in the baseline", () => {
+    const [fix] = classifyBase([alert("undici", "< 22.2.1", "22.2.1")], { undici: ["22.2.5"] }, { undici: ["22.2.5"] }, {
+      changes: [add("undici", ">=22.2.1 <23")],
+    });
+    assert.equal(fix.status, "awaiting-close");
+  });
+
+  it("reports no-patch ahead of every other rule", () => {
+    const [fix] = classifyBase([alert("left-pad", "<= 1.3.0", null)], { "left-pad": ["1.3.0"] }, { "left-pad": ["1.3.0"] });
+    assert.equal(fix.status, "no-patch");
+  });
+
+  it("reports a package in neither lockfile as not-installed", () => {
+    const [fix] = classifyBase([alert("ghost", "< 2.0.0", "2.0.0")], { other: ["1.0.0"] }, { other: ["1.0.0"] });
+    assert.equal(fix.status, "not-installed");
+  });
+
+  describe("a dependency added or downgraded since the baseline", () => {
+    it("is introduced-covered when this run's override reaches the new vulnerable copy", () => {
+      const [fix] = classifyBase([alert("newdep", "< 1.0.1", "1.0.1")], {}, { newdep: ["1.0.0"] }, {
+        changes: [add("newdep", ">=1.0.1 <2")],
+      });
+      assert.equal(fix.status, "introduced-covered");
+      assert.deepEqual(fix.from, ["1.0.0"]);
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("is introduced when nothing reaches the new vulnerable copy", () => {
+      const [fix] = classifyBase([alert("newdep", "< 1.0.1", "1.0.1")], {}, { newdep: ["1.0.0"] });
+      assert.equal(fix.status, "introduced");
+      assert.deepEqual(fix.from, ["1.0.0"]);
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("is introduced when a patched baseline copy was downgraded to a vulnerable one", () => {
+      const [fix] = classifyBase([alert("lib", "< 2.0.0", "2.0.0")], { lib: ["2.0.0"] }, { lib: ["1.0.0"] });
+      assert.equal(fix.status, "introduced");
+      assert.deepEqual(fix.from, ["1.0.0"]);
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("is introduced-covered by an override in the working copy that the baseline lacks", () => {
+      const [fix] = classifyBase([alert("lib", "< 2.0.0", "2.0.0")], { lib: ["2.0.0"] }, { lib: ["1.0.0"] }, {
+        overridesNow: { lib: ">=2.0.0 <3" },
+      });
+      assert.equal(fix.status, "introduced-covered");
+    });
+
+    it("is introduced-covered when the baseline held the key with another value and the new floor qualifies", () => {
+      const [fix] = classifyBase([alert("lib", "< 2.0.0", "2.0.0")], { lib: ["2.0.0"] }, { lib: ["1.0.0"] }, {
+        overridesNow: { lib: ">=2.0.0 <3" },
+        baselineOverrides: { lib: ">=1.0.0" },
+      });
+      assert.equal(fix.status, "introduced-covered");
+    });
+
+    it("is introduced when the baseline held the key with another value and the new floor is below the copy", () => {
+      const [fix] = classifyBase([alert("lib", "< 2.0.0", "2.0.0")], { lib: ["2.0.0"] }, { lib: ["1.5.0"] }, {
+        overridesNow: { lib: ">=1.0.0" },
+        baselineOverrides: { lib: ">=0.5.0" },
+      });
+      assert.equal(fix.status, "introduced");
+    });
+
+    it("is introduced, not covered, when the override was already in the baseline", () => {
+      const [fix] = classifyBase([alert("lib", "< 2.0.0", "2.0.0")], { lib: ["2.0.0"] }, { lib: ["1.0.0"] }, {
+        overridesNow: { lib: ">=2.0.0 <3" },
+        baselineOverrides: { lib: ">=2.0.0 <3" },
+      });
+      assert.equal(fix.status, "introduced");
+    });
+
+    it("is not-in-baseline when a new dependency is already patched", () => {
+      const [fix] = classifyBase([alert("newdep", "< 1.0.1", "1.0.1")], {}, { newdep: ["2.0.0"] });
+      assert.equal(fix.status, "not-in-baseline");
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("counts an unparseable range as vulnerable, so a new copy is introduced", () => {
+      const [fix] = classifyBase([alert("weird", "something odd", "2.0.0")], {}, { weird: ["1.0.0"] });
+      assert.equal(fix.status, "introduced");
+    });
+  });
+
+  describe("overrides", () => {
+    it("calls an alert fixed by this run's override, with the floor in `to`", () => {
+      const [fix] = classifyBase([alert("follow-redirects", "< 1.16.2", "1.16.2")], { "follow-redirects": ["1.15.9"] }, { "follow-redirects": ["1.15.9"] }, {
+        changes: [add("follow-redirects", ">=1.16.2 <2")],
+      });
+      assert.equal(fix.status, "override");
+      assert.deepEqual(fix.from, ["1.15.9"]);
+      assert.equal(fix.to, "≥ 1.16.2");
+      assert.equal(isFixed(fix), true);
+    });
+
+    it("calls an alert fixed by an uninstalled override that the baseline lacks as an override", () => {
+      const [fix] = classifyBase([alert("pkg", "< 1.0.1", "1.0.1")], { pkg: ["1.0.0"] }, { pkg: ["1.0.0"] }, {
+        overridesNow: { pkg: ">=1.0.1 <2" },
+        baselineOverrides: {},
+      });
+      assert.equal(fix.status, "override");
+      assert.deepEqual(fix.from, ["1.0.0"]);
+      assert.equal(fix.to, "≥ 1.0.1");
+      assert.equal(isFixed(fix), true);
+    });
+
+    it("calls a changed value of an override the baseline holds an override when the new floor qualifies", () => {
+      const [fix] = classifyBase([alert("pkg", "< 1.0.1", "1.0.1")], { pkg: ["1.0.0"] }, { pkg: ["1.0.0"] }, {
+        overridesNow: { pkg: ">=1.0.1 <2" },
+        baselineOverrides: { pkg: ">=1.0.0" },
+      });
+      assert.equal(fix.status, "override");
+      assert.equal(fix.to, "≥ 1.0.1");
+    });
+
+    it("keeps covered when the changed value's floor is below the copy", () => {
+      const [fix] = classifyBase([alert("pkg", "< 1.0.1", "1.0.1")], { pkg: ["1.0.0"] }, { pkg: ["1.0.0"] }, {
+        overridesNow: { pkg: ">=0.9.0" },
+        baselineOverrides: { pkg: ">=1.0.0" },
+      });
+      assert.equal(fix.status, "covered");
+    });
+
+    it("ignores an overridesNow value for a key this run's change replaced", () => {
+      const [fix] = classifyBase([alert("pkg", "< 1.0.1", "1.0.1")], { pkg: ["1.0.0"] }, { pkg: ["1.0.0"] }, {
+        changes: [{ packageName: "pkg", action: "update", oldVersion: ">=1.0.1 <2", newVersion: ">=0.9.0", reason: "r" }],
+        overridesNow: { pkg: ">=1.0.1 <2" },
+        baselineOverrides: { pkg: ">=1.0.0" },
+      });
+      assert.equal(fix.status, "covered");
+    });
+
+    it("does not treat a prototype key as an override in the baseline", () => {
+      const [fix] = classifyBase([alert("constructor", "< 1.0.1", "1.0.1")], { constructor: ["1.0.0"] }, { constructor: ["1.0.0"] }, {
+        overridesNow: { constructor: ">=1.0.1 <2" },
+      });
+      assert.equal(fix.status, "override");
+    });
+
+    it("calls the same override present in both covered", () => {
+      const [fix] = classifyBase([alert("pkg", "< 1.0.1", "1.0.1")], { pkg: ["1.0.0"] }, { pkg: ["1.0.0"] }, {
+        overridesNow: { pkg: ">=1.0.1 <2" },
+        baselineOverrides: { pkg: ">=1.0.1 <2" },
+      });
+      assert.equal(fix.status, "covered");
+      assert.equal(isFixed(fix), false);
+    });
+
+    it("matches a scoped baseline override key by its base name", () => {
+      const [fix] = classifyBase([alert("js-yaml", "< 3.14.2", "3.14.2")], { "js-yaml": ["3.14.1"] }, { "js-yaml": ["3.14.1"] }, {
+        overridesNow: { "js-yaml@3": ">=3.14.2 <4" },
+        baselineOverrides: { "js-yaml@3": ">=3.14.2 <4" },
+      });
+      assert.equal(fix.status, "covered");
+    });
+
+    it("does not let a new override on another release line fix the alert", () => {
+      const [fix] = classifyBase([multilineAlerts[0]], { "js-yaml": ["3.14.1", "4.1.0"] }, { "js-yaml": ["3.14.1", "4.1.0"] }, {
+        overridesNow: { "js-yaml@3": ">=3.15.0 <4", "js-yaml@4": ">=4.2.0 <5" },
+        baselineOverrides: { "js-yaml@4": ">=4.2.0 <5" },
+      });
+      assert.equal(fix.status, "covered");
+    });
+
+    it("calls a vulnerable copy with no override still-vulnerable", () => {
+      const [fix] = classifyBase([alert("glob", "< 10.5.0", "10.5.0")], { glob: ["10.4.0"] }, { glob: ["10.4.0"] });
+      assert.equal(fix.status, "still-vulnerable");
+      assert.deepEqual(fix.from, ["10.4.0"]);
+    });
+
+    it("prefers the update rule over an override when no vulnerable copy remains", () => {
+      const [fix] = classifyBase([alert("zod", "< 4.6.6", "4.6.6")], { zod: ["4.6.5"] }, { zod: ["4.6.6"] }, {
+        changes: [add("zod", ">=4.6.6 <5")],
+      });
+      assert.equal(fix.status, "update");
+    });
+  });
+});
+
+describe("overridesRemovedSinceBaseline", () => {
+  it("lists the baseline keys that are missing now", () => {
+    assert.deepEqual(overridesRemovedSinceBaseline({ a: "1", b: "2" }, { a: "1" }), ["b"]);
+  });
+
+  it("is empty when nothing was removed", () => {
+    assert.deepEqual(overridesRemovedSinceBaseline({ a: "1" }, { a: "2", c: "3" }), []);
   });
 });

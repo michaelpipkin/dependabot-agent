@@ -75,6 +75,10 @@ const REASON: Record<FixStatus, string> = {
   covered: "an existing override is meant to cover it",
   "no-patch": "no patched version",
   "not-installed": "not installed",
+  // Placeholders until the report names the baseline in these reasons (a later task).
+  "introduced-covered": "not vulnerable in the baseline; an override covers it",
+  introduced: "not vulnerable in the baseline; still vulnerable here",
+  "not-in-baseline": "not in the baseline",
   "still-vulnerable": "still vulnerable after this run",
 };
 

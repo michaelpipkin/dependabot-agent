@@ -1,5 +1,6 @@
 import { alertScope, baseNameOfOverrideKey, overrideFloor } from "../reconcile.js";
 import { compareSemver, parseSemver, satisfiesVulnerableRange } from "../semver.js";
+import type { VersionIndex } from "../baseline/versions.js";
 import { findInstalledVersions } from "../tree.js";
 import type { DependabotAlert, DepScope, InstalledTree, OverrideChange } from "../types.js";
 
@@ -14,6 +15,10 @@ import type { DependabotAlert, DepScope, InstalledTree, OverrideChange } from ".
  *   covered          an override from an earlier run already holds this package
  *   no-patch         the advisory has no patched version to move to
  *   not-installed    the package isn't in the tree, before or after
+ *   introduced-covered  the baseline had no vulnerable copy (a dependency added or downgraded
+ *                    since) and an override reaches the one that is vulnerable now
+ *   introduced       the same, with nothing reaching the vulnerable copy
+ *   not-in-baseline  the package isn't in the baseline and what's here is already patched
  *   still-vulnerable nothing this run did fixed it, and nothing explains why
  */
 export type FixStatus =
@@ -23,6 +28,9 @@ export type FixStatus =
   | "covered"
   | "no-patch"
   | "not-installed"
+  | "introduced-covered"
+  | "introduced"
+  | "not-in-baseline"
   | "still-vulnerable";
 
 export interface AlertFix {
@@ -70,7 +78,7 @@ const byVersion = (a: string, b: string): number => {
  * The lowest qualifying floor wins.
  */
 function qualifyingFloor(
-  changes: OverrideChange[],
+  changes: Pick<OverrideChange, "packageName" | "action" | "newVersion">[],
   packageName: string,
   range: string,
   vulnerableAfter: string[],
@@ -157,5 +165,115 @@ export function classifyAlerts(input: {
     }
 
     return { ...fix, from: vulnerableAfter };
+  });
+}
+
+/**
+ * This run's changes plus the overrides in the working copy that differ from the
+ * baseline (absent there, or holding another value: written by an earlier run and
+ * not installed or deployed yet), as the entries qualifyingFloor reads. A key this
+ * run changed is left to its change, so an updated key's old value isn't a candidate.
+ */
+function overrideEntriesSinceBaseline(
+  changes: OverrideChange[],
+  overridesNow: Record<string, string>,
+  baselineOverrides: Record<string, string>,
+): Pick<OverrideChange, "packageName" | "action" | "newVersion">[] {
+  const changedKeys = new Set(changes.map((change) => change.packageName));
+  const added = Object.entries(overridesNow)
+    .filter(([key]) => !changedKeys.has(key))
+    .filter(([key, value]) => !Object.hasOwn(baselineOverrides, key) || baselineOverrides[key] !== value)
+    .map(([key, value]) => ({ packageName: key, action: "add" as const, newVersion: value }));
+  return [...changes, ...added];
+}
+
+/** The override keys the baseline had that the working copy no longer has. */
+export function overridesRemovedSinceBaseline(
+  baselineOverrides: Record<string, string>,
+  overridesNow: Record<string, string>,
+): string[] {
+  return Object.keys(baselineOverrides).filter((key) => !Object.hasOwn(overridesNow, key));
+}
+
+/**
+ * Like classifyAlerts, but compares the current lockfile with a baseline standing
+ * for what's deployed, so an alert counts as fixed only when the baseline had a
+ * vulnerable copy and the current state no longer does, or an override reaches the
+ * copy that remains. A dependency added or downgraded since the baseline was never
+ * exposed in production: it is neither fixed nor awaiting close.
+ *
+ * Rules, first that applies (B = baseline versions, C = current versions):
+ *   1. no patched version                          no-patch
+ *   2. B and C both empty                          not-installed
+ *   3. neither B nor C has a vulnerable copy       not-in-baseline (B empty) or awaiting-close
+ *   4. B has none, C has one                       introduced-covered or introduced
+ *   5. C has none                                  update
+ *   6. an override reaches C's vulnerable copies    override
+ *   7. an override held in the baseline already    covered
+ *   8. otherwise                                   still-vulnerable
+ *
+ * As everywhere else, an unparseable range counts as vulnerable.
+ */
+export function classifyAgainstBaseline(input: {
+  alerts: DependabotAlert[];
+  baseline: VersionIndex;
+  current: VersionIndex;
+  changes: OverrideChange[];
+  overridesNow: Record<string, string>;
+  baselineOverrides: Record<string, string>;
+}): AlertFix[] {
+  const { alerts, baseline, current, changes, overridesNow, baselineOverrides } = input;
+  const overrides = overrideEntriesSinceBaseline(changes, overridesNow, baselineOverrides);
+
+  return alerts.map((alert) => {
+    const vuln = alert.security_vulnerability;
+    const packageName = alert.dependency.package.name;
+    const range = vuln.vulnerable_version_range;
+    const fix: AlertFix = {
+      number: alert.number,
+      url: alert.html_url,
+      severity: alert.security_advisory.severity,
+      packageName,
+      manifest: alert.dependency.manifest_path,
+      scope: alertScope(alert),
+      status: "still-vulnerable",
+      from: [],
+    };
+    const isVulnerable = (version: string): boolean => satisfiesVulnerableRange(version, range) !== false;
+
+    if (!vuln.first_patched_version) return { ...fix, status: "no-patch" };
+
+    const baselineVersions = baseline.get(packageName) ?? [];
+    const currentVersions = current.get(packageName) ?? [];
+    if (baselineVersions.length === 0 && currentVersions.length === 0) return { ...fix, status: "not-installed" };
+
+    const vulnerableBaseline = baselineVersions.filter(isVulnerable);
+    const vulnerableNow = currentVersions.filter(isVulnerable);
+
+    if (vulnerableBaseline.length === 0) {
+      if (vulnerableNow.length === 0) {
+        return { ...fix, status: baselineVersions.length === 0 ? "not-in-baseline" : "awaiting-close" };
+      }
+      const covered = qualifyingFloor(overrides, packageName, range, vulnerableNow) !== null;
+      return { ...fix, status: covered ? "introduced-covered" : "introduced", from: vulnerableNow };
+    }
+
+    if (vulnerableNow.length === 0) {
+      return {
+        ...fix,
+        status: "update",
+        from: vulnerableBaseline,
+        to: currentVersions.length > 0 ? currentVersions.join(", ") : "removed",
+      };
+    }
+
+    const floor = qualifyingFloor(overrides, packageName, range, vulnerableNow);
+    if (floor !== null) return { ...fix, status: "override", from: vulnerableNow, to: `≥ ${floor}` };
+
+    if (Object.keys(baselineOverrides).some((key) => baseNameOfOverrideKey(key) === packageName)) {
+      return { ...fix, status: "covered", from: vulnerableNow };
+    }
+
+    return { ...fix, from: vulnerableNow };
   });
 }
