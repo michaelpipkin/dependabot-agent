@@ -2178,8 +2178,10 @@ describe("compared with the deployed baseline", () => {
     assert.equal(report.baselineVulnerable, undefined);
     assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind]), [["root", "run-start"]]);
     assert.ok(md.includes("Couldn't read package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead."), md);
-    assert.ok(md.includes("Compared with the last commit ("), md);
-    assert.ok(!md.includes("Compared with the packages installed"), md);
+    // The only group used the start of the run, so that is what the report names.
+    assert.equal(report.baseline?.kind, "run-start");
+    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
+    assert.ok(!md.includes("Compared with the last commit"), md);
     assert.equal(report.outcome, "clean");
   });
 
@@ -2196,25 +2198,26 @@ describe("compared with the deployed baseline", () => {
     assert.ok(md.includes("[!IMPORTANT]"), md);
   });
 
-  it("an unreadable compareTo warns and falls back to the last commit", async () => {
-    const { dir } = gitProject("6.5.0", "6.5.3");
+  it("an unreadable compareTo warns, falls back to the last commit and names it", async () => {
+    const { dir, sha } = gitProject("6.5.0", "6.5.3");
     const { report, md } = await runIn(dir, { compareTo: "release" });
 
     assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind, f.reason]), [["root", "commit", "404"]]);
     assert.deepEqual(report.baselineVulnerable, [1]);
-    assert.ok(md.includes('Compared with `release` on GitHub.'), md);
+    assert.ok(md.includes(`Compared with the last commit (\`${sha.slice(0, 7)}\`).`), md);
+    assert.ok(!md.includes("`release` on GitHub"), md);
     assert.ok(md.includes(`Couldn't read package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
     assert.ok(md.includes("[!IMPORTANT]"), md);
-    assert.equal(report.baseline?.kind, "ref");
+    assert.deepEqual(report.baseline, { kind: "commit", sha, fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }] });
   });
 
   it("compareTo with no token (an alerts file) falls back to the last commit without asking GitHub", async () => {
-    const { dir } = gitProject("6.5.0", "6.5.3");
+    const { dir, sha } = gitProject("6.5.0", "6.5.3");
     const { report, md, urls } = await runIn(dir, { compareTo: "release", token: "" });
 
     assert.deepEqual(urls.filter((u) => u.includes("/contents/")), []);
     assert.ok(md.includes('on "release" from GitHub (no token); compared with the last commit instead.'), md);
-    assert.ok(md.includes("Compared with `release` on GitHub."), md);
+    assert.ok(md.includes(`Compared with the last commit (\`${sha.slice(0, 7)}\`).`), md);
     assert.deepEqual(report.baselineVulnerable, [1]);
   });
 
@@ -2237,7 +2240,7 @@ describe("compared with the deployed baseline", () => {
     assert.ok(!md.includes("Couldn't read package-lock.json"), md);
   });
 
-  it("an unexpected failure reading the baseline is a warning: the run goes on and the box keeps its 1.4.0 rule", async () => {
+  it("an unexpected failure reading the baseline is a warning: the run goes on and the box compares with the start of the run", async () => {
     const { dir } = gitProject("6.5.0", "6.5.3");
     const reportDir = tempDir();
     const cfg = cfgFor(dir, { reportDir });
@@ -2249,7 +2252,7 @@ describe("compared with the deployed baseline", () => {
     assert.equal(report.outcome, "clean");
     assert.equal(report.baseline, undefined);
     assert.equal(report.baselineVulnerable, undefined);
-    assert.deepEqual(report.warnings, ["⚠️  Couldn't read the baseline (boom); the deploy box keeps its 1.4.0 rule."]);
+    assert.deepEqual(report.warnings, ["⚠️  Couldn't read the baseline (boom); the deploy box compares with the packages installed at the start of the run."]);
     const md = reportMd(reportDir);
     assert.ok(md.includes("Couldn't read the baseline (boom)"), md);
     assert.doesNotMatch(md, /Compared with/);

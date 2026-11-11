@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
-import type { BaselineFallback } from "../baseline/source.js";
+import { displayBaseline, type Baseline, type BaselineFallback } from "../baseline/source.js";
 import type { VersionIndex } from "../baseline/versions.js";
 import type { ResolvedConfig } from "../config.js";
 import { discoverIsolatedManifestDirs, hasOwnLockfile } from "../discover.js";
@@ -447,6 +447,7 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
   const bctx = baselineContextFor(cfg);
   const vulnerable: number[] = [];
   const fallbacks: BaselineFallback[] = [];
+  const used: Baseline[] = [];
   const warnings: string[] = [];
   let withAlerts = 0;
   let readable = 0;
@@ -456,6 +457,7 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
     warnings.push(...read.warnings);
     const fallback = fallbackOf(read.baseline, bctx.requested, group.label, read.reason);
     if (fallback) fallbacks.push(fallback);
+    used.push(read.baseline);
     const { indexes } = read;
     if (indexes) {
       readable++;
@@ -465,7 +467,7 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
     }
   }
   return {
-    baseline: { ...bctx.requested, fallbacks },
+    baseline: { ...displayBaseline(bctx.requested, used), fallbacks },
     ...(withAlerts === 0 || readable > 0 ? { baselineVulnerable: [...new Set(vulnerable)].sort((a, b) => a - b) } : {}),
     ...(warnings.length > 0 ? { warnings: boundedWarnings(warnings) } : {}),
   };
@@ -826,8 +828,8 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
   try {
     Object.assign(base, await readBaseline(groups, cfg));
   } catch (e) {
-    // Every expected failure is already a warning inside; this is for the unexpected. The box keeps its 1.4.0 rule.
-    const warning = `⚠️  Couldn't read the baseline (${firstLine(messageOf(e))}); the deploy box keeps its 1.4.0 rule.`;
+    // Every expected failure is already a warning inside; this is for the unexpected. The box compares with the start of the run.
+    const warning = `⚠️  Couldn't read the baseline (${firstLine(messageOf(e))}); the deploy box compares with the packages installed at the start of the run.`;
     log(warning);
     base.warnings = [warning];
   }

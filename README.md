@@ -34,7 +34,7 @@ These are the default `compatible` and `latest` strategies. Targeted mode works 
   [CI integration](#ci-integration-github-actions) below. Targeted mode's
   [reusable workflow](#running-it-in-github-actions) also accepts a GitHub App.
 
-  **If you set [`compareTo`](#comparing-with-whats-deployed), the same token needs one more permission,** because the agent then reads files from the repository: **Contents: Read** for a fine-grained token, or the `repo` scope for a classic token on a private repository. In Actions, the token that reads the alerts is already a personal access token or an App token, since `GITHUB_TOKEN` can't read alerts, and that is the one that needs it. Without `compareTo`, no extra permission is needed.
+  **If you set [`compareTo`](#comparing-with-whats-deployed), the same token needs one more permission,** because the agent then reads files from the repository: **Contents: Read** for a fine-grained token, or the `repo` scope for a classic token on a private repository. In Actions, the token that reads the alerts is already a personal access token or an App token, since `GITHUB_TOKEN` can't read alerts, and that is the one that needs it. Inside the reusable targeted workflow the alerts token never reaches the agent, so it doesn't need Contents: Read there (see [what targeted mode does](#what-the-report-compares-with)). Without `compareTo`, no extra permission is needed.
 
 ## Install & invoke
 
@@ -167,7 +167,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 
 | Flag | Env fallback | Default | Description |
 |---|---|---|---|
-| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT that can read Dependabot alerts (classic: `security_events` scope; fine-grained: **Dependabot alerts** read — see [Requirements](#requirements)). **Required**, unless `--alerts-file` supplies the alerts. Never read from a config file. |
+| `--token <t>` | `GITHUB_TOKEN` | — | GitHub PAT that can read Dependabot alerts (classic: `security_events` scope; fine-grained: **Dependabot alerts** read — see [Requirements](#requirements)). **Required**, unless `--alerts-file` supplies the alerts. With [`compareTo`](#comparing-with-whats-deployed) it also needs to read the repository's contents: **Contents: Read** (fine-grained) or `repo` (classic, private repository). Never read from a config file. |
 | `--repo <owner/repo>` | `GITHUB_REPO` | — | Target repository. **Required.** |
 | `--package-manager <pnpm\|npm>` | `PACKAGE_MANAGER` | auto-detect | Override lockfile-based detection. |
 | `--workspace-root <path>` | `WORKSPACE_ROOT` | cwd | Project root. |
@@ -482,7 +482,7 @@ Run locally, the agent holds whatever token you give it, and talks to `api.githu
 
 - It runs no project code. Every npm command it runs has `--package-lock-only --ignore-scripts`, and it needs no `node_modules`.
 - It only writes `package.json` and `package-lock.json` files, and the report. If a check fails, it restores them.
-- It reads your git history through `git rev-parse` and `git show`, to read the lockfile as last committed. It never runs `git fetch`, and never writes to git.
+- It reads your git history through `git rev-parse` and `git show`, to read the lockfile and the override file as last committed. It never runs `git fetch`, and never writes to git.
 - It has two runtime dependencies, `js-yaml` and `semver`. Releases are published from GitHub Actions with npm provenance, which `npm audit signatures` can check.
 
 #### What leaves the machine
@@ -634,7 +634,7 @@ If a failure can't be tied to a package, or the retries run out, **every file in
 
 `--report <dir>` writes a report under any strategy. For `compatible` and `latest` it holds:
 
-- `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, except in a dry run, packages changed), then a line saying what the run was compared with, then the deploy recommendation, then a `Packages` table with a row for each alert fixed: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts that weren't fixed are on one "Not addressed" line, each with its reason (listed below); it shows at most 20, then a count of the rest. It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
+- `report.md`: the text for a pull request. It opens with a summary line (alerts addressed, overrides added or updated and removed, and, except in a dry run, packages changed), then a `Strategy ... on ...` line, then a line saying what the run was compared with, then the deploy recommendation, then a `Packages` table with a row for each alert fixed: its severity, the package, the version change, whether it was updated or overridden, its scope, and the manifest GitHub raised it on. Alerts that weren't fixed are on one "Not addressed" line, each with its reason (listed below); it shows at most 20, then a count of the rest. It is cut to fit GitHub's size limit, with a note saying so; in that case `report-full.md` also exists with the complete text.
 - `report.json`: the same data, plus `baseline` (what the run was compared with, and any manifest that couldn't use it) and an `outcome`: `changes` when this run added, updated or removed an override or changed the working copy's lockfile, otherwise `clean`. `outcome` describes the run, not how far the working copy is from the baseline, so a workflow that opens a pull request on `changes` doesn't open empty ones because your branch differs from `release`.
 
 Targeted mode's report keeps its own sections, listed below, with the summary line, the "Compared with" line and the deploy recommendation added at the top.
@@ -646,8 +646,8 @@ The deploy recommendation answers one question: **do you need to deploy?** To an
 | Line under the summary | Baseline | When |
 |---|---|---|
 | Compared with the last commit (`c2b8101`). | The lockfile as committed at `HEAD`, read with `git show`. | The default, when the repository has a commit that contains the lockfile. |
-| Compared with `release` on GitHub. | The lockfile on the branch, tag or commit you set as [`compareTo`](#comparing-with-whats-deployed), read from GitHub through the API. | `compareTo` is set. If it can't be read, a warning right below this line says what was used instead. |
-| Compared with the packages installed at the start of the run. | The installed packages before the run. | Neither of the above could be read. |
+| Compared with `release` on GitHub. | The lockfile on the branch, tag or commit you set as [`compareTo`](#comparing-with-whats-deployed), read from GitHub through the API. | `compareTo` is set and could be read. |
+| Compared with the packages installed at the start of the run. | The installed packages before the run. | Neither of the above could be read, so the report names this and says why in a warning. |
 
 An alert counts as fixed, and so can make the report say to deploy, **only when what's deployed has the vulnerable version.** That means one of these:
 
@@ -664,9 +664,9 @@ The summary line counts `packages changed since the last commit` (or since `rele
 
 **When the baseline can't be read.** Reading a baseline never fails a run and never changes which overrides are written; it only changes what the report says.
 
-- If `compareTo` can't be read (no token, an unknown branch, missing permission, no lockfile on that ref, no network), the agent prints a warning and repeats it under the "Compared with" line, then compares with the last commit instead, for example `Couldn't read pnpm-lock.yaml on "release" from GitHub (404); compared with the last commit instead.` The "Compared with" line still names the ref you asked for, so read the warning beneath it: it says what the numbers were compared with.
-- If there's no usable last commit either (not a git repository, git isn't installed, or the lockfile isn't committed yet), or the working copy's lockfile can't be read, it compares with the packages installed at the start of the run, and says so. This is the rule earlier releases used for everything: an alert counts as fixed only if this run changed what's installed, a package already patched at the start is awaiting close, and the packages count is what the update pass moved.
-- A manifest group with its own lockfile, such as `functions/`, reads its own lockfile at the baseline. If one can't use the baseline the others use, that group alone falls back, with a warning that names it, and `report.json` lists it under `baseline.fallbacks`.
+- If `compareTo` can't be read (no token, an unknown branch, missing permission, no lockfile on that ref, no network), the agent prints a warning and repeats it under the "Compared with" line, then compares with the last commit instead, for example `Couldn't read pnpm-lock.yaml on "release" from GitHub (404); compared with the last commit instead.` The "Compared with" line names what was actually used, here the last commit, with the warning beneath it saying why `release` wasn't.
+- If there's no usable last commit either (not a git repository, git isn't installed, or the lockfile isn't committed yet), or the baseline's lockfile can't be parsed, or the working copy's lockfile can't be read, it compares with the packages installed at the start of the run, and says so. A baseline lockfile that can't be parsed goes straight to this, without trying the last commit. This is the rule earlier releases used for everything: an alert counts as fixed only if this run changed what's installed, a package already patched at the start is awaiting close, and the packages count is what the update pass moved.
+- A manifest group with its own lockfile, such as `functions/`, reads its own lockfile at the baseline. If one can't use the baseline the others use, that group alone falls back, with a warning that names it, and `report.json` lists it under `baseline.fallbacks`. When the groups ended up on different baselines, the "Compared with" line names the one you asked for, and the warnings say which group used what. When they all ended up on the same one, the line names that one, even if it isn't the one you asked for; `report.json`'s `baseline` does the same.
 
 **The deploy recommendation** is built from the alerts counted as fixed. A package fixed in more than one manifest, such as the root and a `functions/` folder, is one entry naming both places. It is one of four boxes:
 
@@ -891,6 +891,8 @@ The agent prints the right command for your package manager after it writes the 
 >     permission-vulnerability-alerts: read
 > ```
 > Then pass `${{ steps.app.outputs.token }}` to the agent as `GITHUB_TOKEN`.
+>
+> If you set `compareTo`, that credential also needs to read the repository's contents: **Contents: Read** for a fine-grained token or an App (`permission-contents: read` on the step above), or `repo` for a classic token on a private repository.
 
 ### Minimal example (manual trigger, commits directly)
 

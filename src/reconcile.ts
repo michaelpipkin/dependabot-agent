@@ -1,6 +1,6 @@
 import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
-import { Baseline, BaselineFallback, gitRepoInfo, readBaselineFiles } from "./baseline/source.js";
+import { Baseline, BaselineFallback, displayBaseline, gitRepoInfo, readBaselineFiles } from "./baseline/source.js";
 import { countChangedVersions, lockfileName, lockfileVersions, VersionIndex } from "./baseline/versions.js";
 import { ResolvedConfig } from "./config.js";
 import { discoverIsolatedManifestDirs } from "./discover.js";
@@ -1518,6 +1518,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   const allDeployInputs: DeployInput[] = [];
   const allRemovedKeys = new Set<string>();
   const fallbacks: BaselineFallback[] = [];
+  const usedBaselines: Baseline[] = [];
   const allWarnings: string[] = [];
   let totalAwaitingClose = 0;
   // Whether this run changed what's on disk: a lockfile, or against the start of
@@ -1557,6 +1558,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
     allDeployInputs.push(...result.deployInputs);
     for (const key of result.removedOverrideKeys) allRemovedKeys.add(key);
     if (result.fallback) fallbacks.push(result.fallback);
+    usedBaselines.push(result.baseline);
     allWarnings.push(...result.warnings);
     totalAwaitingClose += result.awaitingClose;
     if (result.lockfileChanged || (result.baseline.kind === "run-start" && result.packagesUpdated > 0)) {
@@ -1584,7 +1586,9 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   const deploy = recommendDeploy(allDeployInputs, removedKeys, { openAlerts });
   // With a count of open alerts the block always prints, if only to say there were none.
   log(`\n${"═".repeat(48)}`);
-  logDeployRecommendation(deploy, { baseline: bctx.requested, openAlerts, awaitingClose: totalAwaitingClose });
+  // What the reader is told it was compared with: what every group used when they agree, else what was asked for.
+  const shownBaseline = displayBaseline(bctx.requested, usedBaselines);
+  logDeployRecommendation(deploy, { baseline: shownBaseline, openAlerts, awaitingClose: totalAwaitingClose });
 
   if (cfg.reportDir) {
     const report = assembleStrategyReport({
@@ -1597,7 +1601,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
       overridesRemoved: totalRemoved,
       removedOverrideKeys: removedKeys,
       packagesUpdated: totalPackagesUpdated,
-      baseline: { ...bctx.requested, fallbacks },
+      baseline: { ...shownBaseline, fallbacks },
       warnings: boundedWarnings(allWarnings),
       openAlerts,
       changedThisRun: totalAdded + totalRemoved > 0 || anyInstallChanged,

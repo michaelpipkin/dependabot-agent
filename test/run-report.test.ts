@@ -289,8 +289,8 @@ describe("run — compared with the deployed baseline", () => {
     assert.deepEqual(r.contentUrls, [], "no compareTo, no GitHub read");
   });
 
-  it("falls back to the last commit when compareTo can't be read, and says so", async () => {
-    const { dir } = gitProject();
+  it("falls back to the last commit when compareTo can't be read, and names the last commit", async () => {
+    const { dir, sha } = gitProject();
     const plain = await baselineRun(dir);
     mock.restoreAll();
     const r = await baselineRun(dir, { compareTo: "release" });
@@ -298,10 +298,14 @@ describe("run — compared with the deployed baseline", () => {
     const warning = `⚠️  Couldn't read package-lock.json on "release" from GitHub (404); compared with the last commit instead.`;
     assert.ok(r.console.includes(warning), "the console warns");
     assert.ok(r.body.includes(warning), "the report warns");
-    assert.ok(r.body.includes("Compared with `release` on GitHub."), "the report names the baseline asked for");
+    // The one group used the last commit, so that is what the report and the console say, not `release`.
+    const compared = `Compared with the last commit (\`${sha.slice(0, 7)}\`).`;
+    assert.ok(r.body.includes(compared), "the report names the baseline used");
+    assert.ok(!r.body.includes("`release` on GitHub"), "and not the one asked for");
+    assert.ok(r.console.includes(compared), "the console names it too");
     assert.deepEqual(r.report.baseline, {
-      kind: "ref",
-      ref: "release",
+      kind: "commit",
+      sha,
       fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }],
     });
     assert.match(r.body, UPDATE_ROW, "compared with the last commit");
@@ -332,6 +336,9 @@ describe("run — compared with the deployed baseline", () => {
       contents: { "package-lock.json": rootLock("7.5.1") },
     });
 
+    // The groups used different baselines, so the report names the one asked for; the warning says the rest.
+    assert.ok(r.body.includes("Compared with `release` on GitHub."));
+    assert.equal(r.report.baseline.kind, "ref");
     assert.deepEqual(r.report.baseline.fallbacks, [{ manifest: "functions", kind: "commit", reason: "404" }]);
     const warning = `⚠️  Couldn't read functions/package-lock.json on "release" from GitHub (404); compared with the last commit instead.`;
     assert.ok(r.body.includes(warning));
@@ -344,7 +351,9 @@ describe("run — compared with the deployed baseline", () => {
     rmSync(join(dir, "package-lock.json"));
     const r = await baselineRun(dir);
 
-    assert.equal(r.report.baseline.kind, "commit");
+    // The only group used the start of the run, so that is what the report names.
+    assert.equal(r.report.baseline.kind, "run-start");
+    assert.ok(r.body.includes("Compared with the packages installed at the start of the run."));
     assert.deepEqual(r.report.baseline.fallbacks, [{ manifest: "root", kind: "run-start", reason: "not found" }]);
     assert.deepEqual(r.report.warnings, [
       "⚠️  Couldn't read the working copy's package-lock.json (not found); compared with the packages installed at the start of the run instead.",

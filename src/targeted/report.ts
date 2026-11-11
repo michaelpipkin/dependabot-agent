@@ -30,7 +30,7 @@ export interface RunReport {
   advisoriesUnchecked?: string;
   /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
   restoreError?: string;
-  /** What the deploy box compares with: the baseline asked for, and the lockfiles that couldn't use it. Unset when it was never read. */
+  /** What the deploy box compares with: the baseline every lockfile used when they agree, else the one asked for, and the lockfiles that couldn't use the one asked for. Unset when it was never read. */
   baseline?: ReportBaseline;
   /**
    * The alerts (by number) whose package had a vulnerable copy in the baseline's lockfile. Unset when
@@ -346,7 +346,7 @@ function headerBlock(report: RunReport): string {
   if (report.outcome !== "failed" || report.alerts.length > 0) {
     const planned = report.outcome === "failed" || report.dryRun;
     lines.push(renderSummaryLine(targetedSummary(report), planned), "");
-    // The baseline asked for, as in the other strategies; the warnings and `baseline.fallbacks` say where one couldn't be used.
+    // The baseline the lockfiles used (the one asked for when they differ), as in the other strategies; the warnings and `baseline.fallbacks` say where one couldn't be used.
     const baseline = report.baseline;
     const warnings = report.warnings ?? [];
     if (baseline) lines.push(comparedWithLine(baseline));

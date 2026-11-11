@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
   baselinePhrase,
   comparedWithLine,
+  displayBaseline,
   gitRepoInfo,
   gitShowFile,
   readBaselineFiles,
@@ -278,5 +279,27 @@ describe("parseOverridesText", () => {
     assert.deepEqual(parseOverridesText("pnpm-workspace.yaml", "pnpm", "a: [unclosed"), {});
     assert.deepEqual(parseOverridesText("package.json", "npm", "{}"), {});
     assert.deepEqual(parseOverridesText("pnpm-workspace.yaml", "pnpm", ""), {});
+  });
+});
+
+describe("displayBaseline", () => {
+  const requested = { kind: "ref", ref: "release" } as const;
+  const commit = { kind: "commit", sha: "c".repeat(40) } as const;
+
+  it("names what the groups used when they all used the same baseline", () => {
+    assert.deepEqual(displayBaseline(requested, [commit]), commit);
+    assert.deepEqual(displayBaseline(requested, [commit, { ...commit }]), commit);
+    assert.deepEqual(displayBaseline(requested, [{ kind: "run-start" }]), { kind: "run-start" });
+    assert.deepEqual(displayBaseline(requested, [requested, { kind: "ref", ref: "release" }]), requested);
+  });
+
+  it("names the one asked for when the groups used different baselines", () => {
+    assert.deepEqual(displayBaseline(requested, [requested, commit]), requested);
+    assert.deepEqual(displayBaseline(requested, [commit, { kind: "run-start" }]), requested);
+    assert.deepEqual(displayBaseline(requested, [commit, { kind: "commit", sha: "d".repeat(40) }]), requested);
+  });
+
+  it("names the one asked for when no group was read", () => {
+    assert.deepEqual(displayBaseline(requested, []), requested);
   });
 });

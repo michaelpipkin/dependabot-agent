@@ -14,6 +14,20 @@ export interface BaselineFallback {
 /** What report.json carries. */
 export type ReportBaseline = Baseline & { fallbacks: BaselineFallback[] };
 
+const sameBaseline = (a: Baseline, b: Baseline): boolean =>
+  a.kind === b.kind &&
+  (a.kind !== "ref" || (b.kind === "ref" && a.ref === b.ref)) &&
+  (a.kind !== "commit" || (b.kind === "commit" && a.sha === b.sha));
+
+/**
+ * The baseline a report names: the one every manifest group actually used when they all used
+ * the same, so a fallback is never hidden behind the name of the baseline that was asked for.
+ * Groups that used different ones name the baseline asked for; their warnings say the rest.
+ */
+export function displayBaseline(requested: Baseline, used: Baseline[]): Baseline {
+  return used.length > 0 && used.every((b) => sameBaseline(b, used[0])) ? used[0] : requested;
+}
+
 /** A ref as a code span's text: backticks can't appear inside one, and a ref is user input. */
 const refText = (ref: string): string => ref.replace(/`/g, "'").replace(/\s+/g, " ");
 
