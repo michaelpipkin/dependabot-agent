@@ -215,3 +215,38 @@ function buildPnpmPackageJsonSource(filePath: string): OverrideSource {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Reading overrides from text (a file at a baseline), without touching disk
+// ---------------------------------------------------------------------------
+
+function stringEntries(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return out;
+  for (const [key, v] of Object.entries(value)) {
+    if (typeof v === "string") out[key] = v;
+  }
+  return out;
+}
+
+/**
+ * The flat override map `fileBase` ("package.json" or "pnpm-workspace.yaml") holds in `text`,
+ * as the same file would yield through selectOverrideSource: `overrides` for npm,
+ * `pnpm.overrides` for pnpm; a pnpm-workspace.yaml's top-level `overrides`, else its
+ * `pnpm.overrides`. Nested (object) values are left out. `{}` when the text doesn't parse.
+ */
+export function parseOverridesText(fileBase: string, pm: PackageManagerId, text: string): Record<string, string> {
+  try {
+    if (fileBase === "pnpm-workspace.yaml") {
+      const doc = (yaml.load(text) ?? {}) as Record<string, unknown>;
+      const pnpm = doc.pnpm as Record<string, unknown> | null | undefined;
+      const nested = typeof pnpm === "object" && pnpm !== null && "overrides" in pnpm;
+      return stringEntries("overrides" in doc || !nested ? doc.overrides : pnpm?.overrides);
+    }
+    const raw = JSON.parse(text) as Record<string, unknown>;
+    if (pm === "npm") return stringEntries(raw.overrides);
+    return stringEntries((raw.pnpm as Record<string, unknown> | undefined)?.overrides);
+  } catch {
+    return {};
+  }
+}

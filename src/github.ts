@@ -100,3 +100,33 @@ export async function fetchDependabotAlerts(repo: GitHubRepoConfig): Promise<Dep
   log(`   Found ${openCount} open npm Dependabot alert(s) (${alerts.length} across all states).`);
   return alerts;
 }
+
+// ---------------------------------------------------------------------------
+// Read one file from the repository at a ref
+// ---------------------------------------------------------------------------
+
+/**
+ * The raw text of `repoPath` at `ref`, through the contents API. Never throws or exits: the
+ * caller decides what an unreadable file means, so `reason` is the HTTP status or the error.
+ */
+export async function fetchRepoFile(
+  repo: GitHubRepoConfig,
+  ref: string,
+  repoPath: string,
+): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+  const encodedPath = repoPath.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`;
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${repo.token}`,
+        Accept: "application/vnd.github.raw",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (!response.ok) return { ok: false, reason: String(response.status) };
+    return { ok: true, text: await response.text() };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
