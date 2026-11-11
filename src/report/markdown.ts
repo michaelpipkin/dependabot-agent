@@ -54,6 +54,8 @@ export interface SummaryCounts {
   overridesAddedOrUpdated: number;
   overridesRemoved: number;
   packagesUpdated: number;
+  /** Set to a baselinePhrase when packagesUpdated counts every package changed since that baseline. */
+  packagesSince?: string;
   rangeBumps?: number;
   /** True when "packages updated" counts only what the update pass moved, not the override changes. */
   updatePassOnly: boolean;
@@ -73,8 +75,12 @@ export function renderSummaryLine(c: SummaryCounts, planned: boolean): string {
   if (c.rangeBumps !== undefined) parts.push(`**${c.rangeBumps}** ${plural(c.rangeBumps, "range bump", "range bumps")}`);
   parts.push(`**${c.overridesRemoved}** removed`);
   if (!planned) {
-    const packages = `**${c.packagesUpdated}** ${plural(c.packagesUpdated, "package", "packages")} updated`;
-    parts.push(c.updatePassOnly ? `${packages} by the update pass` : packages);
+    if (c.packagesSince !== undefined) {
+      parts.push(`**${c.packagesUpdated}** ${plural(c.packagesUpdated, "package", "packages")} changed since ${c.packagesSince}`);
+    } else {
+      const packages = `**${c.packagesUpdated}** ${plural(c.packagesUpdated, "package", "packages")} updated`;
+      parts.push(c.updatePassOnly ? `${packages} by the update pass` : packages);
+    }
   }
   return (planned ? "Planned: " : "") + parts.join(" · ");
 }

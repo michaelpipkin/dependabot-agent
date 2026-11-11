@@ -1321,6 +1321,11 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
       overridesRemoved: totalRemoved,
       removedOverrideKeys: removedKeys,
       packagesUpdated: totalPackagesUpdated,
+      // Until the run reads a baseline, the report compares with the start of the run, as 1.4.0 did.
+      baseline: { kind: "run-start", fallbacks: [] },
+      warnings: [],
+      openAlerts: allFixes.length,
+      changedThisRun: totalAdded > 0 || totalRemoved > 0 || totalPackagesUpdated > 0,
     });
     try {
       writeStrategyReport(cfg.reportDir, report);

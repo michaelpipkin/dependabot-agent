@@ -32,8 +32,8 @@ const impact = (over: Partial<DeploymentRecommendation> = {}) => (packageName: s
   ...over,
 });
 
-const build = (fixes: AlertFix[], over: Partial<Parameters<typeof assembleStrategyReport>[0]> = {}): StrategyReport =>
-  assembleStrategyReport({
+const build = (fixes: AlertFix[], over: Partial<Parameters<typeof assembleStrategyReport>[0]> = {}): StrategyReport => {
+  const input: Parameters<typeof assembleStrategyReport>[0] = {
     strategy: "latest",
     packageManager: "pnpm",
     dryRun: false,
@@ -43,8 +43,16 @@ const build = (fixes: AlertFix[], over: Partial<Parameters<typeof assembleStrate
     overridesRemoved: 0,
     removedOverrideKeys: [],
     packagesUpdated: 1,
+    baseline: { kind: "run-start", fallbacks: [] },
+    warnings: [],
+    openAlerts: fixes.length,
+    changedThisRun: false,
     ...over,
-  });
+  };
+  // As 1.4.0 decided its outcome, unless a test says what the run changed.
+  const changed = input.overridesAddedOrUpdated > 0 || input.overridesRemoved > 0 || input.packagesUpdated > 0;
+  return assembleStrategyReport({ ...input, changedThisRun: over.changedThisRun ?? changed });
+};
 
 // 40 distinct packages: the deploy section is never cut, so it must stay small for the table to be what overflows.
 const manyFixes = (n: number): AlertFix[] =>
@@ -308,6 +316,79 @@ describe("writeStrategyReport", () => {
       writeStrategyReport(dir, build(manyFixes(2000)));
       assert.ok(readFileSync(join(dir, "report.md"), "utf8").length <= MAX_BODY_CHARS);
       assert.equal(rowCount(readFileSync(join(dir, "report-full.md"), "utf8")), 2000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a report with a baseline", () => {
+  const release: StrategyReport["baseline"] = { kind: "ref", ref: "release", fallbacks: [] };
+  const notAddressedOf = (body: string): string => body.split("\n").find((l) => l.startsWith("**Not addressed:**")) ?? "";
+
+  it("names the baseline under the strategy line and puts warnings in italics under it", () => {
+    const warning = '⚠️  Couldn\'t read functions/pnpm-lock.yaml on "release" from GitHub (404); compared with the last commit instead.';
+    const body = renderStrategyReport(build([fix({ number: 1, packageName: "a", status: "update" })], { baseline: release, warnings: [warning] }));
+    const lines = body.split("\n");
+    const at = lines.indexOf("Strategy `latest` on pnpm.");
+    assert.ok(at > 0);
+    assert.equal(lines[at + 2], "Compared with `release` on GitHub.");
+    assert.equal(lines[at + 4], `_${warning}_`);
+  });
+
+  it("names the last commit, and the start of the run", () => {
+    const commit: StrategyReport["baseline"] = { kind: "commit", sha: "c2b8101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fallbacks: [] };
+    assert.match(renderStrategyReport(build([], { baseline: commit })), /Compared with the last commit \(`c2b8101`\)\./);
+    assert.match(renderStrategyReport(build([])), /Compared with the packages installed at the start of the run\./);
+  });
+
+  it("ends the summary with the packages changed since the baseline, except against the start of the run", () => {
+    const withRef = build([fix({ number: 1, packageName: "a", status: "update" })], { baseline: release, packagesUpdated: 23 });
+    assert.equal(withRef.summary.packagesSince, "`release`");
+    assert.match(renderStrategyReport(withRef), /· \*\*23\*\* packages changed since `release`\n/);
+    const runStart = build([fix({ number: 1, packageName: "a", status: "update" })], { packagesUpdated: 23 });
+    assert.equal("packagesSince" in runStart.summary, false);
+    assert.match(renderStrategyReport(runStart), /· \*\*23\*\* packages updated by the update pass\n/);
+  });
+
+  it("gives the new statuses their reasons with the baseline named", () => {
+    const fixes = [
+      fix({ number: 1, packageName: "a", status: "introduced-covered", from: [], to: undefined }),
+      fix({ number: 2, packageName: "b", status: "introduced", from: [], to: undefined }),
+      fix({ number: 3, packageName: "c", status: "not-in-baseline", from: [], to: undefined }),
+    ];
+    const line = notAddressedOf(renderStrategyReport(build(fixes, { baseline: release, changedThisRun: false })));
+    assert.match(line, /not vulnerable in `release`; an override covers it/);
+    assert.match(line, /not vulnerable in `release`; still vulnerable here/);
+    assert.match(line, /not in `release`/);
+    const commitLine = notAddressedOf(renderStrategyReport(build(fixes, { baseline: { kind: "commit", sha: "abcdef0123", fallbacks: [] } })));
+    assert.match(commitLine, /not vulnerable in the last commit; an override covers it/);
+    const startLine = notAddressedOf(renderStrategyReport(build(fixes)));
+    assert.match(startLine, /not in the packages installed at the start of the run/);
+  });
+
+  it("shows the nothing-fixed box when open alerts are all awaiting close", () => {
+    const fixes = [fix({ number: 1, packageName: "a", status: "awaiting-close", from: [], to: undefined })];
+    const r = build(fixes, { baseline: release, changedThisRun: false, packagesUpdated: 0 });
+    assert.equal(r.deploy.nothingFixed, true);
+    assert.match(renderStrategyReport(r), /> ✅ \*\*No deploy needed:\*\* no package was fixed for an alert compared with `release`/);
+  });
+
+  it("is clean when the run changed nothing, however many packages differ from the baseline", () => {
+    const r = build([fix({ number: 1, packageName: "a", status: "update" })], { baseline: release, packagesUpdated: 40, changedThisRun: false });
+    assert.equal(r.outcome, "clean");
+    assert.equal(build([], { changedThisRun: true, packagesUpdated: 0 }).outcome, "changes");
+  });
+
+  it("writes the baseline, its fallbacks and the warnings to report.json", () => {
+    const dir = mkdtempSync(join(tmpdir(), "strategy-report-"));
+    try {
+      const fallbacks = [{ manifest: "functions/pnpm-lock.yaml", kind: "commit" as const, reason: "404" }];
+      writeStrategyReport(dir, build([], { baseline: { ...release, fallbacks }, warnings: ["w"] }));
+      const json = JSON.parse(readFileSync(join(dir, "report.json"), "utf8")) as StrategyReport;
+      assert.equal(json.baseline.kind, "ref");
+      assert.deepEqual(json.baseline.fallbacks, fallbacks);
+      assert.deepEqual(json.warnings, ["w"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

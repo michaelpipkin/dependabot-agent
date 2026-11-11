@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { baselinePhrase, comparedWithLine, type Baseline, type ReportBaseline } from "../baseline/source.js";
 import type { DepScope, DeploymentRecommendation, PackageManagerId } from "../types.js";
 import { isFixed, type AlertFix, type FixStatus } from "./alert-fixes.js";
 import { recommendDeploy, renderDeploySection, type DeployInput, type DeployRecommendation } from "./deploy.js";
@@ -9,7 +10,12 @@ export interface StrategyReport {
   strategy: "compatible" | "latest";
   packageManager: PackageManagerId;
   dryRun: boolean;
+  /** "changes" when this run changed something; "clean" when it didn't, whatever it is compared with. */
   outcome: "changes" | "clean";
+  /** What the working copy was compared with, and any manifest that fell back to something weaker. */
+  baseline: ReportBaseline;
+  /** Why the baseline isn't what was asked for, and anything else worth saying under the Compared line. */
+  warnings: string[];
   summary: SummaryCounts;
   deploy: DeployRecommendation;
   /** The alerts this run fixed. */
@@ -43,24 +49,33 @@ export function assembleStrategyReport(input: {
   overridesRemoved: number;
   removedOverrideKeys: string[];
   packagesUpdated: number;
+  baseline: ReportBaseline;
+  warnings: string[];
+  /** Open alerts in scope, the ones the deploy recommendation has to account for. */
+  openAlerts: number;
+  /** Whether this run changed overrides or installed anything; not how far the working copy is from the baseline. */
+  changedThisRun: boolean;
 }): StrategyReport {
   const { fixes } = input;
   const fixed = fixes.filter(isFixed);
-  const changed = input.overridesAddedOrUpdated > 0 || input.overridesRemoved > 0 || input.packagesUpdated > 0;
   return {
     strategy: input.strategy,
     packageManager: input.packageManager,
     dryRun: input.dryRun,
-    outcome: changed ? "changes" : "clean",
+    outcome: input.changedThisRun ? "changes" : "clean",
+    baseline: input.baseline,
+    warnings: input.warnings,
     summary: {
       addressed: fixed.length,
       open: fixes.length,
       overridesAddedOrUpdated: input.overridesAddedOrUpdated,
       overridesRemoved: input.overridesRemoved,
       packagesUpdated: input.packagesUpdated,
+      // Against the start of the run the count is the update pass's, as in 1.4.0.
+      ...(input.baseline.kind === "run-start" ? {} : { packagesSince: baselinePhrase(input.baseline) }),
       updatePassOnly: true,
     },
-    deploy: recommendDeploy(input.deployInputs, input.removedOverrideKeys),
+    deploy: recommendDeploy(input.deployInputs, input.removedOverrideKeys, { openAlerts: input.openAlerts }),
     fixes: fixed,
     notAddressed: fixes.filter((f) => !isFixed(f)),
   };
@@ -68,18 +83,18 @@ export function assembleStrategyReport(input: {
 
 const MAX_NOT_ADDRESSED = 20;
 
-const REASON: Record<FixStatus, string> = {
-  update: "updated",
-  override: "overridden",
-  "awaiting-close": "already patched, awaiting close",
-  covered: "an existing override is meant to cover it",
-  "no-patch": "no patched version",
-  "not-installed": "not installed",
-  // Placeholders until the report names the baseline in these reasons (a later task).
-  "introduced-covered": "not vulnerable in the baseline; an override covers it",
-  introduced: "not vulnerable in the baseline; still vulnerable here",
-  "not-in-baseline": "not in the baseline",
-  "still-vulnerable": "still vulnerable after this run",
+/** Why an alert wasn't addressed; some reasons name the baseline, `phrase` being its baselinePhrase. */
+const REASON: Record<FixStatus, (phrase: string) => string> = {
+  update: () => "updated",
+  override: () => "overridden",
+  "awaiting-close": () => "already patched, awaiting close",
+  covered: () => "an existing override is meant to cover it",
+  "no-patch": () => "no patched version",
+  "not-installed": () => "not installed",
+  "introduced-covered": (phrase) => `not vulnerable in ${phrase}; an override covers it`,
+  introduced: (phrase) => `not vulnerable in ${phrase}; still vulnerable here`,
+  "not-in-baseline": (phrase) => `not in ${phrase}`,
+  "still-vulnerable": () => "still vulnerable after this run",
 };
 
 const SCOPE_ORDER: Record<DepScope, number> = { production: 0, dev: 1, unknown: 2 };
@@ -117,11 +132,12 @@ function sortedFixes(fixes: AlertFix[]): AlertFix[] {
 }
 
 /** By alert number, so the cut keeps the oldest alerts. */
-function notAddressedLine(fixes: AlertFix[]): string {
+function notAddressedLine(fixes: AlertFix[], baseline: Baseline): string {
+  const phrase = baselinePhrase(baseline);
   const entries = [...fixes]
     .sort((a, b) => a.number - b.number)
     .slice(0, MAX_NOT_ADDRESSED)
-    .map((f) => inline(`${alertLink(f)} ${code(f.packageName)}: ${REASON[f.status]}`));
+    .map((f) => inline(`${alertLink(f)} ${code(f.packageName)}: ${REASON[f.status](phrase)}`));
   const more = fixes.length - MAX_NOT_ADDRESSED;
   if (more > 0) entries.push(`and ${more} more`);
   return `**Not addressed:** ${entries.join("; ")}`;
@@ -134,11 +150,18 @@ const CUT_NOTE =
 export function renderStrategyReport(report: StrategyReport, options: { full?: boolean } = {}): string {
   const top = [report.dryRun ? "# Dependency overrides reconciled — plan" : "# Dependency overrides reconciled", ""];
   if (report.dryRun) top.push("> **Dry run.** This is the plan of what the tool would do. Nothing was changed.", "");
-  top.push(renderSummaryLine(report.summary, report.dryRun), "", `Strategy \`${report.strategy}\` on ${report.packageManager}.`);
-  const deploy = renderDeploySection(report.deploy);
+  top.push(
+    renderSummaryLine(report.summary, report.dryRun),
+    "",
+    `Strategy \`${report.strategy}\` on ${report.packageManager}.`,
+    "",
+    comparedWithLine(report.baseline),
+  );
+  for (const warning of report.warnings) top.push("", `_${inline(warning)}_`);
+  const deploy = renderDeploySection(report.deploy, report.baseline);
   const head = [top.join("\n"), ...(deploy ? [deploy] : [])];
 
-  const tail = report.notAddressed.length > 0 ? [notAddressedLine(report.notAddressed)] : [];
+  const tail = report.notAddressed.length > 0 ? [notAddressedLine(report.notAddressed, report.baseline)] : [];
   const join = (parts: string[]): string => parts.join("\n\n") + "\n";
 
   if (report.fixes.length === 0) return join([...head, "No alerts were fixed in this run.", ...tail]);

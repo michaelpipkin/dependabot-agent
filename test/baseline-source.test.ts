@@ -232,6 +232,11 @@ describe("baseline wording", () => {
     assert.equal(baselinePhrase({ kind: "run-start" }), "the packages installed at the start of the run");
   });
 
+  it("keeps a ref inside its code span", () => {
+    assert.equal(baselinePhrase({ kind: "ref", ref: "a`b\nc" }), "`a'b c`");
+    assert.equal(comparedWithLine({ kind: "ref", ref: "a`b" }), "Compared with `a'b` on GitHub.");
+  });
+
   it("comparedWithLine", () => {
     assert.equal(
       comparedWithLine({ kind: "commit", sha: "abcdef0123456" }),

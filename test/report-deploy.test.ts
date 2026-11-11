@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it, mock } from "node:test";
+import type { Baseline } from "../src/baseline/source.js";
 import {
   logDeployRecommendation,
   MAX_DEPLOY_ENTRIES,
@@ -285,5 +286,102 @@ describe("logDeployRecommendation", () => {
 
   it("prints nothing for none", () => {
     assert.deepEqual(capture(recommendDeploy([], [])), []);
+  });
+});
+
+const commit: Baseline = { kind: "commit", sha: "c2b8101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+
+describe("recommendDeploy with open alerts", () => {
+  it("says nothing was fixed when there are open alerts and nothing changed", () => {
+    const rec = recommendDeploy([], [], { openAlerts: 16 });
+    assert.equal(rec.outcome, "no-deploy");
+    assert.equal(rec.nothingFixed, true);
+    assert.deepEqual([rec.production, rec.development, rec.unknown, rec.removedOverrides], [[], [], [], []]);
+  });
+
+  it("stays none with no open alerts, and without a context", () => {
+    assert.equal(recommendDeploy([], [], { openAlerts: 0 }).outcome, "none");
+    assert.equal(recommendDeploy([], [], { openAlerts: 0 }).nothingFixed, false);
+    assert.equal(recommendDeploy([], []).nothingFixed, false);
+  });
+
+  it("keeps the removed-overrides check, and a real recommendation, when there are open alerts", () => {
+    const check = recommendDeploy([], ["minimist"], { openAlerts: 3 });
+    assert.equal(check.outcome, "check");
+    assert.equal(check.nothingFixed, false);
+    const dev = recommendDeploy([inputs[3]], [], { openAlerts: 3 });
+    assert.equal(dev.outcome, "no-deploy");
+    assert.equal(dev.nothingFixed, false);
+  });
+});
+
+describe("renderDeploySection for nothing fixed", () => {
+  const rec = recommendDeploy([], [], { openAlerts: 16 });
+
+  it("renders the TIP box naming the baseline", () => {
+    assert.equal(
+      renderDeploySection(rec, commit),
+      [
+        "## Deploy recommendation",
+        "",
+        "> [!TIP]",
+        "> ✅ **No deploy needed:** no package was fixed for an alert compared with the last commit",
+      ].join("\n"),
+    );
+    assert.match(renderDeploySection(rec, { kind: "ref", ref: "release" }), /compared with `release`$/);
+  });
+
+  it("names the start of the run when there is no baseline", () => {
+    assert.match(renderDeploySection(rec), /compared with the packages installed at the start of the run$/);
+  });
+
+  it("keeps a ref from breaking out of its code span", () => {
+    const text = renderDeploySection(rec, { kind: "ref", ref: "a`b @evil" });
+    assert.doesNotMatch(text, /a`b/);
+    assert.match(text, /compared with `a'b @evil`$/);
+  });
+
+  it("renders the other outcomes as before", () => {
+    assert.equal(renderDeploySection(recommendDeploy([inputs[3]], []), commit), renderDeploySection(recommendDeploy([inputs[3]], [])));
+  });
+});
+
+describe("logDeployRecommendation with a baseline", () => {
+  afterEach(() => mock.restoreAll());
+
+  const capture = (rec: ReturnType<typeof recommendDeploy>, info: { baseline: Baseline; openAlerts: number; awaitingClose: number }): string[] => {
+    const out: string[] = [];
+    mock.method(console, "log", (m?: unknown) => out.push(String(m)));
+    logDeployRecommendation(rec, info);
+    return out;
+  };
+
+  it("prints the Compared line first under the heading", () => {
+    const out = capture(recommendDeploy(inputs, [], { openAlerts: 5 }), { baseline: commit, openAlerts: 5, awaitingClose: 0 });
+    assert.equal(out[0], "\n🚀 Deployment impact analysis:");
+    assert.equal(out[1], "   Compared with the last commit (`c2b8101`).");
+    assert.equal(out.at(-1), "   🚀 Recommendation: DEPLOY — fixed packages are in production code.");
+  });
+
+  it("says nothing was fixed, and how many alerts are awaiting close", () => {
+    const out = capture(recommendDeploy([], [], { openAlerts: 6 }), { baseline: commit, openAlerts: 6, awaitingClose: 6 });
+    assert.deepEqual(out, [
+      "\n🚀 Deployment impact analysis:",
+      "   Compared with the last commit (`c2b8101`).",
+      "",
+      "   ✅ Recommendation: NO DEPLOY NEEDED — no package was fixed for an alert compared with the last commit.",
+      "   6 alert(s) were already patched in the last commit and are awaiting close.",
+    ]);
+  });
+
+  it("leaves out the awaiting-close line when none are, and names a ref plainly", () => {
+    const out = capture(recommendDeploy([], [], { openAlerts: 2 }), { baseline: { kind: "ref", ref: "release" }, openAlerts: 2, awaitingClose: 0 });
+    assert.equal(out.at(-1), "   ✅ Recommendation: NO DEPLOY NEEDED — no package was fixed for an alert compared with `release`.");
+  });
+
+  it("says there are no open alerts to assess", () => {
+    const out = capture(recommendDeploy([], [], { openAlerts: 0 }), { baseline: commit, openAlerts: 0, awaitingClose: 0 });
+    assert.equal(out[1], "   Compared with the last commit (`c2b8101`).");
+    assert.ok(out.includes("   No open alerts to assess."));
   });
 });

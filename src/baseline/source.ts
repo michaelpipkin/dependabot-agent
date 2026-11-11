@@ -14,13 +14,16 @@ export interface BaselineFallback {
 /** What report.json carries. */
 export type ReportBaseline = Baseline & { fallbacks: BaselineFallback[] };
 
+/** A ref as a code span's text: backticks can't appear inside one, and a ref is user input. */
+const refText = (ref: string): string => ref.replace(/`/g, "'").replace(/\s+/g, " ");
+
 /** The baseline as it reads mid-sentence in the report and the console. */
 export function baselinePhrase(b: Baseline): string {
   switch (b.kind) {
     case "commit":
       return "the last commit";
     case "ref":
-      return `\`${b.ref}\``;
+      return `\`${refText(b.ref)}\``;
     case "run-start":
       return "the packages installed at the start of the run";
   }
@@ -32,7 +35,7 @@ export function comparedWithLine(b: Baseline): string {
     case "commit":
       return `Compared with the last commit (\`${b.sha.slice(0, 7)}\`).`;
     case "ref":
-      return `Compared with \`${b.ref}\` on GitHub.`;
+      return `Compared with \`${refText(b.ref)}\` on GitHub.`;
     case "run-start":
       return "Compared with the packages installed at the start of the run.";
   }

@@ -41,3 +41,27 @@ describe("shared helpers", () => {
     assert.equal(cell("a|b"), "a\\|b");
   });
 });
+
+describe("renderSummaryLine with a baseline", () => {
+  it("ends with the packages changed since the baseline", () => {
+    assert.equal(
+      renderSummaryLine({ ...base, packagesSince: "the last commit" }, false),
+      "**12** of 13 alerts addressed · **8** overrides added or updated · **0** removed · **23** packages changed since the last commit",
+    );
+    assert.match(renderSummaryLine({ ...base, packagesSince: "`release`" }, false), /· \*\*23\*\* packages changed since `release`$/);
+  });
+
+  it("uses the singular for one package", () => {
+    assert.match(
+      renderSummaryLine({ ...base, packagesUpdated: 1, packagesSince: "the last commit" }, false),
+      /· \*\*1\*\* package changed since the last commit$/,
+    );
+  });
+
+  it("leaves the packages part out of a plan", () => {
+    assert.equal(
+      renderSummaryLine({ ...base, packagesSince: "the last commit" }, true),
+      "Planned: **12** of 13 alerts addressed · **8** overrides added or updated · **0** removed",
+    );
+  });
+});

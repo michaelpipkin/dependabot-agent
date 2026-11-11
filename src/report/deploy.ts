@@ -1,3 +1,4 @@
+import { baselinePhrase, comparedWithLine, type Baseline } from "../baseline/source.js";
 import type { DepScope } from "../types.js";
 import { log } from "../util.js";
 import { inline } from "./markdown.js";
@@ -26,6 +27,8 @@ export interface DeployRecommendation {
   development: DeployEntry[];
   unknown: DeployEntry[];
   removedOverrides: string[];
+  /** True when there are open alerts, nothing was fixed and no override was removed. */
+  nothingFixed: boolean;
 }
 
 const MAX_VIA = 5;
@@ -53,7 +56,11 @@ function mergeScope(a: DepScope, b: DepScope): DepScope {
   return "unknown";
 }
 
-export function recommendDeploy(inputs: DeployInput[], removedOverrides: string[]): DeployRecommendation {
+export function recommendDeploy(
+  inputs: DeployInput[],
+  removedOverrides: string[],
+  context?: { openAlerts: number },
+): DeployRecommendation {
   interface Acc {
     scope: DepScope;
     places: Set<string>;
@@ -92,9 +99,12 @@ export function recommendDeploy(inputs: DeployInput[], removedOverrides: string[
   if (production.length > 0) outcome = "deploy";
   else if (unknown.length > 0) outcome = "check";
   else if (development.length > 0) outcome = "no-deploy";
-  else outcome = removedOverrides.length > 0 ? "check" : "none";
+  else if (removedOverrides.length > 0) outcome = "check";
+  else if (context !== undefined && context.openAlerts > 0) outcome = "no-deploy";
+  else outcome = "none";
+  const nothingFixed = byName.size === 0 && removedOverrides.length === 0 && outcome === "no-deploy";
 
-  return { outcome, production, development, unknown, removedOverrides };
+  return { outcome, production, development, unknown, removedOverrides, nothingFixed };
 }
 
 /** A name as a code span. Backticks can't appear inside one, so they become '. */
@@ -153,13 +163,17 @@ function bulletsThenDevelopment(entries: DeployEntry[], rec: DeployRecommendatio
 }
 
 /** The deploy section of a report: heading plus a GitHub alert box. Empty when there is nothing to say. */
-export function renderDeploySection(rec: DeployRecommendation): string {
+export function renderDeploySection(rec: DeployRecommendation, baseline?: Baseline): string {
   if (rec.outcome === "none") return "";
 
   let type: string;
   let first: string;
   let body: string[];
-  if (rec.outcome === "deploy") {
+  if (rec.nothingFixed) {
+    type = "TIP";
+    first = `✅ **No deploy needed:** no package was fixed for an alert compared with ${baselinePhrase(baseline ?? { kind: "run-start" })}`;
+    body = [];
+  } else if (rec.outcome === "deploy") {
     type = "IMPORTANT";
     first = "🚀 **Deploy:** fixed packages are in production code";
     body = bulletsThenDevelopment(rec.production, rec);
@@ -189,10 +203,18 @@ function plainLine(entry: DeployEntry, marker: string): string {
 }
 
 /** The console version of the deploy section: the same entries as plain text. */
-export function logDeployRecommendation(rec: DeployRecommendation): void {
-  if (rec.outcome === "none") return;
+export function logDeployRecommendation(
+  rec: DeployRecommendation,
+  info?: { baseline: Baseline; openAlerts: number; awaitingClose: number },
+): void {
+  if (rec.outcome === "none" && !(info && info.openAlerts === 0)) return;
 
   log("\n🚀 Deployment impact analysis:");
+  if (info) log(`   ${comparedWithLine(info.baseline)}`);
+  if (rec.outcome === "none") {
+    log("   No open alerts to assess.");
+    return;
+  }
   if (rec.production.length > 0) {
     log("   Packages in the PRODUCTION dependency graph:");
     for (const e of rec.production) log(plainLine(e, "⚠️ "));
@@ -210,7 +232,13 @@ export function logDeployRecommendation(rec: DeployRecommendation): void {
   }
 
   log("");
-  if (rec.outcome === "deploy") {
+  if (rec.nothingFixed) {
+    const phrase = baselinePhrase(info?.baseline ?? { kind: "run-start" });
+    log(`   ✅ Recommendation: NO DEPLOY NEEDED — no package was fixed for an alert compared with ${phrase}.`);
+    if (info && info.awaitingClose > 0) {
+      log(`   ${info.awaitingClose} alert(s) were already patched in ${phrase} and are awaiting close.`);
+    }
+  } else if (rec.outcome === "deploy") {
     log("   🚀 Recommendation: DEPLOY — fixed packages are in production code.");
   } else if (rec.outcome === "no-deploy") {
     log("   ✅ Recommendation: NO DEPLOY NEEDED — every fixed package is development-only.");
