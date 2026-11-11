@@ -47,7 +47,30 @@ describe("parseArgs — --update-strategy targeted and --report", () => {
   });
 });
 
+describe("parseArgs — --compare-to", () => {
+  it("takes the ref as the next argument or inline", () => {
+    assert.equal(parseArgs(["--compare-to", "v1.2.0"], "0.0.0").compareTo, "v1.2.0");
+    assert.equal(parseArgs(["--compare-to=release"], "0.0.0").compareTo, "release");
+  });
+
+  it("leaves compareTo undefined when absent", () => {
+    assert.equal(parseArgs(["--dry-run"], "0.0.0").compareTo, undefined);
+  });
+});
+
 describe("parseArgs — --help", () => {
+  it("lists --compare-to", () => {
+    const printed: string[] = [];
+    mock.method(console, "log", (message: unknown) => printed.push(String(message)));
+    mock.method(process, "exit", () => undefined);
+    try {
+      parseArgs(["--help"], "0.0.0");
+    } finally {
+      mock.restoreAll();
+    }
+    assert.ok(printed.join("\n").includes("--compare-to <ref>"));
+  });
+
   it("says --report writes the pull request description with the deploy recommendation", () => {
     const printed: string[] = [];
     mock.method(console, "log", (message: unknown) => printed.push(String(message)));

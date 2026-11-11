@@ -55,6 +55,7 @@ describe("README config examples", () => {
       "updateWorkspaceMembers",
       "limits",
       "moveTogether",
+      "compareTo",
     ];
     const [, reference] = configBlocks();
     assert.deepEqual(Object.keys(reference), expected);

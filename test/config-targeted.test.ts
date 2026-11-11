@@ -53,6 +53,21 @@ describe("resolveConfig — reportDir", () => {
   });
 });
 
+describe("resolveConfig — compareTo", () => {
+  it("lets --compare-to win over COMPARE_TO, and COMPARE_TO over the config file", () => {
+    const dir = workspace({ compareTo: "from-config" });
+    assert.equal(resolveConfig({ compareTo: "from-flag" }, baseEnv(dir, { COMPARE_TO: "from-env" })).compareTo, "from-flag");
+    assert.equal(resolveConfig({}, baseEnv(dir, { COMPARE_TO: "from-env" })).compareTo, "from-env");
+    assert.equal(resolveConfig({}, baseEnv(dir)).compareTo, "from-config");
+  });
+
+  it("is undefined when nothing sets it, and an empty value counts as unset", () => {
+    assert.equal(resolveConfig({}, baseEnv(workspace())).compareTo, undefined);
+    assert.equal(resolveConfig({ compareTo: "" }, baseEnv(workspace(), { COMPARE_TO: "" })).compareTo, undefined);
+    assert.equal(resolveConfig({}, baseEnv(workspace({ compareTo: "" }))).compareTo, undefined);
+  });
+});
+
 describe("resolveConfig — what the workflow's DRY_RUN does", () => {
   it("false beats a repository's \"dryRun\": true", () => {
     assert.equal(resolveConfig({}, baseEnv(workspace({ dryRun: true }), { DRY_RUN: "false" })).dryRun, false);

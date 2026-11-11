@@ -12,6 +12,7 @@ export interface CliArgs {
   workspaceRoot?: string;
   updateStrategy?: UpdateStrategy;
   reportDir?: string;
+  compareTo?: string;
   alertsFile?: string;
   allowPrerelease?: boolean;
   dryRun?: boolean;
@@ -39,6 +40,9 @@ Options:
   --report <dir>                   Write a report of the run to this directory
                                    (or env REPORT_DIR): a pull request description
                                    with the deploy recommendation.
+  --compare-to <ref>               Compare the deploy recommendation with this branch,
+                                   tag or commit on GitHub (or env COMPARE_TO); default:
+                                   the last commit
   --alerts-file <path>             Read alerts from this JSON file instead of GitHub, with
                                    no token (or env ALERTS_FILE). It holds what GitHub's
                                    alerts API returns, across all states. Targeted only.
@@ -118,6 +122,9 @@ export function parseArgs(argv: string[], version: string): CliArgs {
         break;
       case "--report":
         args.reportDir = takeValue();
+        break;
+      case "--compare-to":
+        args.compareTo = takeValue();
         break;
       case "--alerts-file":
         args.alertsFile = takeValue();

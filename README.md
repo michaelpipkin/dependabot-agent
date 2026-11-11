@@ -128,7 +128,8 @@ Commit this file at the workspace root. It's auto-discovered — no `--config` f
   "packages": [],                // extra manifest dirs to always process
   "updateWorkspaceMembers": true, // let the update pass bump workspace members too
   "limits": {},
-  "moveTogether": []
+  "moveTogether": [],
+  "compareTo": "release"         // compare the deploy recommendation with this branch, tag or commit (default: the last commit)
 }
 ```
 
@@ -174,6 +175,7 @@ pnpm deps:fix --update-strategy latest    # one-off: allow crossing majors
 | `--skip-update` | `SKIP_UPDATE=true` | `false` | Skip the pre-check dependency update. |
 | `--exit-code` | `EXIT_CODE=true` | `false` | Exit `2` if any override changes are found. Pair with `--dry-run` to fail CI on override drift — see [CI integration](#ci-integration-github-actions). |
 | `--report <dir>` | `REPORT_DIR` | — | Write a report of the run to this directory, under any strategy. `report.md` is the text for a pull request: a summary line, the deploy recommendation and a table of the alerts fixed. `report.json` holds the same data, and `report-full.md` is written when `report.md` had to be cut. See [The report](#the-report). |
+| `--compare-to <ref>` | `COMPARE_TO` | last commit | Compare the deploy recommendation with this branch, tag or commit on GitHub, instead of the last commit. Also settable as `compareTo` in the config file. |
 | `--alerts-file <path>` | `ALERTS_FILE` | — | Read alerts from this JSON file instead of GitHub, with no token needed. It holds what GitHub's alerts API returns, across all states. Targeted strategy only: under `compatible` or `latest` it prints a warning and is ignored. |
 | `--config <path>` | — | auto-discover | Path to a JSON config file. |
 
@@ -209,7 +211,8 @@ The config file must be **JSON** (a `.js`/`.ts` config is not supported). All ke
   "packages": [],                // extra manifest dirs to always process
   "updateWorkspaceMembers": true, // bump workspace members' manifests too (default true)
   "limits": {},                  // targeted mode only: package glob -> semver range, e.g. {"@angular/*": "<22"}
-  "moveTogether": []             // targeted mode only: groups kept on one version, e.g. [["@angular/ssr", "@angular/build"]]
+  "moveTogether": [],            // targeted mode only: groups kept on one version, e.g. [["@angular/ssr", "@angular/build"]]
+  "compareTo": "release"         // compare the deploy recommendation with this branch, tag or commit (default: the last commit)
 }
 ```
 

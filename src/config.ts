@@ -24,6 +24,7 @@ export interface ResolvedConfig {
   limits: Record<string, string>; // targeted mode: package-name glob → semver range it must stay within
   moveTogether?: string[][]; // targeted mode: groups of package names that must stay on one version
   reportDir?: string; // write a run report here (flag/env only)
+  compareTo?: string; // branch, tag or commit the deploy recommendation compares with (default: the last commit)
   alertsFile?: string; // targeted mode: read alerts from this file, with no token (flag/env only)
 }
 
@@ -41,6 +42,7 @@ interface ConfigFile {
   updateWorkspaceMembers?: boolean;
   limits?: Record<string, string>;
   moveTogether?: string[][];
+  compareTo?: string;
   token?: string; // not allowed — warned and ignored
 }
 
@@ -171,6 +173,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   const moveTogether = parseMoveTogether(config.moveTogether);
 
   const reportDir = args.reportDir || env.REPORT_DIR || undefined;
+  const compareTo = args.compareTo || env.COMPARE_TO || config.compareTo || undefined;
 
   if (Object.keys(limits).length > 0 && updateStrategy !== "targeted") {
     warn(`"limits" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
@@ -218,6 +221,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
     limits,
     moveTogether,
     reportDir,
+    compareTo,
     alertsFile,
   };
 }
