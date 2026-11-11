@@ -11,8 +11,11 @@ export interface BaselineFallback {
   reason: string;
 }
 
-/** What report.json carries. */
-export type ReportBaseline = Baseline & { fallbacks: BaselineFallback[] };
+/**
+ * What report.json carries: the baseline compared with, the manifests that fell back, and the
+ * baseline that was asked for, which differs from the first when every manifest fell back.
+ */
+export type ReportBaseline = Baseline & { fallbacks: BaselineFallback[]; requested?: Baseline };
 
 const sameBaseline = (a: Baseline, b: Baseline): boolean =>
   a.kind === b.kind &&

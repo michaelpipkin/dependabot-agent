@@ -66,6 +66,22 @@ describe("resolveConfig — compareTo", () => {
     assert.equal(resolveConfig({ compareTo: "" }, baseEnv(workspace(), { COMPARE_TO: "" })).compareTo, undefined);
     assert.equal(resolveConfig({}, baseEnv(workspace({ compareTo: "" }))).compareTo, undefined);
   });
+
+  it("reads a number in the config file (an unquoted short SHA) as its digits", () => {
+    assert.equal(resolveConfig({}, baseEnv(workspace({ compareTo: 1234567 }))).compareTo, "1234567");
+  });
+
+  it("warns about and ignores any other value that isn't text", () => {
+    for (const value of [true, ["release"], { ref: "release" }]) {
+      const warned = mock.method(console, "warn", () => {});
+      try {
+        assert.equal(resolveConfig({}, baseEnv(workspace({ compareTo: value }))).compareTo, undefined);
+        assert.ok(warned.mock.calls.some((call) => String(call.arguments[0]).includes('Ignoring "compareTo" in config file')), JSON.stringify(value));
+      } finally {
+        warned.mock.restore();
+      }
+    }
+  });
 });
 
 describe("resolveConfig — what the workflow's DRY_RUN does", () => {

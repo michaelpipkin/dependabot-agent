@@ -173,7 +173,7 @@ export function resolveConfig(args: CliArgs, env: NodeJS.ProcessEnv): ResolvedCo
   const moveTogether = parseMoveTogether(config.moveTogether);
 
   const reportDir = args.reportDir || env.REPORT_DIR || undefined;
-  const compareTo = args.compareTo || env.COMPARE_TO || config.compareTo || undefined;
+  const compareTo = args.compareTo || env.COMPARE_TO || configCompareTo(config.compareTo) || undefined;
 
   if (Object.keys(limits).length > 0 && updateStrategy !== "targeted") {
     warn(`"limits" only applies with --update-strategy targeted — ignoring it under "${updateStrategy}".`);
@@ -240,6 +240,18 @@ function parseStrategyConfig(value: unknown): UpdateStrategy | undefined {
     exitWithError(`Invalid "updateStrategy" in the config file: ${JSON.stringify(value)} (expected "compatible", "latest" or "targeted")`);
   }
   return value;
+}
+
+/**
+ * The config file's `compareTo`. An unquoted short SHA like 1234567 is a number in JSON, so a
+ * number is read as its digits; anything else that isn't text is ignored with a warning.
+ */
+function configCompareTo(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  warn(`Ignoring "compareTo" in config file — it must be a branch, tag or commit as text.`);
+  return undefined;
 }
 
 /**

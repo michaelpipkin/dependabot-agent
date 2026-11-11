@@ -440,12 +440,15 @@ function wasVulnerable(index: VersionIndex, alert: DependabotAlert): boolean {
 /**
  * Reads each lockfile with open alerts at the baseline, the way the other strategies do, and
  * names the alerts whose package was vulnerable there. A lockfile that can't be read at the
- * baseline falls back on its own, with a warning; its alerts all count, as in 1.4.0. When no
- * lockfile could be read at the baseline `baselineVulnerable` is left unset. Never throws.
+ * baseline falls back on its own, with a warning; its alerts are kept apart in `runStartAlerts`
+ * and judged as in 1.4.0 (only a fix by this run counts). When no lockfile could be read at the
+ * baseline, or there are no alerts, `baselineVulnerable` is left unset (and with no alerts, so is
+ * `baseline`: nothing was read). Never throws.
  */
-async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<RunReport, "baseline" | "baselineVulnerable" | "warnings">> {
+async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<RunReport, "baseline" | "baselineVulnerable" | "runStartAlerts" | "warnings">> {
   const bctx = baselineContextFor(cfg);
   const vulnerable: number[] = [];
+  const runStart: number[] = [];
   const fallbacks: BaselineFallback[] = [];
   const used: Baseline[] = [];
   const warnings: string[] = [];
@@ -463,12 +466,14 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
       readable++;
       vulnerable.push(...group.input.alerts.filter((a) => wasVulnerable(indexes.baseline, a)).map((a) => a.number));
     } else {
-      vulnerable.push(...group.input.alerts.map((a) => a.number));
+      runStart.push(...group.input.alerts.map((a) => a.number));
     }
   }
   return {
-    baseline: { ...displayBaseline(bctx.requested, used), fallbacks },
-    ...(withAlerts === 0 || readable > 0 ? { baselineVulnerable: [...new Set(vulnerable)].sort((a, b) => a - b) } : {}),
+    // With no alerts nothing was read, so there is nothing to say it was compared with.
+    ...(withAlerts > 0 ? { baseline: { ...displayBaseline(bctx.requested, used), fallbacks, requested: bctx.requested } } : {}),
+    ...(readable > 0 ? { baselineVulnerable: [...new Set(vulnerable)].sort((a, b) => a - b) } : {}),
+    ...(readable > 0 && runStart.length > 0 ? { runStartAlerts: [...new Set(runStart)].sort((a, b) => a - b) } : {}),
     ...(warnings.length > 0 ? { warnings: boundedWarnings(warnings) } : {}),
   };
 }
@@ -521,7 +526,7 @@ const restoreNote = (state: RunState): string =>
 
 type ReportBase = Pick<
   RunReport,
-  "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith" | "advised" | "advisoriesUnchecked" | "baseline" | "baselineVulnerable" | "warnings"
+  "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith" | "advised" | "advisoriesUnchecked" | "baseline" | "baselineVulnerable" | "runStartAlerts" | "warnings"
 >;
 
 /** Write the report if asked to, and print it. A write that fails says so, and names the directory. */

@@ -124,7 +124,7 @@ describe("assembleStrategyReport", () => {
     assert.equal(r.outcome, "clean");
     assert.equal(r.deploy.outcome, "none");
     const body = renderStrategyReport(r);
-    assert.match(body, /No alerts were fixed in this run\./);
+    assert.match(body, /No alert was fixed compared with the packages installed at the start of the run\./);
     assert.doesNotMatch(body, /Deploy recommendation/);
     assert.doesNotMatch(body, /\| Alert \|/);
   });
@@ -342,6 +342,13 @@ describe("a report with a baseline", () => {
     assert.match(renderStrategyReport(build([])), /Compared with the packages installed at the start of the run\./);
   });
 
+  it("says what a run that fixed nothing was compared with", () => {
+    const none = (baseline: StrategyReport["baseline"]): string => renderStrategyReport(build([], { baseline }));
+    assert.ok(none({ kind: "commit", sha: "c2b8101aaaaaaaa", fallbacks: [] }).includes("No alert was fixed compared with the last commit."));
+    assert.ok(none(release).includes("No alert was fixed compared with `release`."));
+    assert.doesNotMatch(none(release), /No alerts were fixed/);
+  });
+
   it("ends the summary with the packages changed since the baseline, except against the start of the run", () => {
     const withRef = build([fix({ number: 1, packageName: "a", status: "update" })], { baseline: release, packagesUpdated: 23 });
     assert.equal(withRef.summary.packagesSince, "`release`");
@@ -384,10 +391,12 @@ describe("a report with a baseline", () => {
     const dir = mkdtempSync(join(tmpdir(), "strategy-report-"));
     try {
       const fallbacks = [{ manifest: "functions/pnpm-lock.yaml", kind: "commit" as const, reason: "404" }];
-      writeStrategyReport(dir, build([], { baseline: { ...release, fallbacks }, warnings: ["w"] }));
+      const requested = { kind: "ref" as const, ref: "release" };
+      writeStrategyReport(dir, build([], { baseline: { ...release, fallbacks, requested }, warnings: ["w"] }));
       const json = JSON.parse(readFileSync(join(dir, "report.json"), "utf8")) as StrategyReport;
       assert.equal(json.baseline.kind, "ref");
       assert.deepEqual(json.baseline.fallbacks, fallbacks);
+      assert.deepEqual(json.baseline.requested, requested);
       assert.deepEqual(json.warnings, ["w"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

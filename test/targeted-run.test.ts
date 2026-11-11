@@ -2142,7 +2142,7 @@ describe("compared with the deployed baseline", () => {
     assert.equal(report.alerts[0].status, "awaiting-close");
     assert.equal(report.outcome, "clean");
     assert.deepEqual(report.baselineVulnerable, [1]);
-    assert.deepEqual(report.baseline, { kind: "commit", sha, fallbacks: [] });
+    assert.deepEqual(report.baseline, { kind: "commit", sha, fallbacks: [], requested: { kind: "commit", sha } });
     assert.ok(md.includes(`Compared with the last commit (\`${sha.slice(0, 7)}\`).`), md);
     assert.ok(md.includes("[!IMPORTANT]") && md.includes("`qs`"), md);
     assert.ok(md.indexOf("Compared with") < md.indexOf("## Deploy recommendation"));
@@ -2192,7 +2192,7 @@ describe("compared with the deployed baseline", () => {
 
     assert.ok(urls.includes("https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"), urls.join(", "));
     assert.deepEqual(urls.filter((u) => u.includes("/contents/")), ["https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"], "only the lockfile is read at the baseline");
-    assert.deepEqual(report.baseline, { kind: "ref", ref: "release", fallbacks: [] });
+    assert.deepEqual(report.baseline, { kind: "ref", ref: "release", fallbacks: [], requested: { kind: "ref", ref: "release" } });
     assert.deepEqual(report.baselineVulnerable, [1]);
     assert.ok(md.includes("Compared with `release` on GitHub."), md);
     assert.ok(md.includes("[!IMPORTANT]"), md);
@@ -2208,7 +2208,12 @@ describe("compared with the deployed baseline", () => {
     assert.ok(!md.includes("`release` on GitHub"), md);
     assert.ok(md.includes(`Couldn't read package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
     assert.ok(md.includes("[!IMPORTANT]"), md);
-    assert.deepEqual(report.baseline, { kind: "commit", sha, fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }] });
+    assert.deepEqual(report.baseline, {
+      kind: "commit",
+      sha,
+      fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }],
+      requested: { kind: "ref", ref: "release" },
+    });
   });
 
   it("compareTo with no token (an alerts file) falls back to the last commit without asking GitHub", async () => {
@@ -2221,15 +2226,18 @@ describe("compared with the deployed baseline", () => {
     assert.deepEqual(report.baselineVulnerable, [1]);
   });
 
-  it("an isolated package whose lockfile isn't at the baseline falls back on its own and its alerts count", async () => {
+  it("an isolated package whose lockfile isn't at the baseline falls back on its own and is judged by the run alone", async () => {
     // The root is committed (and on `release`); functions/ has a lockfile in the working copy only.
     const { dir } = gitProject("6.5.0", "6.5.3");
     writeProject(join(dir, "functions"), functionsProject());
     const release = JSON.stringify(readLock(dir)).replace("6.5.3", "6.5.0");
     const { report, md, urls } = await runIn(dir, { compareTo: "release" }, { "package-lock.json": release }, [qsAlert(), msAlert()]);
 
-    // qs was vulnerable at the baseline; ms can't be told, so it counts as in 1.4.0.
-    assert.deepEqual(report.baselineVulnerable, [1, 2]);
+    // qs was vulnerable at the baseline; ms can't be told, so it is judged as in 1.4.0 (this run fixed it, so it counts).
+    assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.deepEqual(report.runStartAlerts, [2]);
+    const box = md.slice(md.indexOf("## Deploy recommendation"));
+    assert.ok(box.includes("`qs`") && box.includes("`ms`"), md);
     assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind]), [["functions", "run-start"]]);
     const read = urls.filter((u) => u.includes("/contents/"));
     assert.ok(read.includes("https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"), read.join(", "));
@@ -2238,6 +2246,33 @@ describe("compared with the deployed baseline", () => {
     assert.ok(md.includes(`Couldn't read functions/package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
     assert.ok(md.includes("Couldn't read functions/package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead."), md);
     assert.ok(!md.includes("Couldn't read package-lock.json"), md);
+  });
+
+  it("a fallback group's alert that was already patched never counts, though a baseline group's does", async () => {
+    // The root is committed vulnerable and patched in the working copy; functions/ has ms 2.0.5 already, in the working copy only.
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    writeProject(join(dir, "functions"), {
+      ...functionsProject(),
+      packages: { "node_modules/b": { version: "1.0.0", dependencies: { ms: "^2.0.0" } }, "node_modules/ms": { version: "2.0.5" } },
+    });
+    const { report, md } = await runIn(dir, {}, {}, [qsAlert(), msAlert()]);
+
+    assert.deepEqual(report.alerts.map((a) => [a.number, a.status]), [[1, "awaiting-close"], [2, "awaiting-close"]]);
+    assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.deepEqual(report.runStartAlerts, [2]);
+    const box = md.slice(md.indexOf("## Deploy recommendation"), md.indexOf("Alerts: "));
+    assert.ok(box.includes("[!IMPORTANT]") && box.includes("`qs`"), md);
+    assert.ok(!box.includes("`ms`"), "ms was already patched in production, so it is no reason to deploy: " + box);
+  });
+
+  it("with no open alerts nothing is read, so there is no Compared line and no baseline", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    const { report, md, urls } = await runIn(dir, { compareTo: "release" }, {}, []);
+
+    assert.equal(report.baseline, undefined);
+    assert.equal(report.baselineVulnerable, undefined);
+    assert.deepEqual(urls.filter((u) => u.includes("/contents/")), []);
+    assert.doesNotMatch(md, /Compared with/);
   });
 
   it("an unexpected failure reading the baseline is a warning: the run goes on and the box compares with the start of the run", async () => {

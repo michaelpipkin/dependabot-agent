@@ -119,7 +119,7 @@ describe("run — --report under compatible", () => {
     const body = readFileSync(join(out, "report.md"), "utf-8");
     assert.ok(body.includes("Compared with the packages installed at the start of the run."));
     const report = JSON.parse(readFileSync(join(out, "report.json"), "utf-8"));
-    assert.deepEqual(report.baseline, { kind: "run-start", fallbacks: [] });
+    assert.deepEqual(report.baseline, { kind: "run-start", fallbacks: [], requested: { kind: "run-start" } });
   });
 
   it("names the directory when the report can't be written", async () => {
@@ -278,7 +278,7 @@ describe("run — compared with the deployed baseline", () => {
     assert.ok(r.body.includes(`Compared with the last commit (\`${sha.slice(0, 7)}\`).`));
     assert.match(r.body, UPDATE_ROW);
     assert.match(r.body, DEPLOY_BOX);
-    assert.deepEqual(r.report.baseline, { kind: "commit", sha, fallbacks: [] });
+    assert.deepEqual(r.report.baseline, { kind: "commit", sha, fallbacks: [], requested: { kind: "commit", sha } });
     assert.deepEqual(r.report.warnings, []);
     assert.equal(r.report.deploy.outcome, "deploy");
     assert.equal(r.report.summary.packagesUpdated, 1, "semver changed since the last commit");
@@ -303,10 +303,12 @@ describe("run — compared with the deployed baseline", () => {
     assert.ok(r.body.includes(compared), "the report names the baseline used");
     assert.ok(!r.body.includes("`release` on GitHub"), "and not the one asked for");
     assert.ok(r.console.includes(compared), "the console names it too");
+    // report.json still says `release` was asked for, though the only group used the last commit.
     assert.deepEqual(r.report.baseline, {
       kind: "commit",
       sha,
       fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }],
+      requested: { kind: "ref", ref: "release" },
     });
     assert.match(r.body, UPDATE_ROW, "compared with the last commit");
     assert.match(r.body, DEPLOY_BOX);
@@ -320,7 +322,7 @@ describe("run — compared with the deployed baseline", () => {
     const r = await baselineRun(dir, { compareTo: "release", contents: { "package-lock.json": rootLock("7.5.1") } });
 
     assert.ok(r.body.includes("Compared with `release` on GitHub."));
-    assert.deepEqual(r.report.baseline, { kind: "ref", ref: "release", fallbacks: [] });
+    assert.deepEqual(r.report.baseline, { kind: "ref", ref: "release", fallbacks: [], requested: { kind: "ref", ref: "release" } });
     assert.deepEqual(r.report.warnings, []);
     assert.match(r.body, UPDATE_ROW);
     assert.match(r.body, DEPLOY_BOX);
@@ -364,17 +366,36 @@ describe("run — compared with the deployed baseline", () => {
     assert.equal(r.changes, 1, "the override decision is unchanged");
   });
 
-  it("falls back to the start of the run when the baseline lockfile can't be parsed", async () => {
-    const { dir } = gitProject();
+  it("falls back to the last commit when the lockfile at compareTo downloads but can't be parsed", async () => {
+    const { dir, sha } = gitProject();
     const r = await baselineRun(dir, { compareTo: "release", contents: { "package-lock.json": "<html>not a lockfile" } });
 
     assert.equal(r.report.baseline.fallbacks.length, 1);
-    assert.equal(r.report.baseline.fallbacks[0].kind, "run-start");
+    assert.equal(r.report.baseline.fallbacks[0].kind, "commit");
     assert.match(r.report.baseline.fallbacks[0].reason, /^could not parse package-lock\.json: /);
     assert.equal(r.report.warnings.length, 1);
     assert.match(
       r.report.warnings[0],
-      /^⚠️ {2}Couldn't read package-lock\.json on "release" from GitHub \(could not parse package-lock\.json: .*\); compared with the packages installed at the start of the run instead\.$/,
+      /^⚠️ {2}Couldn't read package-lock\.json on "release" from GitHub \(could not parse package-lock\.json: .*\); compared with the last commit instead\.$/,
+    );
+    assert.deepEqual({ kind: r.report.baseline.kind, sha: (r.report.baseline as { sha?: string }).sha }, { kind: "commit", sha });
+    assert.match(r.body, UPDATE_ROW, "compared with the last commit, where semver was vulnerable");
+    assert.match(r.body, DEPLOY_BOX);
+  });
+
+  it("falls to the start of the run, with both warnings, when the lockfile at compareTo can't be parsed and the last commit has none", async () => {
+    const { dir } = gitProject();
+    execFileSync("git", ["rm", "-q", "--cached", "package-lock.json"], { cwd: dir });
+    execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@e.test", "commit", "-q", "-m", "drop lock"], { cwd: dir });
+    const r = await baselineRun(dir, { compareTo: "release", contents: { "package-lock.json": "<html>not a lockfile" } });
+
+    assert.equal(r.report.baseline.kind, "run-start");
+    assert.deepEqual(r.report.baseline.fallbacks.map((f) => [f.manifest, f.kind, f.reason]), [["root", "run-start", "not in the last commit"]]);
+    assert.equal(r.report.warnings.length, 2);
+    assert.match(r.report.warnings[0], /on "release" from GitHub \(could not parse package-lock\.json: .*\); compared with the last commit instead\.$/);
+    assert.equal(
+      r.report.warnings[1],
+      "⚠️  Couldn't read package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead.",
     );
     assert.equal(r.report.notAddressed[0]?.status, "awaiting-close");
   });

@@ -1233,20 +1233,28 @@ export async function readGroupBaseline(
 ): Promise<GroupBaseline> {
   const lockPath = repoPathOf(bctx.repoRoot, lockFile);
   const overridePath = overrideFile === undefined ? undefined : repoPathOf(bctx.repoRoot, overrideFile);
-  const files = await readBaselineFiles({
-    repo: bctx.repo,
-    compareTo: bctx.compareTo,
-    git: bctx.git,
-    repoPaths: overridePath === undefined ? [lockPath] : [lockPath, overridePath],
-  });
+  const repoPaths = overridePath === undefined ? [lockPath] : [lockPath, overridePath];
+  let files = await readBaselineFiles({ repo: bctx.repo, compareTo: bctx.compareTo, git: bctx.git, repoPaths });
   const warnings = [...files.warnings];
   // readBaselineFiles warns once per level it fell from: the last warning is
   // about the level just above the one it settled on.
-  let reason: string | null = null;
-  const lastRead = warnings.at(-1);
-  if (lastRead !== undefined) {
-    const fellFrom = files.baseline.kind === "run-start" ? "from the last commit" : `on "${bctx.compareTo}" from GitHub`;
-    reason = reasonIn(lastRead, `${lockPath} ${fellFrom} (`);
+  const reasonOfLastWarning = (read: typeof files): string | null => {
+    const lastRead = read.warnings.at(-1);
+    if (lastRead === undefined) return null;
+    const fellFrom = read.baseline.kind === "run-start" ? "from the last commit" : `on "${bctx.compareTo}" from GitHub`;
+    return reasonIn(lastRead, `${lockPath} ${fellFrom} (`);
+  };
+  let reason = reasonOfLastWarning(files);
+
+  // A lockfile that downloaded at the ref but can't be parsed drops to the last commit, as one that couldn't be downloaded does.
+  if (files.baseline.kind === "ref") {
+    const atRef = parseLockfile(pmId, files.texts.get(lockPath) ?? null);
+    if ("reason" in atRef) {
+      warnings.push(`⚠️  Couldn't read ${lockPath} ${baselineSource(files.baseline)} (${atRef.reason}); compared with the last commit instead.`);
+      files = await readBaselineFiles({ repo: bctx.repo, git: bctx.git, repoPaths });
+      warnings.push(...files.warnings);
+      reason = reasonOfLastWarning(files) ?? atRef.reason;
+    }
   }
 
   const lockBefore = readTextOrNull(lockFile);
@@ -1601,7 +1609,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
       overridesRemoved: totalRemoved,
       removedOverrideKeys: removedKeys,
       packagesUpdated: totalPackagesUpdated,
-      baseline: { ...shownBaseline, fallbacks },
+      baseline: { ...shownBaseline, fallbacks, requested: bctx.requested },
       warnings: boundedWarnings(allWarnings),
       openAlerts,
       changedThisRun: totalAdded + totalRemoved > 0 || anyInstallChanged,

@@ -656,6 +656,23 @@ describe("the deploy box and the Compared line against a baseline", () => {
     assert.deepEqual(rec.development.map((e) => e.packageName), ["waiting"]);
   });
 
+  it("an alert in runStartAlerts counts only when fixed or partly fixed, never when awaiting close", () => {
+    const rec = targetedDeploy(
+      report({
+        alerts: [
+          awaiting({ number: 1, packageName: "waiting" }),
+          alert({ number: 2, packageName: "fixed-here" }),
+          alert({ number: 3, packageName: "partly", status: "partly-fixed" }),
+          awaiting({ number: 4, packageName: "was-vulnerable" }),
+        ],
+        baseline: COMMIT,
+        baselineVulnerable: [4],
+        runStartAlerts: [1, 2, 3],
+      }),
+    );
+    assert.deepEqual(rec.production.map((e) => e.packageName).sort(), ["fixed-here", "partly", "was-vulnerable"]);
+  });
+
   it("without baselineVulnerable an awaiting-close alert is not an input (1.4.0), but open alerts keep the box from going silent", () => {
     const input = report({ outcome: "clean", alerts: [awaiting()] });
     const rec = targetedDeploy(input);

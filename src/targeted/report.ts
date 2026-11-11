@@ -37,6 +37,11 @@ export interface RunReport {
    * no lockfile could be read at the baseline, so the box keeps its 1.4.0 rule.
    */
   baselineVulnerable?: number[];
+  /**
+   * The alerts (by number) in lockfiles that couldn't be read at the baseline, when others could.
+   * They are judged against the start of the run, as in 1.4.0: only a fix by this run counts.
+   */
+  runStartAlerts?: number[];
   /** Why the baseline isn't what was asked for, one line each. */
   warnings?: string[];
 }
@@ -134,10 +139,12 @@ export function targetedSummary(report: RunReport): SummaryCounts {
  */
 export function targetedDeploy(report: RunReport): DeployRecommendation {
   const vulnerable = report.baselineVulnerable ? new Set(report.baselineVulnerable) : null;
-  const counts = (a: AlertOutcome): boolean =>
-    vulnerable
-      ? vulnerable.has(a.number) && (a.status === "fixed" || a.status === "partly-fixed" || a.status === "awaiting-close")
-      : a.status === "fixed" || a.status === "partly-fixed";
+  const runStart = new Set(report.runStartAlerts ?? []);
+  const counts = (a: AlertOutcome): boolean => {
+    const fixed = a.status === "fixed" || a.status === "partly-fixed";
+    if (!vulnerable || runStart.has(a.number)) return fixed;
+    return vulnerable.has(a.number) && (fixed || a.status === "awaiting-close");
+  };
   const inputs: DeployInput[] = report.alerts
     .filter(counts)
     .map((a) => ({ packageName: a.packageName, scope: a.scope, manifest: a.manifest, via: [] }));

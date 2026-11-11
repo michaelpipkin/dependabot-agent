@@ -164,7 +164,7 @@ export function renderStrategyReport(report: StrategyReport, options: { full?: b
   const tail = report.notAddressed.length > 0 ? [notAddressedLine(report.notAddressed, report.baseline)] : [];
   const join = (parts: string[]): string => parts.join("\n\n") + "\n";
 
-  if (report.fixes.length === 0) return join([...head, "No alerts were fixed in this run.", ...tail]);
+  if (report.fixes.length === 0) return join([...head, `No alert was fixed compared with ${baselinePhrase(report.baseline)}.`, ...tail]);
 
   const tableHead = [`| ${TABLE_HEAD.join(" | ")} |`, `|${TABLE_HEAD.map(() => " --- ").join("|")}|`];
   const rows = sortedFixes(report.fixes).map(row);
