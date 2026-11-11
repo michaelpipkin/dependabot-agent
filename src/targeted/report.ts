@@ -348,11 +348,10 @@ function headerBlock(report: RunReport): string {
     lines.push(renderSummaryLine(targetedSummary(report), planned), "");
     // The baseline asked for, as in the other strategies; the warnings and `baseline.fallbacks` say where one couldn't be used.
     const baseline = report.baseline;
-    if (baseline) {
-      lines.push(comparedWithLine(baseline));
-      for (const warning of report.warnings ?? []) lines.push("", `_${inline(warning)}_`);
-      lines.push("");
-    }
+    const warnings = report.warnings ?? [];
+    if (baseline) lines.push(comparedWithLine(baseline));
+    for (const warning of warnings) lines.push(...(lines.at(-1) === "" ? [] : [""]), `_${inline(warning)}_`);
+    if (baseline || warnings.length > 0) lines.push("");
     if (report.outcome !== "failed") {
       const deploy = renderDeploySection(targetedDeploy(report), baseline);
       if (deploy) lines.push(deploy, "");

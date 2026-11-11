@@ -2116,7 +2116,12 @@ describe("compared with the deployed baseline", () => {
     return { dir, sha: git("rev-parse", "HEAD").trim() };
   }
 
-  async function runIn(dir: string, over: Partial<ResolvedConfig> = {}, fetched: Record<string, string> = {}): Promise<{ report: RunReport; md: string; urls: string[] }> {
+  async function runIn(
+    dir: string,
+    over: Partial<ResolvedConfig> = {},
+    fetched: Record<string, string> = {},
+    alerts: DependabotAlert[] = [qsAlert()],
+  ): Promise<{ report: RunReport; md: string; urls: string[] }> {
     const reportDir = tempDir();
     const urls: string[] = [];
     mock.method(globalThis, "fetch", async (input: string | URL) => {
@@ -2126,7 +2131,7 @@ describe("compared with the deployed baseline", () => {
       const text = contents ? fetched[decodeURIComponent(contents[1])] : undefined;
       return text === undefined ? new Response("Not Found", { status: 404 }) : new Response(text, { status: 200 });
     });
-    await runTargeted(cfgFor(dir, { reportDir, ...over }), depsFor([qsAlert()], fakeNpm()));
+    await runTargeted(cfgFor(dir, { reportDir, ...over }), depsFor(alerts, fakeNpm()));
     return { report: reportIn(reportDir), md: reportMd(reportDir), urls };
   }
 
@@ -2211,6 +2216,43 @@ describe("compared with the deployed baseline", () => {
     assert.ok(md.includes('on "release" from GitHub (no token); compared with the last commit instead.'), md);
     assert.ok(md.includes("Compared with `release` on GitHub."), md);
     assert.deepEqual(report.baselineVulnerable, [1]);
+  });
+
+  it("an isolated package whose lockfile isn't at the baseline falls back on its own and its alerts count", async () => {
+    // The root is committed (and on `release`); functions/ has a lockfile in the working copy only.
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    writeProject(join(dir, "functions"), functionsProject());
+    const release = JSON.stringify(readLock(dir)).replace("6.5.3", "6.5.0");
+    const { report, md, urls } = await runIn(dir, { compareTo: "release" }, { "package-lock.json": release }, [qsAlert(), msAlert()]);
+
+    // qs was vulnerable at the baseline; ms can't be told, so it counts as in 1.4.0.
+    assert.deepEqual(report.baselineVulnerable, [1, 2]);
+    assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind]), [["functions", "run-start"]]);
+    const read = urls.filter((u) => u.includes("/contents/"));
+    assert.ok(read.includes("https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"), read.join(", "));
+    assert.ok(read.includes("https://api.github.com/repos/o/r/contents/functions/package-lock.json?ref=release"), read.join(", "));
+    assert.ok(md.includes("Compared with `release` on GitHub."), md);
+    assert.ok(md.includes(`Couldn't read functions/package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
+    assert.ok(md.includes("Couldn't read functions/package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead."), md);
+    assert.ok(!md.includes("Couldn't read package-lock.json"), md);
+  });
+
+  it("an unexpected failure reading the baseline is a warning: the run goes on and the box keeps its 1.4.0 rule", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    const reportDir = tempDir();
+    const cfg = cfgFor(dir, { reportDir });
+    Object.defineProperty(cfg, "owner", { get: () => { throw new Error("boom"); } });
+    mock.method(globalThis, "fetch", async () => new Response("", { status: 404 }));
+    await runTargeted(cfg, depsFor([qsAlert()], fakeNpm()));
+
+    const report = reportIn(reportDir);
+    assert.equal(report.outcome, "clean");
+    assert.equal(report.baseline, undefined);
+    assert.equal(report.baselineVulnerable, undefined);
+    assert.deepEqual(report.warnings, ["⚠️  Couldn't read the baseline (boom); the deploy box keeps its 1.4.0 rule."]);
+    const md = reportMd(reportDir);
+    assert.ok(md.includes("Couldn't read the baseline (boom)"), md);
+    assert.doesNotMatch(md, /Compared with/);
   });
 
   it("the files the workflow reads are unchanged by the baseline", async () => {

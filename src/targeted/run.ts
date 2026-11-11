@@ -67,6 +67,7 @@ const defaultDeps: TargetedDeps = {
 const posix = (p: string): string => p.split(path.sep).join("/");
 const sameDir = (a: string, b: string): boolean => path.resolve(a) === path.resolve(b);
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const firstLine = (text: string): string => text.split("\n")[0].trim();
 
 /** Stop before any write if any directory in the run is managed by pnpm. */
 export function assertTargetedSupported(dirs: string[], cfg: ResolvedConfig): void {
@@ -455,9 +456,10 @@ async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<
     warnings.push(...read.warnings);
     const fallback = fallbackOf(read.baseline, bctx.requested, group.label, read.reason);
     if (fallback) fallbacks.push(fallback);
-    if (read.indexes) {
+    const { indexes } = read;
+    if (indexes) {
       readable++;
-      vulnerable.push(...group.input.alerts.filter((a) => wasVulnerable(read.indexes!.baseline, a)).map((a) => a.number));
+      vulnerable.push(...group.input.alerts.filter((a) => wasVulnerable(indexes.baseline, a)).map((a) => a.number));
     } else {
       vulnerable.push(...group.input.alerts.map((a) => a.number));
     }
@@ -821,7 +823,14 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
   const base: ReportBase = { dryRun: cfg.dryRun, blockedCount: 0, alerts: [], npmVersion: state.npmVersion };
   refreshBase(base, groups, placed.unprocessed, state);
   // Before anything is written: a baseline read must never fail the run, and git and GitHub are read-only here.
-  Object.assign(base, await readBaseline(groups, cfg));
+  try {
+    Object.assign(base, await readBaseline(groups, cfg));
+  } catch (e) {
+    // Every expected failure is already a warning inside; this is for the unexpected. The box keeps its 1.4.0 rule.
+    const warning = `⚠️  Couldn't read the baseline (${firstLine(messageOf(e))}); the deploy box keeps its 1.4.0 rule.`;
+    log(warning);
+    base.warnings = [warning];
+  }
 
   if (cfg.dryRun) {
     const removedOverrides = await previewOrphans(groups, ctx);
