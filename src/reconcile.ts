@@ -1106,7 +1106,7 @@ interface GroupResult {
 }
 
 /** What every group needs to read its baseline. */
-interface BaselineContext {
+export interface BaselineContext {
   /** The baseline the run was asked for: compareTo, else the last commit, else the start of the run. */
   requested: Baseline;
   repo: GitHubRepoConfig | null;
@@ -1114,6 +1114,22 @@ interface BaselineContext {
   git: { toplevel: string; headSha: string } | null;
   /** What repo paths are relative to: git's top level, else the workspace root. */
   repoRoot: string;
+}
+
+/** What every group of a run reads its baseline with: the baseline asked for, and where to read it from. */
+export function baselineContextFor(cfg: ResolvedConfig): BaselineContext {
+  const git = gitRepoInfo(cfg.workspaceRoot);
+  return {
+    requested: cfg.compareTo
+      ? { kind: "ref", ref: cfg.compareTo }
+      : git
+        ? { kind: "commit", sha: git.headSha }
+        : { kind: "run-start" },
+    repo: cfg.token ? { owner: cfg.owner, name: cfg.name, token: cfg.token } : null,
+    compareTo: cfg.compareTo,
+    git,
+    repoRoot: git?.toplevel ?? cfg.workspaceRoot,
+  };
 }
 
 /** The path with symlinks and short names resolved, or as given when it can't be. */
@@ -1170,6 +1186,15 @@ function baselineSource(b: Baseline): string {
   return b.kind === "ref" ? `on "${b.ref}" from GitHub` : "from the last commit";
 }
 
+/**
+ * Set when a group couldn't use the baseline asked for. A group's kind is "ref" only
+ * when the run asked for a ref, so a group that differs fell back to the last commit
+ * or the start of the run.
+ */
+export function fallbackOf(used: Baseline, requested: Baseline, manifest: string, reason: string | null): BaselineFallback | null {
+  return used.kind !== requested.kind && used.kind !== "ref" ? { manifest, kind: used.kind, reason: reason ?? "" } : null;
+}
+
 /** At most `max` warnings, duplicates dropped, then how many more: they go in the report header, which is never cut. */
 export function boundedWarnings(warnings: string[], max = 10): string[] {
   const unique = [...new Set(warnings)];
@@ -1177,7 +1202,7 @@ export function boundedWarnings(warnings: string[], max = 10): string[] {
 }
 
 /** What a group compares with, settled before the update pass. */
-interface GroupBaseline {
+export interface GroupBaseline {
   baseline: Baseline;
   /** The baseline's and the working copy's lockfile versions; null when the group compares with the start of the run. */
   indexes: { baseline: VersionIndex; working: VersionIndex } | null;
@@ -1199,7 +1224,7 @@ interface GroupBaseline {
  * otherwise the group compares installed trees from the start of the run, as 1.4.0
  * did. Every failure is a warning; none stops the run.
  */
-async function readGroupBaseline(
+export async function readGroupBaseline(
   bctx: BaselineContext,
   pmId: PackageManagerId,
   lockFile: string,
@@ -1396,12 +1421,7 @@ async function processManifestGroup(
     packagesUpdated = beforeUnknown ? 0 : countChangedPackages(before, tree);
   }
 
-  // A group's kind is "ref" only when the run asked for a ref, so a group that
-  // differs fell back to the last commit or the start of the run.
-  const fallback: BaselineFallback | null =
-    baseline.kind !== bctx.requested.kind && baseline.kind !== "ref"
-      ? { manifest: label.split(path.sep).join("/"), kind: baseline.kind, reason: reason ?? "" }
-      : null;
+  const fallback = fallbackOf(baseline, bctx.requested, label.split(path.sep).join("/"), reason);
 
   // Several alerts can name the same package; walk its dependency paths once.
   const impacts = new Map<string, DeploymentRecommendation>();
@@ -1506,18 +1526,7 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   // The baseline the run is asked for. Each group reads its own files at it and
   // falls back on its own when it can't, so a missing file in one isolated package
   // doesn't move the rest.
-  const git = gitRepoInfo(cfg.workspaceRoot);
-  const bctx: BaselineContext = {
-    requested: cfg.compareTo
-      ? { kind: "ref", ref: cfg.compareTo }
-      : git
-        ? { kind: "commit", sha: git.headSha }
-        : { kind: "run-start" },
-    repo: cfg.token ? { owner: cfg.owner, name: cfg.name, token: cfg.token } : null,
-    compareTo: cfg.compareTo,
-    git,
-    repoRoot: git?.toplevel ?? cfg.workspaceRoot,
-  };
+  const bctx = baselineContextFor(cfg);
 
   // Names still load-bearing by alert state across every group — anything not
   // `fixed` (open, dismissed, auto_dismissed). Prevents a package from being

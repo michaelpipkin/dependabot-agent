@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { comparedWithLine, type Baseline, type ReportBaseline } from "../baseline/source.js";
 import { recommendDeploy, renderDeploySection, type DeployInput, type DeployRecommendation } from "../report/deploy.js";
 import { cell, inline, MAX_BODY_CHARS, renderSummaryLine, SCOPE_LABEL, type SummaryCounts } from "../report/markdown.js";
 import type { Advised, AlertOutcome, CopyDecision, MovedWith } from "./plan.js";
@@ -29,6 +30,15 @@ export interface RunReport {
   advisoriesUnchecked?: string;
   /** Set when the run failed and putting the files back failed too: the working tree may hold partial changes. */
   restoreError?: string;
+  /** What the deploy box compares with: the baseline asked for, and the lockfiles that couldn't use it. Unset when it was never read. */
+  baseline?: ReportBaseline;
+  /**
+   * The alerts (by number) whose package had a vulnerable copy in the baseline's lockfile. Unset when
+   * no lockfile could be read at the baseline, so the box keeps its 1.4.0 rule.
+   */
+  baselineVulnerable?: number[];
+  /** Why the baseline isn't what was asked for, one line each. */
+  warnings?: string[];
 }
 
 /** The spec's order: a failure beats everything, then any changed file, then any blocked copy. */
@@ -117,12 +127,30 @@ export function targetedSummary(report: RunReport): SummaryCounts {
   };
 }
 
-/** Whether fixed packages reach production. The lockfile is all this strategy reads, so no `via` is traced. */
+/**
+ * The baseline as the report names it. A run whose lockfiles couldn't be read at the
+ * baseline has `baselineVulnerable` unset, and what it did compare with is the start of the run.
+ */
+function shownBaseline(report: RunReport): Baseline | undefined {
+  if (!report.baseline) return undefined;
+  return report.baselineVulnerable ? report.baseline : { kind: "run-start" };
+}
+
+/**
+ * Whether fixed packages reach production. The lockfile is all this strategy reads, so no `via` is traced.
+ * Against a baseline, an alert counts when its package was vulnerable there and the working lockfile no
+ * longer has it (fixed, or already patched and awaiting close); one introduced since never does.
+ */
 export function targetedDeploy(report: RunReport): DeployRecommendation {
+  const vulnerable = report.baselineVulnerable ? new Set(report.baselineVulnerable) : null;
+  const counts = (a: AlertOutcome): boolean =>
+    vulnerable
+      ? vulnerable.has(a.number) && (a.status === "fixed" || a.status === "partly-fixed" || a.status === "awaiting-close")
+      : a.status === "fixed" || a.status === "partly-fixed";
   const inputs: DeployInput[] = report.alerts
-    .filter((a) => a.status === "fixed" || a.status === "partly-fixed")
+    .filter(counts)
     .map((a) => ({ packageName: a.packageName, scope: a.scope, manifest: a.manifest, via: [] }));
-  return recommendDeploy(inputs, report.removedOverrides.map((o) => o.key));
+  return recommendDeploy(inputs, report.removedOverrides.map((o) => o.key), { openAlerts: report.alerts.length });
 }
 
 function summaryLine(alerts: AlertOutcome[], planned: boolean): string {
@@ -327,8 +355,14 @@ function headerBlock(report: RunReport): string {
   if (report.outcome !== "failed" || report.alerts.length > 0) {
     const planned = report.outcome === "failed" || report.dryRun;
     lines.push(renderSummaryLine(targetedSummary(report), planned), "");
+    const baseline = shownBaseline(report);
+    if (baseline) {
+      lines.push(comparedWithLine(baseline));
+      for (const warning of report.warnings ?? []) lines.push("", `_${inline(warning)}_`);
+      lines.push("");
+    }
     if (report.outcome !== "failed") {
-      const deploy = renderDeploySection(targetedDeploy(report));
+      const deploy = renderDeploySection(targetedDeploy(report), baseline);
       if (deploy) lines.push(deploy, "");
     }
     lines.push(summaryLine(report.alerts, planned));

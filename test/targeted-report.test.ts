@@ -613,3 +613,114 @@ describe("the npm version", () => {
     assert.match(renderMarkdown(report({ npmVersion: null })), /npm version unknown/);
   });
 });
+
+describe("the deploy box and the Compared line against a baseline", () => {
+  const awaiting = (over: Partial<AlertOutcome> = {}): AlertOutcome =>
+    alert({ number: 7, packageName: "semver", status: "awaiting-close", copies: [], ...over });
+  const COMMIT = { kind: "commit" as const, sha: "0123456789abcdef", fallbacks: [] };
+
+  it("an awaiting-close production alert that was vulnerable in the baseline gets the Deploy box", () => {
+    const input = report({ outcome: "clean", alerts: [awaiting()], baseline: COMMIT, baselineVulnerable: [7] });
+    const rec = targetedDeploy(input);
+    assert.equal(rec.outcome, "deploy");
+    assert.deepEqual(rec.production.map((e) => e.packageName), ["semver"]);
+    const md = renderMarkdown(input);
+    assert.ok(md.includes("[!IMPORTANT]"), md);
+    assert.ok(md.includes("`semver`"), md);
+  });
+
+  it("a fixed alert that was not vulnerable in the baseline (introduced) is no reason to deploy", () => {
+    const input = report({ alerts: [alert({ number: 8 })], baseline: COMMIT, baselineVulnerable: [] });
+    const rec = targetedDeploy(input);
+    assert.equal(rec.production.length, 0);
+    assert.equal(rec.nothingFixed, true);
+    const md = renderMarkdown(input);
+    assert.doesNotMatch(md, /\[!IMPORTANT\]/);
+    assert.ok(md.includes("compared with the last commit"), md);
+  });
+
+  it("with baselineVulnerable, only the alerts in it count, and blocked ones never do", () => {
+    const rec = targetedDeploy(
+      report({
+        alerts: [
+          alert({ number: 1, packageName: "kept" }),
+          alert({ number: 2, packageName: "introduced" }),
+          awaiting({ number: 3, packageName: "waiting", scope: "dev" }),
+          alert({ ...blockedAlert(), number: 4 }),
+        ],
+        baseline: COMMIT,
+        baselineVulnerable: [1, 3, 4],
+      }),
+    );
+    assert.deepEqual(rec.production.map((e) => e.packageName), ["kept"]);
+    assert.deepEqual(rec.development.map((e) => e.packageName), ["waiting"]);
+  });
+
+  it("without baselineVulnerable an awaiting-close alert is not an input (1.4.0), but open alerts keep the box from going silent", () => {
+    const input = report({ outcome: "clean", alerts: [awaiting()] });
+    const rec = targetedDeploy(input);
+    assert.equal(rec.production.length, 0);
+    assert.equal(rec.outcome, "no-deploy");
+    assert.equal(rec.nothingFixed, true);
+  });
+
+  it("the header names the baseline between the summary line and the box, with warnings under it", () => {
+    const input = report({
+      alerts: [alert({ number: 8, packageName: "qs" })],
+      baseline: { kind: "ref", ref: "release", fallbacks: [] },
+      baselineVulnerable: [8],
+      warnings: ['⚠️  Couldn\'t read functions/package-lock.json on "release" from GitHub (404); compared with the last commit instead.'],
+    });
+    const md = renderMarkdown(input);
+    const at = (text: string): number => md.indexOf(text);
+    assert.ok(at("of 1 alert addressed") > -1);
+    assert.ok(at("of 1 alert addressed") < at("Compared with `release` on GitHub."), md);
+    assert.ok(at("Compared with `release` on GitHub.") < at("Couldn't read functions/package-lock.json"), md);
+    assert.ok(at("Couldn't read functions/package-lock.json") < at("## Deploy recommendation"), md);
+    assert.ok(at("## Deploy recommendation") < at("Alerts: "), md);
+  });
+
+  it("the Compared line names the last commit's short sha", () => {
+    const md = renderMarkdown(report({ baseline: COMMIT, baselineVulnerable: [12] }));
+    assert.ok(md.includes("Compared with the last commit (`0123456`)."), md);
+  });
+
+  it("with no usable baseline it says the start of the run and keeps 1.4.0's rule for the box", () => {
+    const input = report({ alerts: [awaiting({ number: 9 })], baseline: { kind: "commit", sha: "0123456789abcdef", fallbacks: [{ manifest: "root", kind: "run-start", reason: "not in the last commit" }] } });
+    const md = renderMarkdown(input);
+    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
+    assert.ok(md.includes("compared with the packages installed at the start of the run"), md);
+    assert.doesNotMatch(md, /last commit/);
+    assert.equal(targetedDeploy(input).production.length, 0);
+  });
+
+  it("without a baseline the header has no Compared line", () => {
+    assert.doesNotMatch(renderMarkdown(report()), /Compared with/);
+  });
+
+  it("the summary line and every section are the same with or without the baseline", () => {
+    const alerts = [alert(), awaiting(), blockedAlert()];
+    const plain = report({ alerts });
+    const based = report({ alerts, baseline: COMMIT, baselineVulnerable: [7] });
+    assert.deepEqual(targetedSummary(based), targetedSummary(plain));
+    const sections = (md: string): string => md.slice(md.indexOf("## Fixed"));
+    assert.equal(sections(renderMarkdown(based)), sections(renderMarkdown(plain)));
+    const summaryOf = (md: string): string => md.split("\n").find((l) => l.includes("alert") && l.includes("addressed"))!;
+    assert.equal(summaryOf(renderMarkdown(based)), summaryOf(renderMarkdown(plain)));
+  });
+
+  it("report.json carries baseline, baselineVulnerable and warnings beside the fields the workflow reads", () => {
+    const dir = mkdtempSync(join(tmpdir(), "report-"));
+    try {
+      writeReport(dir, report({ baseline: COMMIT, baselineVulnerable: [12], warnings: ["w"] }));
+      const json = JSON.parse(readFileSync(join(dir, "report.json"), "utf8"));
+      assert.deepEqual(json.baseline, COMMIT);
+      assert.deepEqual(json.baselineVulnerable, [12]);
+      assert.deepEqual(json.warnings, ["w"]);
+      assert.equal(json.outcome, "changes");
+      assert.equal(json.blockedCount, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

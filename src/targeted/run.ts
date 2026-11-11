@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
+import type { BaselineFallback } from "../baseline/source.js";
+import type { VersionIndex } from "../baseline/versions.js";
 import type { ResolvedConfig } from "../config.js";
 import { discoverIsolatedManifestDirs, hasOwnLockfile } from "../discover.js";
 import { fetchDependabotAlerts, readDependabotAlertsFile } from "../github.js";
@@ -8,9 +10,13 @@ import type { DirectDep } from "../manifest.js";
 import { readNpmOverrides } from "../override-source.js";
 import { detectPackageManager } from "../package-manager/index.js";
 import {
+  baselineContextFor,
+  boundedWarnings,
+  fallbackOf,
   highestOverrideFloor,
   judgeOrphanedOverride,
   loadBearingAlertNames,
+  readGroupBaseline,
   resolvePmForDir,
 } from "../reconcile.js";
 import type { RunResult } from "../reconcile.js";
@@ -421,6 +427,50 @@ async function removeOrphans(group: Group, ctx: OrphanContext, run: NpmRunner | 
 }
 
 // ---------------------------------------------------------------------------
+// The baseline the deploy box compares with
+// ---------------------------------------------------------------------------
+
+/** Whether the baseline's lockfile has a copy of the alert's package in the alert's vulnerable range, unknown versions included. */
+function wasVulnerable(index: VersionIndex, alert: DependabotAlert): boolean {
+  const { package: pkg, vulnerable_version_range: range } = alert.security_vulnerability;
+  return (index.get(pkg.name) ?? []).some((version) => satisfiesVulnerableRange(version, range) !== false);
+}
+
+/**
+ * Reads each lockfile with open alerts at the baseline, the way the other strategies do, and
+ * names the alerts whose package was vulnerable there. A lockfile that can't be read at the
+ * baseline falls back on its own, with a warning; its alerts all count, as in 1.4.0. When no
+ * lockfile could be read at the baseline `baselineVulnerable` is left unset. Never throws.
+ */
+async function readBaseline(groups: Group[], cfg: ResolvedConfig): Promise<Pick<RunReport, "baseline" | "baselineVulnerable" | "warnings">> {
+  const bctx = baselineContextFor(cfg);
+  const vulnerable: number[] = [];
+  const fallbacks: BaselineFallback[] = [];
+  const warnings: string[] = [];
+  let withAlerts = 0;
+  let readable = 0;
+  for (const group of groups.filter((g) => g.input.alerts.length > 0)) {
+    withAlerts++;
+    // package.json stands in for the override source file: this strategy has no use for it at the baseline.
+    const read = await readGroupBaseline(bctx, "npm", path.join(group.dir, "package-lock.json"), path.join(group.dir, "package.json"));
+    warnings.push(...read.warnings);
+    const fallback = fallbackOf(read.baseline, bctx.requested, group.label, read.reason);
+    if (fallback) fallbacks.push(fallback);
+    if (read.indexes) {
+      readable++;
+      vulnerable.push(...group.input.alerts.filter((a) => wasVulnerable(read.indexes!.baseline, a)).map((a) => a.number));
+    } else {
+      vulnerable.push(...group.input.alerts.map((a) => a.number));
+    }
+  }
+  return {
+    baseline: { ...bctx.requested, fallbacks },
+    ...(withAlerts === 0 || readable > 0 ? { baselineVulnerable: [...new Set(vulnerable)].sort((a, b) => a - b) } : {}),
+    ...(warnings.length > 0 ? { warnings: boundedWarnings(warnings) } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -466,7 +516,10 @@ const restoreNote = (state: RunState): string =>
     ? `Restoring the files failed, so the working tree may hold partial changes: ${state.restoreError}`
     : "Every file was restored to how it was before the run.";
 
-type ReportBase = Pick<RunReport, "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith" | "advised" | "advisoriesUnchecked">;
+type ReportBase = Pick<
+  RunReport,
+  "dryRun" | "blockedCount" | "alerts" | "npmVersion" | "movedWith" | "advised" | "advisoriesUnchecked" | "baseline" | "baselineVulnerable" | "warnings"
+>;
 
 /** Write the report if asked to, and print it. A write that fails says so, and names the directory. */
 function publish(report: RunReport, cfg: ResolvedConfig, state: RunState): void {
@@ -768,6 +821,8 @@ async function execute(cfg: ResolvedConfig, deps: TargetedDeps, state: RunState)
   const groups = await planGroups(cfg, deps, placed.processed, [...extraDirs, ...placed.addedDirs]);
   const base: ReportBase = { dryRun: cfg.dryRun, blockedCount: 0, alerts: [], npmVersion: state.npmVersion };
   refreshBase(base, groups, placed.unprocessed, state);
+  // Before anything is written: a baseline read must never fail the run, and git and GitHub are read-only here.
+  Object.assign(base, await readBaseline(groups, cfg));
 
   if (cfg.dryRun) {
     const removedOverrides = await previewOrphans(groups, ctx);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -2086,5 +2087,133 @@ describe("a raised version that won't verify", () => {
 
     assert.equal(reportIn(reportDir).alerts[0].status, "fixed");
     assert.equal(readLock(dir).packages["node_modules/ms"].version, "2.0.5");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The deploy box and the Compared line against a baseline
+// ---------------------------------------------------------------------------
+
+describe("compared with the deployed baseline", () => {
+  /** qs 6.5.0 (vulnerable) or 6.5.3 (patched), reached through a. */
+  const qsAt = (version: string): ProjectSpec => ({
+    root: { dependencies: { a: "^1.0.0" } },
+    packages: { "node_modules/a": { version: "1.0.0", dependencies: { qs: "^6.0.0" } }, "node_modules/qs": { version } },
+  });
+
+  /** A git repo whose last commit has qs `committed`; the working copy then gets `working`, uncommitted. */
+  function gitProject(committed: string, working: string): { dir: string; sha: string } {
+    const dir = tempDir();
+    const git = (...args: string[]): string => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    writeProject(dir, qsAt(committed));
+    git("init", "-q");
+    git("config", "user.name", "Test");
+    git("config", "user.email", "test@example.com");
+    git("config", "commit.gpgsign", "false");
+    git("add", ".");
+    git("commit", "-q", "-m", "committed");
+    writeProject(dir, qsAt(working));
+    return { dir, sha: git("rev-parse", "HEAD").trim() };
+  }
+
+  async function runIn(dir: string, over: Partial<ResolvedConfig> = {}, fetched: Record<string, string> = {}): Promise<{ report: RunReport; md: string; urls: string[] }> {
+    const reportDir = tempDir();
+    const urls: string[] = [];
+    mock.method(globalThis, "fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      const contents = /\/contents\/([^?]+)\?ref=/.exec(url);
+      const text = contents ? fetched[decodeURIComponent(contents[1])] : undefined;
+      return text === undefined ? new Response("Not Found", { status: 404 }) : new Response(text, { status: 200 });
+    });
+    await runTargeted(cfgFor(dir, { reportDir, ...over }), depsFor([qsAlert()], fakeNpm()));
+    return { report: reportIn(reportDir), md: reportMd(reportDir), urls };
+  }
+
+  it("an alert already patched in the working lockfile but vulnerable in the last commit gets the Deploy box", async () => {
+    const { dir, sha } = gitProject("6.5.0", "6.5.3");
+    const { report, md } = await runIn(dir);
+
+    assert.equal(report.alerts[0].status, "awaiting-close");
+    assert.equal(report.outcome, "clean");
+    assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.deepEqual(report.baseline, { kind: "commit", sha, fallbacks: [] });
+    assert.ok(md.includes(`Compared with the last commit (\`${sha.slice(0, 7)}\`).`), md);
+    assert.ok(md.includes("[!IMPORTANT]") && md.includes("`qs`"), md);
+    assert.ok(md.indexOf("Compared with") < md.indexOf("## Deploy recommendation"));
+  });
+
+  it("an alert whose package wasn't vulnerable in the last commit never counts, and the box isn't silent", async () => {
+    const { dir } = gitProject("6.6.0", "6.5.3");
+    const { report, md } = await runIn(dir);
+
+    assert.deepEqual(report.baselineVulnerable, []);
+    assert.doesNotMatch(md, /\[!IMPORTANT\]/);
+    assert.ok(md.includes("No deploy needed:") && md.includes("compared with the last commit"), md);
+  });
+
+  it("outside a git repository it compares with the start of the run and keeps 1.4.0's rule", async () => {
+    const dir = tempDir();
+    writeProject(dir, qsAt("6.5.3"));
+    const { report, md } = await runIn(dir);
+
+    assert.equal(report.baselineVulnerable, undefined);
+    assert.equal(report.baseline?.kind, "run-start");
+    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
+    assert.doesNotMatch(md, /\[!IMPORTANT\]/);
+    assert.equal(report.outcome, "clean");
+  });
+
+  it("the last commit has no lockfile: a warning and the start of the run, and the run goes on", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    execFileSync("git", ["rm", "-q", "--cached", "package-lock.json"], { cwd: dir });
+    execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@e.test", "commit", "-q", "-m", "drop lock"], { cwd: dir });
+    const { report, md } = await runIn(dir);
+
+    assert.equal(report.baselineVulnerable, undefined);
+    assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind]), [["root", "run-start"]]);
+    assert.ok(md.includes("Couldn't read package-lock.json from the last commit (not in the last commit); compared with the packages installed at the start of the run instead."), md);
+    assert.ok(md.includes("Compared with the packages installed at the start of the run."), md);
+    assert.equal(report.outcome, "clean");
+  });
+
+  it("compareTo is read from GitHub", async () => {
+    const { dir } = gitProject("6.6.0", "6.5.3");
+    const release = JSON.stringify(readLock(dir)).replace("6.5.3", "6.5.0");
+    const { report, md, urls } = await runIn(dir, { compareTo: "release" }, { "package-lock.json": release });
+
+    assert.ok(urls.includes("https://api.github.com/repos/o/r/contents/package-lock.json?ref=release"), urls.join(", "));
+    assert.deepEqual(report.baseline, { kind: "ref", ref: "release", fallbacks: [] });
+    assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.ok(md.includes("Compared with `release` on GitHub."), md);
+    assert.ok(md.includes("[!IMPORTANT]"), md);
+  });
+
+  it("an unreadable compareTo warns and falls back to the last commit", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    const { report, md } = await runIn(dir, { compareTo: "release" });
+
+    assert.deepEqual(report.baseline?.fallbacks.map((f) => [f.manifest, f.kind, f.reason]), [["root", "commit", "404"]]);
+    assert.deepEqual(report.baselineVulnerable, [1]);
+    assert.ok(md.includes(`Couldn't read package-lock.json on "release" from GitHub (404); compared with the last commit instead.`), md);
+    assert.ok(md.includes("[!IMPORTANT]"), md);
+    assert.equal(report.baseline?.kind, "ref");
+  });
+
+  it("compareTo with no token (an alerts file) falls back to the last commit without asking GitHub", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    const { report, md, urls } = await runIn(dir, { compareTo: "release", token: "" });
+
+    assert.deepEqual(urls.filter((u) => u.includes("/contents/")), []);
+    assert.ok(md.includes('on "release" from GitHub (no token); compared with the last commit instead.'), md);
+    assert.deepEqual(report.baselineVulnerable, [1]);
+  });
+
+  it("the files the workflow reads are unchanged by the baseline", async () => {
+    const { dir } = gitProject("6.5.0", "6.5.3");
+    const { report } = await runIn(dir);
+    assert.equal(report.outcome, "clean");
+    assert.equal(report.blockedCount, 0);
+    assert.equal(report.restoreError, undefined);
   });
 });
