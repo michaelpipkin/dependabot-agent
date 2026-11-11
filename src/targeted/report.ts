@@ -148,7 +148,11 @@ export function targetedDeploy(report: RunReport): DeployRecommendation {
   const inputs: DeployInput[] = report.alerts
     .filter(counts)
     .map((a) => ({ packageName: a.packageName, scope: a.scope, manifest: a.manifest, via: [] }));
-  return recommendDeploy(inputs, report.removedOverrides.map((o) => o.key), { openAlerts: report.alerts.length });
+  return recommendDeploy(inputs, report.removedOverrides.map((o) => o.key), {
+    openAlerts: report.alerts.length,
+    // No baseline read (or none usable) means the run itself is all there is to go on.
+    runStart: !report.baseline || report.baseline.kind === "run-start",
+  });
 }
 
 function summaryLine(alerts: AlertOutcome[], planned: boolean): string {

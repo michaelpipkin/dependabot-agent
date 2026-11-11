@@ -673,10 +673,20 @@ describe("the deploy box and the Compared line against a baseline", () => {
     assert.deepEqual(rec.production.map((e) => e.packageName).sort(), ["fixed-here", "partly", "was-vulnerable"]);
   });
 
-  it("without baselineVulnerable an awaiting-close alert is not an input (1.4.0), but open alerts keep the box from going silent", () => {
+  it("without a baseline an awaiting-close alert is not an input, and nothing fixed means check before deciding", () => {
     const input = report({ outcome: "clean", alerts: [awaiting()] });
     const rec = targetedDeploy(input);
     assert.equal(rec.production.length, 0);
+    assert.equal(rec.outcome, "check");
+    assert.equal(rec.nothingFixed, true);
+    const md = renderMarkdown(input);
+    assert.ok(md.includes("> [!WARNING]"), md);
+    assert.ok(md.includes("compared with the packages installed at the start of the run, which can miss updates made before it"), md);
+    assert.doesNotMatch(md, /\[!TIP\]/);
+  });
+
+  it("with a baseline, nothing fixed is still an all-clear", () => {
+    const rec = targetedDeploy(report({ outcome: "clean", alerts: [awaiting()], baseline: COMMIT, baselineVulnerable: [] }));
     assert.equal(rec.outcome, "no-deploy");
     assert.equal(rec.nothingFixed, true);
   });

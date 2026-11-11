@@ -299,6 +299,26 @@ describe("recommendDeploy with open alerts", () => {
     assert.deepEqual([rec.production, rec.development, rec.unknown, rec.removedOverrides], [[], [], [], []]);
   });
 
+  it("against the start of the run, nothing fixed means check before deciding, not an all-clear", () => {
+    const rec = recommendDeploy([], [], { openAlerts: 4, runStart: true });
+    assert.equal(rec.outcome, "check");
+    assert.equal(rec.nothingFixed, true);
+    assert.equal(
+      renderDeploySection(rec, { kind: "run-start" }),
+      [
+        "## Deploy recommendation",
+        "",
+        "> [!WARNING]",
+        "> ❓ **Check before deciding:** no package was fixed for an alert compared with the packages installed at the start of the run, which can miss updates made before it",
+      ].join("\n"),
+    );
+  });
+
+  it("a real fix against the start of the run is unaffected by runStart", () => {
+    assert.equal(recommendDeploy([inputs[3]], [], { openAlerts: 3, runStart: true }).outcome, "no-deploy");
+    assert.equal(recommendDeploy([], ["minimist"], { openAlerts: 3, runStart: true }).nothingFixed, false);
+  });
+
   it("stays none with no open alerts, and without a context", () => {
     assert.equal(recommendDeploy([], [], { openAlerts: 0 }).outcome, "none");
     assert.equal(recommendDeploy([], [], { openAlerts: 0 }).nothingFixed, false);
@@ -355,6 +375,15 @@ describe("logDeployRecommendation with a baseline", () => {
     logDeployRecommendation(rec, info);
     return out;
   };
+
+  it("says check before deciding when nothing was fixed against the start of the run", () => {
+    const rec = recommendDeploy([], [], { openAlerts: 4, runStart: true });
+    const out = capture(rec, { baseline: { kind: "run-start" }, openAlerts: 4, awaitingClose: 2 });
+    assert.deepEqual(out.slice(-2), [
+      "   ❓ Recommendation: CHECK BEFORE DECIDING — no package was fixed for an alert compared with the packages installed at the start of the run, which can miss updates made before it.",
+      "   2 alert(s) were already patched in the packages installed at the start of the run and are awaiting close.",
+    ]);
+  });
 
   it("prints the Compared line first under the heading", () => {
     const out = capture(recommendDeploy(inputs, [], { openAlerts: 5 }), { baseline: commit, openAlerts: 5, awaitingClose: 0 });

@@ -1591,11 +1591,11 @@ export async function run(cfg: ResolvedConfig): Promise<RunResult> {
   const removedKeys = [...allRemovedKeys];
   // Every open alert the groups classified; the console and the report say the same.
   const openAlerts = allFixes.length;
-  const deploy = recommendDeploy(allDeployInputs, removedKeys, { openAlerts });
-  // With a count of open alerts the block always prints, if only to say there were none.
-  log(`\n${"═".repeat(48)}`);
   // What the reader is told it was compared with: what every group used when they agree, else what was asked for.
   const shownBaseline = displayBaseline(bctx.requested, usedBaselines);
+  const deploy = recommendDeploy(allDeployInputs, removedKeys, { openAlerts, runStart: shownBaseline.kind === "run-start" });
+  // With a count of open alerts the block always prints, if only to say there were none.
+  log(`\n${"═".repeat(48)}`);
   logDeployRecommendation(deploy, { baseline: shownBaseline, openAlerts, awaitingClose: totalAwaitingClose });
 
   if (cfg.reportDir) {

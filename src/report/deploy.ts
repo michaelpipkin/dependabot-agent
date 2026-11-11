@@ -36,6 +36,8 @@ const MAX_VIA = 5;
 export const MAX_DEPLOY_ENTRIES = 30;
 const OVERRIDES_REMOVED_LINE =
   "❓ **Check before deciding:** overrides were removed, which can change installed versions at the next install";
+const NOTHING_FIXED_AT_RUN_START_LINE =
+  "❓ **Check before deciding:** no package was fixed for an alert compared with the packages installed at the start of the run, which can miss updates made before it";
 
 /** "package-lock.json" is "root"; "functions/pnpm-lock.yaml" is "functions/". */
 export function manifestLabel(manifestPath: string): string {
@@ -59,7 +61,7 @@ function mergeScope(a: DepScope, b: DepScope): DepScope {
 export function recommendDeploy(
   inputs: DeployInput[],
   removedOverrides: string[],
-  context?: { openAlerts: number },
+  context?: { openAlerts: number; runStart?: boolean },
 ): DeployRecommendation {
   interface Acc {
     scope: DepScope;
@@ -100,9 +102,11 @@ export function recommendDeploy(
   else if (unknown.length > 0) outcome = "check";
   else if (development.length > 0) outcome = "no-deploy";
   else if (removedOverrides.length > 0) outcome = "check";
-  else if (context !== undefined && context.openAlerts > 0) outcome = "no-deploy";
+  // Nothing fixed with alerts open: an all-clear only against a real baseline. Against the
+  // start of the run, updates made before it are invisible, so the reader has to check.
+  else if (context !== undefined && context.openAlerts > 0) outcome = context.runStart ? "check" : "no-deploy";
   else outcome = "none";
-  const nothingFixed = byName.size === 0 && removedOverrides.length === 0 && outcome === "no-deploy";
+  const nothingFixed = byName.size === 0 && removedOverrides.length === 0 && context !== undefined && context.openAlerts > 0;
 
   return { outcome, production, development, unknown, removedOverrides, nothingFixed };
 }
@@ -169,7 +173,11 @@ export function renderDeploySection(rec: DeployRecommendation, baseline?: Baseli
   let type: string;
   let first: string;
   let body: string[];
-  if (rec.nothingFixed) {
+  if (rec.nothingFixed && rec.outcome === "check") {
+    type = "WARNING";
+    first = NOTHING_FIXED_AT_RUN_START_LINE;
+    body = [];
+  } else if (rec.nothingFixed) {
     type = "TIP";
     first = `✅ **No deploy needed:** no package was fixed for an alert compared with ${baselinePhrase(baseline ?? { kind: "run-start" })}`;
     body = [];
@@ -234,7 +242,11 @@ export function logDeployRecommendation(
   log("");
   if (rec.nothingFixed) {
     const phrase = baselinePhrase(info?.baseline ?? { kind: "run-start" });
-    log(`   ✅ Recommendation: NO DEPLOY NEEDED — no package was fixed for an alert compared with ${phrase}.`);
+    if (rec.outcome === "check") {
+      log(`   ❓ Recommendation: CHECK BEFORE DECIDING — no package was fixed for an alert compared with ${phrase}, which can miss updates made before it.`);
+    } else {
+      log(`   ✅ Recommendation: NO DEPLOY NEEDED — no package was fixed for an alert compared with ${phrase}.`);
+    }
     if (info && info.awaitingClose > 0) {
       log(`   ${info.awaitingClose} alert(s) were already patched in ${phrase} and are awaiting close.`);
     }

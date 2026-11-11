@@ -381,6 +381,16 @@ describe("a report with a baseline", () => {
     assert.match(renderStrategyReport(r), /> ✅ \*\*No deploy needed:\*\* no package was fixed for an alert compared with `release`/);
   });
 
+  it("shows check before deciding, not the TIP, when nothing was fixed against the start of the run", () => {
+    const fixes = [fix({ number: 1, packageName: "a", status: "awaiting-close", from: [], to: undefined })];
+    const r = build(fixes, { changedThisRun: false, packagesUpdated: 0 });
+    assert.equal(r.deploy.outcome, "check");
+    assert.equal(r.deploy.nothingFixed, true);
+    const md = renderStrategyReport(r);
+    assert.match(md, /> \[!WARNING\]/);
+    assert.doesNotMatch(md, /\[!TIP\]/);
+  });
+
   it("is clean when the run changed nothing, however many packages differ from the baseline", () => {
     const r = build([fix({ number: 1, packageName: "a", status: "update" })], { baseline: release, packagesUpdated: 40, changedThisRun: false });
     assert.equal(r.outcome, "clean");

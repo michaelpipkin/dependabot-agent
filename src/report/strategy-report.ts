@@ -75,7 +75,10 @@ export function assembleStrategyReport(input: {
       ...(input.baseline.kind === "run-start" ? {} : { packagesSince: baselinePhrase(input.baseline) }),
       updatePassOnly: true,
     },
-    deploy: recommendDeploy(input.deployInputs, input.removedOverrideKeys, { openAlerts: input.openAlerts }),
+    deploy: recommendDeploy(input.deployInputs, input.removedOverrideKeys, {
+      openAlerts: input.openAlerts,
+      runStart: input.baseline.kind === "run-start",
+    }),
     fixes: fixed,
     notAddressed: fixes.filter((f) => !isFixed(f)),
   };
