@@ -42,6 +42,79 @@ describe("pnpmLockVersions", () => {
     });
   });
 
+  // pnpm 11+ with a packageManager field: a first document for pnpm itself, then the project's
+  // (the shape of pip-cost-sharing's lockfile, which 1.5.0 couldn't read).
+  const twoDocuments = [
+    "---",
+    "lockfileVersion: '9.0'",
+    "",
+    "importers:",
+    "",
+    "  .:",
+    "    configDependencies: {}",
+    "    packageManagerDependencies:",
+    "      pnpm:",
+    "        specifier: 12.18.0",
+    "        version: 12.18.0",
+    "",
+    "packages:",
+    "",
+    "  '@pnpm/exe.linux-x64@12.18.0':",
+    "    resolution: {integrity: sha512-ccc}",
+    "",
+    "  pnpm@12.18.0:",
+    "    resolution: {integrity: sha512-ddd}",
+    "",
+    "snapshots:",
+    "",
+    "  pnpm@12.18.0: {}",
+    "",
+    "---",
+    "lockfileVersion: '9.0'",
+    "",
+    "settings:",
+    "  autoInstallPeers: true",
+    "",
+    "importers:",
+    "",
+    "  .:",
+    "    dependencies:",
+    "      zod:",
+    "        specifier: ^4.6.0",
+    "        version: 4.6.5",
+    "",
+    "packages:",
+    "",
+    "  zod@4.6.5:",
+    "    resolution: {integrity: sha512-aaa}",
+    "",
+    "  fast-xml-parser@5.11.2:",
+    "    resolution: {integrity: sha512-eee}",
+    "",
+    "snapshots:",
+    "",
+    "  zod@4.6.5: {}",
+    "",
+    "  fast-xml-parser@5.11.2: {}",
+    "",
+  ].join("\n");
+
+  it("reads a lockfile with pnpm's own document first, and leaves pnpm's packages out", () => {
+    assert.deepEqual(asObject(pnpmLockVersions(twoDocuments)), {
+      "fast-xml-parser": ["5.11.2"],
+      zod: ["4.6.5"],
+    });
+  });
+
+  it("doesn't count pnpm updating itself as a changed package", () => {
+    const pnpmUpgraded = twoDocuments.replaceAll("12.18.0", "12.19.0");
+    assert.equal(countChangedVersions(pnpmLockVersions(twoDocuments), pnpmLockVersions(pnpmUpgraded)), 0);
+  });
+
+  it("reads through lockfileVersions for pnpm too", () => {
+    assert.deepEqual(asObject(lockfileVersions("pnpm", twoDocuments)).zod, ["4.6.5"]);
+  });
+
   it("indexes v6 keys, merging a peer-suffixed key into its plain version and sorting ascending", () => {
     const text = ["lockfileVersion: '6.0'", "", "packages:", "", "  /vite@8.3.5(esbuild@0.28.2):", "    dev: true", "", "  /vite@8.3.0:", "    dev: true", ""].join("\n");
     assert.deepEqual(asObject(pnpmLockVersions(text)), { vite: ["8.3.0", "8.3.5"] });

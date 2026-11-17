@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { baselinePhrase, comparedWithLine, type Baseline, type ReportBaseline } from "../baseline/source.js";
+import { baselinePhrase, comparedWithLine, sameBaseline, type Baseline, type ReportBaseline } from "../baseline/source.js";
 import type { DepScope, DeploymentRecommendation, PackageManagerId } from "../types.js";
 import { isFixed, type AlertFix, type FixStatus } from "./alert-fixes.js";
 import { recommendDeploy, renderDeploySection, type DeployInput, type DeployRecommendation } from "./deploy.js";
@@ -39,6 +39,17 @@ export function deployInputsOf(
   });
 }
 
+/**
+ * How the packages count is labelled. Against the start of the run it is the update pass's count.
+ * When manifest groups used different baselines (some fell back while the one named was used by
+ * others), the total mixes counts against each, so it claims neither "since" nor "the update pass".
+ */
+function packagesWording(baseline: ReportBaseline): { packagesSince?: string; updatePassOnly: boolean } {
+  if (baseline.kind === "run-start") return { updatePassOnly: true };
+  const mixed = baseline.fallbacks.length > 0 && (baseline.requested === undefined || sameBaseline(baseline.requested, baseline));
+  return mixed ? { updatePassOnly: false } : { packagesSince: baselinePhrase(baseline), updatePassOnly: true };
+}
+
 export function assembleStrategyReport(input: {
   strategy: "compatible" | "latest";
   packageManager: PackageManagerId;
@@ -71,9 +82,7 @@ export function assembleStrategyReport(input: {
       overridesAddedOrUpdated: input.overridesAddedOrUpdated,
       overridesRemoved: input.overridesRemoved,
       packagesUpdated: input.packagesUpdated,
-      // Against the start of the run the count is the update pass's, as in 1.4.0.
-      ...(input.baseline.kind === "run-start" ? {} : { packagesSince: baselinePhrase(input.baseline) }),
-      updatePassOnly: true,
+      ...packagesWording(input.baseline),
     },
     deploy: recommendDeploy(input.deployInputs, input.removedOverrideKeys, {
       openAlerts: input.openAlerts,

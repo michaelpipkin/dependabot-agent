@@ -358,6 +358,29 @@ describe("a report with a baseline", () => {
     assert.match(renderStrategyReport(runStart), /· \*\*23\*\* packages updated by the update pass\n/);
   });
 
+  it("drops \"since\" from the packages count when manifest groups used different baselines", () => {
+    const fixes = [fix({ number: 1, packageName: "a", status: "update" })];
+    const releaseRef = { kind: "ref" as const, ref: "release" };
+    // pip-cost-sharing's run: functions/ compared with release, the root fell back to the start of the run.
+    const mixed = build(fixes, {
+      baseline: { ...releaseRef, requested: releaseRef, fallbacks: [{ manifest: "root", kind: "run-start", reason: "expected a single document" }] },
+      packagesUpdated: 246,
+    });
+    assert.equal("packagesSince" in mixed.summary, false);
+    assert.equal(mixed.summary.updatePassOnly, false);
+    const md = renderStrategyReport(mixed);
+    assert.match(md, /· \*\*246\*\* packages updated\n/);
+    assert.doesNotMatch(md, /packages changed since/);
+    assert.ok(md.includes("Compared with `release` on GitHub."), md);
+
+    // Every group fell back to the last commit: one baseline was used, so "since" it is true.
+    const uniform = build(fixes, {
+      baseline: { kind: "commit", sha: "c2b8101aaaaaaaa", requested: releaseRef, fallbacks: [{ manifest: "root", kind: "commit", reason: "404" }] },
+      packagesUpdated: 5,
+    });
+    assert.equal(uniform.summary.packagesSince, "the last commit");
+  });
+
   it("gives the new statuses their reasons with the baseline named", () => {
     const fixes = [
       fix({ number: 1, packageName: "a", status: "introduced-covered", from: [], to: undefined }),

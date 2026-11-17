@@ -40,11 +40,33 @@ function parsePnpmKey(rawKey: string): { name: string; version: string } | null 
   return name && parseSemver(version) ? { name, version } : null;
 }
 
-/** Name → versions from the `packages` and `snapshots` keys of a pnpm-lock.yaml (v5, v6 and v9 key shapes). */
+/** What an importer in pnpm's own lockfile document holds; a project importer holds dependencies. */
+const ENV_IMPORTER_KEYS = new Set(["configDependencies", "packageManagerDependencies"]);
+
+/**
+ * Whether a lockfile document is pnpm's own: with a `packageManager` field, pnpm 11+ writes a
+ * first document recording pnpm itself (and config dependencies) ahead of the project's. Its
+ * importers hold nothing but those keys.
+ */
+function isPnpmEnvDocument(doc: Record<string, unknown>): boolean {
+  const importers = doc.importers;
+  if (!importers || typeof importers !== "object") return false;
+  const entries = Object.values(importers as Record<string, unknown>);
+  return (
+    entries.length > 0 &&
+    entries.every((imp) => imp !== null && typeof imp === "object" && Object.keys(imp).every((k) => ENV_IMPORTER_KEYS.has(k)))
+  );
+}
+
+/**
+ * Name → versions from the `packages` and `snapshots` keys of a pnpm-lock.yaml (v5, v6 and v9 key
+ * shapes). The file can hold several YAML documents; pnpm's own (see isPnpmEnvDocument) is left out,
+ * so pnpm updating itself never reads as a changed package.
+ */
 export function pnpmLockVersions(text: string): VersionIndex {
-  const doc = yaml.load(text);
   const found = new Map<string, Set<string>>();
-  if (doc && typeof doc === "object") {
+  for (const doc of yaml.loadAll(text)) {
+    if (!doc || typeof doc !== "object" || isPnpmEnvDocument(doc as Record<string, unknown>)) continue;
     for (const section of ["packages", "snapshots"] as const) {
       const block = (doc as Record<string, unknown>)[section];
       if (!block || typeof block !== "object") continue;
