@@ -17,7 +17,7 @@ export interface BaselineFallback {
  */
 export type ReportBaseline = Baseline & { fallbacks: BaselineFallback[]; requested?: Baseline };
 
-const sameBaseline = (a: Baseline, b: Baseline): boolean =>
+export const sameBaseline = (a: Baseline, b: Baseline): boolean =>
   a.kind === b.kind &&
   (a.kind !== "ref" || (b.kind === "ref" && a.ref === b.ref)) &&
   (a.kind !== "commit" || (b.kind === "commit" && a.sha === b.sha));

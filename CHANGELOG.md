@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Releases from 0.1.5 onward are published as [GitHub Releases](https://github.com/michaelpipkin/dependabot-agent/releases), so Dependabot and Renovate surface these notes directly in the update PRs they open for this package. Entries for 0.1.0–0.1.4 were reconstructed from the commit history after the fact.
 
+## [1.5.1]
+
+Fixes reading pnpm lockfiles written by pnpm 11 and later. The overrides written for a given input are unchanged, and so are exit codes.
+
+### Fixed
+
+- **A `pnpm-lock.yaml` with pnpm's own section first can be read.** With a `packageManager` field in `package.json`, pnpm 11+ writes a first YAML document recording pnpm itself ahead of the project's lockfile. 1.5.0 read the file as one document, so it couldn't parse such a lockfile, warned `expected a single document in the stream, but found more`, and compared that folder with the start of the run instead of the baseline. Every document is read now, and pnpm's own is left out, so pnpm updating itself never counts as a changed package.
+- **The packages count no longer claims "since <baseline>" when manifest groups used different baselines.** The total then mixes counts against each, so the summary says `packages updated`.
+
+### Changed
+
+- **The README's examples pin 1.5.1.**
+
 ## [1.5.0]
 
 The deploy recommendation now answers "do I need to deploy?" by comparing your working copy with what's deployed, instead of with the start of the run. The overrides written for a given input are unchanged, and so are exit codes.
