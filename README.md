@@ -451,7 +451,7 @@ Each step needs more access than the one before, so you can stop at any of them.
 
 ```bash
 export GITHUB_TOKEN=<token> # PowerShell: $env:GITHUB_TOKEN = "<token>"
-npx -y dependabot-agent@1.5.0 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
+npx -y dependabot-agent@1.5.1 --repo <org>/<repo> --update-strategy targeted --dry-run --report <folder-outside-the-checkout>
 ```
 
 This reads the alerts and the lockfile, and looks up published versions, what they require and their advisories. It needs no `node_modules`, changes nothing in the repository, and writes only the report. Read `report.md`. **A dry run only plans: it never resolves anything with npm,** so it can't show every conflict npm would refuse, `legacy-peer-deps` problems or a failed check.
@@ -734,10 +734,10 @@ jobs:
     permissions: # a called workflow can't hold more than its caller grants
       contents: read
       issues: write
-    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@v1.5.0 # pin a tag or a commit SHA
+    uses: michaelpipkin/dependabot-agent/.github/workflows/targeted-reconcile.yml@v1.5.1 # pin a tag or a commit SHA
     with:
       base-branch: main
-      agent-version: "1.5.0" # keep this in step with the workflow's version
+      agent-version: "1.5.1" # keep this in step with the workflow's version
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:
       alerts-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
@@ -749,7 +749,7 @@ To use a GitHub App instead of tokens, replace the two tokens with the App's Cli
 ```yaml
     with:
       base-branch: main
-      agent-version: "1.5.0"
+      agent-version: "1.5.1"
       app-client-id: ${{ vars.DEPENDABOT_APP_CLIENT_ID }}
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
     secrets:
